@@ -1,0 +1,12 @@
+target/
+logs/
+.DS_Store
+
+# IDE/editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS / tooling
+Thumbs.db
