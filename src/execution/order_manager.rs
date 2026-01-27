@@ -535,12 +535,13 @@ impl OrderManager {
                             action = "cancel_unknown_order",
                             "canceled unknown order from user update"
                         );
-                    } else if result.failed.iter().any(|id| id == &order_id) {
+                    } else if let Some(reason) = result.failed.get(&order_id) {
                         tracing::warn!(
                             target: "order_manager",
                             slug = %slug_for_log,
                             token_id = %token_id,
                             order_id = %order_id,
+                            reason = %reason,
                             action = "cancel_unknown_order_failed",
                             "failed to cancel unknown order from user update"
                         );
@@ -595,8 +596,20 @@ async fn execute_cancels(
         for id in result.canceled {
             canceled_ids.insert(id);
         }
-        for id in result.failed {
-            failed_ids.insert(id);
+        for (id, reason) in result.failed {
+            if is_terminal_cancel_failure(&reason) {
+                tracing::warn!(
+                    target: "order_manager",
+                    slug = %slug,
+                    order_id = %id,
+                    reason = %reason,
+                    action = "cancel_terminal_failure",
+                    "cancel reported order is not live; removing from cache"
+                );
+                canceled_ids.insert(id);
+            } else {
+                failed_ids.insert(id);
+            }
         }
     }
 
@@ -640,6 +653,27 @@ async fn execute_cancels(
     }
 
     Ok(())
+}
+
+fn is_terminal_cancel_failure(reason: &str) -> bool {
+    let reason = reason.to_lowercase();
+    if reason.contains("not found") || reason.contains("does not exist") {
+        return true;
+    }
+    if reason.contains("unknown order") {
+        return true;
+    }
+    if reason.contains("not live") || reason.contains("not active") {
+        return true;
+    }
+    if reason.contains("not open") {
+        return true;
+    }
+    if reason.contains("expired") {
+        return true;
+    }
+    reason.contains("already")
+        && (reason.contains("fill") || reason.contains("cancel") || reason.contains("close"))
 }
 
 async fn execute_posts(
@@ -1721,7 +1755,7 @@ mod tests {
         let (_tx_user_orders, rx_user_orders) = mpsc::channel(1);
         mock.push_cancel_result(CancelResult {
             canceled: vec!["order-old".to_string()],
-            failed: Vec::new(),
+            failed: HashMap::new(),
         });
         mock.push_post_result(vec!["order-new".to_string()]);
 
@@ -1754,6 +1788,59 @@ mod tests {
 
         let calls = mock.calls();
         assert_eq!(calls, vec!["cancel", "sign", "post"]);
+    }
+
+    #[tokio::test]
+    async fn terminal_cancel_failure_removes_order_from_cache() {
+        let mut cfg = TradingConfig::default();
+        cfg.dry_run = false;
+        cfg.min_update_interval_ms = 0;
+
+        let mock = MockRestClient::new();
+        let (_tx_user_orders, rx_user_orders) = mpsc::channel(1);
+        let mut failed = HashMap::new();
+        failed.insert("order-old".to_string(), "Order not found".to_string());
+        mock.push_cancel_result(CancelResult {
+            canceled: Vec::new(),
+            failed,
+        });
+
+        let mut manager = OrderManager::with_client(cfg, Arc::new(mock.clone()), rx_user_orders);
+        let slug = future_slug();
+        let cache = manager.markets.entry(slug.clone()).or_default();
+        cache.insert_live(LiveOrder {
+            order_id: "order-old".to_string(),
+            token_id: "token".to_string(),
+            level: 0,
+            price: 0.50,
+            size: 10.0,
+            remaining: 10.0,
+            status: OrderStatus::Open,
+            last_update_ms: 0,
+        });
+
+        manager
+            .handle_command_with_logger(
+                ExecCommand {
+                    slug: slug.clone(),
+                    desired: Vec::new(),
+                },
+                None,
+                None,
+            )
+            .await;
+
+        let cache = manager.markets.get(&slug).expect("cache exists");
+        assert!(
+            !cache.live.contains_key(&("token".to_string(), 0)),
+            "expected order to be removed from cache"
+        );
+        assert!(
+            !cache.order_id_index.contains_key("order-old"),
+            "expected order_id_index to be removed"
+        );
+
+        assert_eq!(mock.calls(), vec!["cancel"]);
     }
 
     #[tokio::test]
@@ -1864,7 +1951,7 @@ mod tests {
         let (_tx_user_orders, rx_user_orders) = mpsc::channel(1);
         mock.push_cancel_result(CancelResult {
             canceled: vec!["order-1".to_string()],
-            failed: Vec::new(),
+            failed: HashMap::new(),
         });
 
         let mut manager = OrderManager::with_client(cfg, Arc::new(mock.clone()), rx_user_orders);
@@ -1906,6 +1993,22 @@ mod tests {
         assert!(is_expected_post_only_reject("Post only would cross"));
         assert!(is_expected_post_only_reject("ORDER WOULD CROSS"));
         assert!(!is_expected_post_only_reject("invalid signature"));
+    }
+
+    #[test]
+    fn terminal_cancel_failure_classification_matches_common_phrases() {
+        assert!(is_terminal_cancel_failure("Order not found"));
+        assert!(is_terminal_cancel_failure("order does not exist"));
+        assert!(is_terminal_cancel_failure("unknown order"));
+        assert!(is_terminal_cancel_failure("order is not live"));
+        assert!(is_terminal_cancel_failure("order is not active"));
+        assert!(is_terminal_cancel_failure("order is not open"));
+        assert!(is_terminal_cancel_failure("order expired"));
+        assert!(is_terminal_cancel_failure("Order is already filled"));
+        assert!(is_terminal_cancel_failure("Already Canceled"));
+        assert!(is_terminal_cancel_failure("ALREADY CLOSED"));
+        assert!(!is_terminal_cancel_failure("rate limited"));
+        assert!(!is_terminal_cancel_failure("internal server error"));
     }
 
     #[tokio::test]
@@ -2023,7 +2126,7 @@ mod tests {
         let (_tx_user_orders, rx_user_orders) = mpsc::channel(1);
         mock.push_cancel_result(CancelResult {
             canceled: vec!["order-1".to_string()],
-            failed: Vec::new(),
+            failed: HashMap::new(),
         });
         mock.push_post_result(vec!["order-2".to_string()]);
 
@@ -2098,7 +2201,7 @@ mod tests {
         let mock = MockRestClient::new();
         mock.push_cancel_result(CancelResult {
             canceled: vec!["order-unknown".to_string()],
-            failed: Vec::new(),
+            failed: HashMap::new(),
         });
 
         let (_tx_user_orders, rx_user_orders) = mpsc::channel(1);
@@ -2218,7 +2321,7 @@ mod tests {
         let mock = MockRestClient::new();
         mock.push_cancel_result(CancelResult {
             canceled: vec!["order-old".to_string()],
-            failed: Vec::new(),
+            failed: HashMap::new(),
         });
         mock.push_post_result(vec!["order-new".to_string()]);
 
@@ -2267,7 +2370,7 @@ mod tests {
         mock.push_post_result(vec!["order-new".to_string()]);
         mock.push_cancel_result(CancelResult {
             canceled: vec!["order-old".to_string()],
-            failed: Vec::new(),
+            failed: HashMap::new(),
         });
 
         let slug = future_slug();

@@ -73,3 +73,4 @@ Task status:
 - [x] W9.3 Execution backoff: ignore expected post-only rejects
 - [x] W9.4 Inventory desync watchdog (Data API compare -> cancel+shutdown)
 - [x] W9.5 Config validation: reject unimplemented key sources/modes
+- [x] W9.6 Cancel terminal failures remove from cache (avoid infinite cancel loop)

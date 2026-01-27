@@ -32,7 +32,7 @@ const DEFAULT_FEE_RATE_TTL_MS: i64 = 60_000;
 #[derive(Debug, Clone, Default)]
 pub struct CancelResult {
     pub canceled: Vec<OrderId>,
-    pub failed: Vec<OrderId>,
+    pub failed: HashMap<OrderId, String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -450,7 +450,7 @@ impl ClobRestClient {
 
         Ok(CancelResult {
             canceled: resp.canceled,
-            failed: resp.not_canceled.into_keys().collect(),
+            failed: resp.not_canceled,
         })
     }
 
@@ -465,7 +465,7 @@ impl ClobRestClient {
             .map_err(|e| BotError::Other(format!("cancel_all failed: {e}")))?;
         Ok(CancelResult {
             canceled: resp.canceled,
-            failed: resp.not_canceled.into_keys().collect(),
+            failed: resp.not_canceled,
         })
     }
 }
