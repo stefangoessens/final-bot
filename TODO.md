@@ -74,3 +74,8 @@ Task status:
 - [x] W9.4 Inventory desync watchdog (Data API compare -> cancel+shutdown)
 - [x] W9.5 Config validation: reject unimplemented key sources/modes
 - [x] W9.6 Cancel terminal failures remove from cache (avoid infinite cancel loop)
+
+## Wave 10 (V2 review backlog)
+- [ ] W10.1 WS raw-log sampling before redaction (reduce CPU)
+- [ ] W10.2 Event log: avoid per-event JSON string allocs
+- [ ] W10.3 Alpha knob: optional blend with market-implied q
