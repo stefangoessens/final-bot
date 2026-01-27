@@ -76,6 +76,8 @@ Task status:
 - [x] W9.6 Cancel terminal failures remove from cache (avoid infinite cancel loop)
 
 ## Wave 10 (V2 review backlog)
-- [ ] W10.1 WS raw-log sampling before redaction (reduce CPU)
-- [ ] W10.2 Event log: avoid per-event JSON string allocs
+- [x] W10.1 WS raw-log sampling before redaction (reduce CPU)
+- [x] W10.2 Event log: avoid per-event JSON string allocs
 - [ ] W10.3 Alpha knob: optional blend with market-implied q
+- [x] W10.4 Execution: enforce max_orders_per_min (post limiter)
+- [x] W10.5 Completion: pre-completion cancel sweep (REST active-orders cancel)
