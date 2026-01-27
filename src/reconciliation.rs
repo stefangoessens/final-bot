@@ -106,7 +106,7 @@ impl StartupReconciler {
 
         let mut result = ReconciliationResult::default();
 
-        if self.rest.authenticated() {
+        if seed_orders && self.rest.authenticated() {
             for identity in &identities {
                 let open_orders = self
                     .rest
