@@ -1,10 +1,17 @@
 # AGENTS.md
 # Instructions for AI Coding Agents (Codex) - Polymarket BTC 15m MM Bot
 
-Last updated: 2026-01-26
+Last updated: 2026-01-27
 
 This repo is intended to be implemented primarily by AI coding agents.
 Be explicit. No "magic". Follow the specs exactly.
+
+------------------------------------------------------------
+0.1) Local machine restriction (hard rule)
+------------------------------------------------------------
+- Do NOT connect to Polymarket from this local machine (CLOB HTTP/WS, User WS, Market WS, RTDS, etc.).
+- Only AWS hosts may connect to Polymarket (and still must comply with "Do not bypass geoblocks").
+- Local runs must be offline-only: unit tests, replay harness, fixture-based parsing tests.
 
 ------------------------------------------------------------
 0) Read these docs first (required)
@@ -131,7 +138,7 @@ At minimum:
 - Unit test: tick rounding correctness.
 - Unit test: combined cap enforcement.
 - Unit test: q_up sanity checks.
-- Integration test (dry-run): connect to RTDS and parse btcusdt messages.
+- Integration test (dry-run; AWS-only): connect to RTDS and parse btcusdt messages.
 
 ------------------------------------------------------------
 6) Definition of "Done" per task
