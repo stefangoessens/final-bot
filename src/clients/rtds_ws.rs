@@ -225,13 +225,16 @@ fn build_subscribe_message() -> String {
     // RTDS expects `filters` to be a string; for Chainlink it is a JSON string like:
     // {"symbol":"btc/usd"}.
     let chainlink_filters = serde_json::json!({ "symbol": CHAINLINK_SYMBOL }).to_string();
+    // Observed RTDS validation requires `filters` to be a JSON object/array string, not a plain
+    // symbol string, so we encode Binance filters the same way.
+    let binance_filters = serde_json::json!({ "symbol": BINANCE_SYMBOL }).to_string();
     serde_json::json!({
         "action": "subscribe",
         "subscriptions": [
             {
                 "topic": TOPIC_BINANCE,
                 "type": "update",
-                "filters": BINANCE_SYMBOL
+                "filters": binance_filters
             },
             {
                 "topic": TOPIC_CHAINLINK,
@@ -569,8 +572,17 @@ mod tests {
                 }
                 TOPIC_BINANCE => {
                     saw_binance = true;
-                    let filters = sub.get("filters").and_then(|v| v.as_str());
-                    assert_eq!(filters, Some(BINANCE_SYMBOL));
+                    let filters = sub
+                        .get("filters")
+                        .and_then(|v| v.as_str())
+                        .expect("binance filters string");
+                    let parsed: Value =
+                        serde_json::from_str(filters).expect("filters must be json string");
+                    let symbol = parsed
+                        .get("symbol")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    assert_eq!(symbol, BINANCE_SYMBOL);
                 }
                 _ => {}
             }
