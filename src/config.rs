@@ -96,6 +96,7 @@ pub struct EndpointsConfig {
     pub clob_ws_user_url: String,
     pub gamma_base_url: String,
     pub data_api_base_url: String,
+    pub geoblock_url: String,
     pub rtds_ws_url: String,
     pub polygon_rpc_url: String,
 }
@@ -108,6 +109,7 @@ impl Default for EndpointsConfig {
             clob_ws_user_url: "wss://ws-subscriptions-clob.polymarket.com/ws/user".to_string(),
             gamma_base_url: "https://gamma-api.polymarket.com".to_string(),
             data_api_base_url: "https://data-api.polymarket.com".to_string(),
+            geoblock_url: "https://polymarket.com/api/geoblock".to_string(),
             rtds_ws_url: "wss://ws-live-data.polymarket.com".to_string(),
             polygon_rpc_url: "https://polygon-rpc.com".to_string(),
         }
@@ -617,6 +619,7 @@ pub struct InfraConfig {
     pub quote_tick_interval_ms: u64,
     pub market_discovery_interval_ms: u64,
     pub market_discovery_grace_s: i64,
+    pub geoblock_poll_interval_ms: u64,
 }
 
 impl Default for InfraConfig {
@@ -629,6 +632,7 @@ impl Default for InfraConfig {
             quote_tick_interval_ms: 200,
             market_discovery_interval_ms: 1_000,
             market_discovery_grace_s: 20 * 60,
+            geoblock_poll_interval_ms: 30_000,
         }
     }
 }
@@ -649,6 +653,17 @@ impl InfraConfig {
             return Err(BotError::Config(format!(
                 "infra.market_discovery_grace_s must be >=0, got {}",
                 self.market_discovery_grace_s
+            )));
+        }
+        if self.geoblock_poll_interval_ms == 0 {
+            return Err(BotError::Config(
+                "infra.geoblock_poll_interval_ms must be >0".to_string(),
+            ));
+        }
+        if self.geoblock_poll_interval_ms < 250 {
+            return Err(BotError::Config(format!(
+                "infra.geoblock_poll_interval_ms must be >=250, got {}",
+                self.geoblock_poll_interval_ms
             )));
         }
         Ok(())

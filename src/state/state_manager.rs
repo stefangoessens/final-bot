@@ -63,6 +63,16 @@ pub struct RTDSUpdate {
 }
 
 #[derive(Debug, Clone)]
+pub struct GeoblockStatus {
+    pub blocked: Option<bool>,
+    pub ip: Option<String>,
+    pub country: Option<String>,
+    pub region: Option<String>,
+    pub ts_ms: i64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub enum OrderUpdate {
     Upsert { slug: String, order: LiveOrder },
     Remove {
@@ -107,6 +117,7 @@ pub enum AppEvent {
     TickSizeSeed(TickSizeSeed),
     UserWsUpdate(UserWsUpdate),
     RTDSUpdate(RTDSUpdate),
+    GeoblockStatus(GeoblockStatus),
     SeedOrders(OrderSeed),
     SeedInventory(InventorySeed),
     // W7.15: OrderManager emits live order updates for rewards scoring.
@@ -123,6 +134,7 @@ pub enum AppEvent {
 pub struct StateManager {
     markets: HashMap<String, MarketState>, // key: slug
     last_user_ws_msg_ms: Option<i64>,
+    last_geoblock: Option<GeoblockStatus>,
     alpha_cfg: AlphaConfig,
     oracle_cfg: OracleConfig,
     trading_cfg: TradingConfig,
@@ -141,6 +153,7 @@ impl StateManager {
         Self {
             markets: HashMap::new(),
             last_user_ws_msg_ms: None,
+            last_geoblock: None,
             alpha_cfg,
             oracle_cfg,
             trading_cfg,
@@ -163,6 +176,7 @@ impl StateManager {
                 AppEvent::UserWsUpdate(UserWsUpdate::Fill(f)) => (f.ts_ms, false),
                 AppEvent::UserWsUpdate(UserWsUpdate::Heartbeat { ts_ms }) => (*ts_ms, false),
                 AppEvent::RTDSUpdate(u) => (u.ts_ms, false),
+                AppEvent::GeoblockStatus(u) => (u.ts_ms, false),
                 AppEvent::SeedOrders(seed) => (seed.ts_ms, false),
                 AppEvent::SeedInventory(seed) => (seed.ts_ms, false),
                 AppEvent::OrderUpdate(u) => (u.ts_ms(), false),
@@ -249,6 +263,9 @@ impl StateManager {
                 }
                 self.apply_rtds_update(update);
             }
+            AppEvent::GeoblockStatus(status) => {
+                self.apply_geoblock_status(status);
+            }
             AppEvent::SeedOrders(seed) => {
                 self.apply_order_seed(seed);
             }
@@ -281,12 +298,6 @@ impl StateManager {
 
                 for state in self.markets.values_mut() {
                     total_markets += 1;
-                    if state.identity.restricted {
-                        self.health.set_halt_reason(Some(format!(
-                            "restricted market {}",
-                            state.identity.slug
-                        )));
-                    }
 
                     let out = crate::alpha::update_alpha(
                         state,
@@ -298,8 +309,7 @@ impl StateManager {
 
                     let tradable = state.identity.active
                         && state.identity.accepting_orders
-                        && !state.identity.closed
-                        && !state.identity.restricted;
+                        && !state.identity.closed;
 
                     let halted = self.health.is_halted();
                     let mut block_reason = None;
@@ -445,6 +455,45 @@ impl StateManager {
                         ts_ms: update.ts_ms,
                     });
                 }
+            }
+        }
+    }
+
+    fn apply_geoblock_status(&mut self, status: GeoblockStatus) {
+        self.last_geoblock = Some(status.clone());
+
+        // Geoblock only gates trading. In dry-run mode we still capture status for observability,
+        // but avoid marking the process halted.
+        if self.trading_cfg.dry_run {
+            return;
+        }
+
+        match status.blocked {
+            Some(true) => {
+                self.health.set_halt_reason(Some(format!(
+                    "geoblock_blocked country={} region={} ip={}",
+                    status.country.as_deref().unwrap_or(""),
+                    status.region.as_deref().unwrap_or(""),
+                    status.ip.as_deref().unwrap_or("")
+                )));
+            }
+            Some(false) => {
+                // Clear only geoblock-driven halts (so future halt reasons don't get stomped).
+                let should_clear = self
+                    .health
+                    .halt_reason()
+                    .as_deref()
+                    .map(|r| r.starts_with("geoblock_"))
+                    .unwrap_or(false);
+                if should_clear {
+                    self.health.set_halt_reason(None);
+                }
+            }
+            None => {
+                self.health.set_halt_reason(Some(format!(
+                    "geoblock_unknown error={}",
+                    status.error.as_deref().unwrap_or("unknown")
+                )));
             }
         }
     }
@@ -943,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn restricted_market_latches_halt() {
+    fn geoblock_blocks_and_clears_halt_reason() {
         let mut cfg = AppConfig::default();
         cfg.trading.dry_run = false;
         let ops = OpsState::new(&cfg);
@@ -954,9 +1003,70 @@ mod tests {
             ops.health.clone(),
             ops.metrics,
         );
+
+        sm.apply_event(AppEvent::GeoblockStatus(GeoblockStatus {
+            blocked: Some(true),
+            ip: Some("1.2.3.4".to_string()),
+            country: Some("US".to_string()),
+            region: Some("CA".to_string()),
+            ts_ms: 1_000,
+            error: None,
+        }), 1_000);
+
+        let report = sm.health.report(1_000);
+        assert_eq!(report.status, "halted");
+        assert!(report.halted_reason.unwrap_or_default().starts_with("geoblock_"));
+
+        sm.apply_event(AppEvent::GeoblockStatus(GeoblockStatus {
+            blocked: Some(false),
+            ip: Some("1.2.3.4".to_string()),
+            country: Some("IE".to_string()),
+            region: Some("L".to_string()),
+            ts_ms: 2_000,
+            error: None,
+        }), 2_000);
+
+        let report = sm.health.report(2_000);
+        assert!(report.halted_reason.is_none());
+    }
+
+    #[test]
+    fn restricted_flag_does_not_block_tradability() {
+        let mut cfg = AppConfig::default();
+        cfg.trading.dry_run = false;
+        let ops = OpsState::new(&cfg);
+        let mut sm = StateManager::new(
+            AlphaConfig::default(),
+            OracleConfig::default(),
+            cfg.trading.clone(),
+            ops.health.clone(),
+            ops.metrics,
+        );
+
         sm.apply_event(
             AppEvent::MarketDiscovered(make_identity_with_flags(true, true, false, true)),
             0,
+        );
+        sm.health.mark_user_ws(9_500);
+        sm.apply_event(
+            AppEvent::MarketWsUpdate(MarketWsUpdate {
+                token_id: "up".to_string(),
+                best_bid: Some(0.49),
+                best_ask: Some(0.51),
+                tick_size: Some(0.001),
+                ts_ms: 9_500,
+            }),
+            9_500,
+        );
+        sm.apply_event(
+            AppEvent::MarketWsUpdate(MarketWsUpdate {
+                token_id: "down".to_string(),
+                best_bid: Some(0.49),
+                best_ask: Some(0.51),
+                tick_size: Some(0.001),
+                ts_ms: 9_500,
+            }),
+            9_500,
         );
         sm.apply_event(
             AppEvent::RTDSUpdate(RTDSUpdate {
@@ -970,9 +1080,6 @@ mod tests {
         sm.apply_event(AppEvent::TimerTick { now_ms: 10_000 }, 10_000);
 
         let state = sm.market_state("btc-updown-15m-0").unwrap();
-        assert!(!state.quoting_enabled);
-
-        let report = sm.health.report(10_000);
-        assert!(report.halted_reason.is_some());
+        assert!(state.quoting_enabled, "restricted should not block quoting");
     }
 }

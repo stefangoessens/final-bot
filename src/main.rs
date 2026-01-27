@@ -77,6 +77,12 @@ async fn main() -> BotResult<()> {
         .run(rx_events, tx_quote_raw),
     );
 
+    let geoblock_loop = clients::geoblock::GeoblockLoop::new(
+        cfg.endpoints.geoblock_url.clone(),
+        cfg.infra.geoblock_poll_interval_ms,
+    );
+    tokio::spawn(geoblock_loop.run(tx_events.clone()));
+
     tokio::spawn(async move {
         let mut rx_quote_raw = rx_quote_raw;
         let tx_quote_strategy = tx_quote_strategy;

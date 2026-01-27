@@ -3,5 +3,6 @@ pub mod clob_public;
 pub mod clob_ws_market;
 pub mod clob_ws_user;
 pub mod data_api;
+pub mod geoblock;
 pub mod gamma;
 pub mod rtds_ws;
