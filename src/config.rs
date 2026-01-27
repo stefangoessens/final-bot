@@ -144,6 +144,10 @@ pub struct TradingConfig {
     pub reprice_min_ticks: u64,
     pub resize_min_pct: f64,
     pub min_update_interval_ms: u64,
+
+    /// Hard cap on the number of orders posted per minute (across markets).
+    /// 0 disables the limiter.
+    pub max_orders_per_min: u32,
 }
 
 impl Default for TradingConfig {
@@ -167,6 +171,7 @@ impl Default for TradingConfig {
             reprice_min_ticks: 1,
             resize_min_pct: 0.10,
             min_update_interval_ms: 250,
+            max_orders_per_min: 300,
         }
     }
 }

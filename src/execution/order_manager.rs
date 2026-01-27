@@ -24,6 +24,7 @@ const BACKOFF_BASE_MS: u64 = 250;
 const BACKOFF_MAX_MS: u64 = 5_000;
 const UNKNOWN_USER_UPDATE_WARN_INTERVAL_MS: i64 = 30_000;
 const UNKNOWN_USER_UPDATE_CANCEL_INTERVAL_MS: i64 = 10_000;
+const ORDERS_PER_MIN_WINDOW_MS: i64 = 60_000;
 
 #[derive(Debug, Default)]
 struct UnknownUserUpdateLimiter {
@@ -57,6 +58,40 @@ impl UnknownUserUpdateLimiter {
         }
         self.last_cancel_ms_by_order
             .insert(order_id.to_string(), now_ms);
+        true
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OrdersPerMinLimiter {
+    limit: u32,
+    window_start_ms: i64,
+    used: u32,
+}
+
+impl OrdersPerMinLimiter {
+    fn new(limit: u32) -> Self {
+        Self {
+            limit,
+            window_start_ms: 0,
+            used: 0,
+        }
+    }
+
+    fn try_acquire(&mut self, now_ms: i64, amount: u32) -> bool {
+        if self.limit == 0 || amount == 0 {
+            return true;
+        }
+        if self.window_start_ms <= 0
+            || now_ms.saturating_sub(self.window_start_ms) >= ORDERS_PER_MIN_WINDOW_MS
+        {
+            self.window_start_ms = now_ms;
+            self.used = 0;
+        }
+        if self.used.saturating_add(amount) > self.limit {
+            return false;
+        }
+        self.used = self.used.saturating_add(amount);
         true
     }
 }
@@ -251,6 +286,7 @@ pub struct OrderManager {
     owner: Option<String>,
     user_orders: Option<Receiver<UserOrderUpdate>>,
     unknown_update_limiter: UnknownUserUpdateLimiter,
+    post_limiter: OrdersPerMinLimiter,
 }
 
 impl OrderManager {
@@ -267,6 +303,7 @@ impl OrderManager {
         rest: Arc<dyn OrderRestClient>,
         user_orders: Receiver<UserOrderUpdate>,
     ) -> Self {
+        let post_limiter = OrdersPerMinLimiter::new(cfg.max_orders_per_min);
         Self {
             cfg,
             rest,
@@ -274,6 +311,7 @@ impl OrderManager {
             owner: default_owner_from_env(),
             user_orders: Some(user_orders),
             unknown_update_limiter: UnknownUserUpdateLimiter::default(),
+            post_limiter,
         }
     }
 
@@ -402,6 +440,19 @@ impl OrderManager {
                 cutoff_active = cutoff_active,
                 cutoff_ts_ms = cutoff_ts_ms.unwrap_or_default(),
                 "post suppressed due to backoff/cutoff"
+            );
+            return;
+        }
+
+        let post_count = posts.len().min(u32::MAX as usize) as u32;
+        if !self.post_limiter.try_acquire(now_ms, post_count) {
+            tracing::warn!(
+                target: "order_manager",
+                slug = %cmd.slug,
+                post_count,
+                max_orders_per_min = self.cfg.max_orders_per_min,
+                action = "post_rate_limited",
+                "post suppressed by max_orders_per_min"
             );
             return;
         }
@@ -1993,6 +2044,64 @@ mod tests {
         assert!(is_expected_post_only_reject("Post only would cross"));
         assert!(is_expected_post_only_reject("ORDER WOULD CROSS"));
         assert!(!is_expected_post_only_reject("invalid signature"));
+    }
+
+    #[test]
+    fn orders_per_min_limiter_resets_window() {
+        let mut limiter = OrdersPerMinLimiter::new(3);
+        assert!(limiter.try_acquire(1_000, 2));
+        assert!(!limiter.try_acquire(1_100, 2), "should exceed limit within window");
+        assert!(limiter.try_acquire(1_000 + ORDERS_PER_MIN_WINDOW_MS, 2));
+    }
+
+    #[tokio::test]
+    async fn max_orders_per_min_suppresses_posts_when_over_limit() {
+        let mut cfg = TradingConfig::default();
+        cfg.dry_run = false;
+        cfg.min_update_interval_ms = 0;
+        cfg.max_orders_per_min = 1;
+
+        let mock = MockRestClient::new();
+        mock.push_post_result(vec!["order-1".to_string()]);
+
+        let (_tx_user_orders, rx_user_orders) = mpsc::channel(1);
+        let mut manager = OrderManager::with_client(cfg, Arc::new(mock.clone()), rx_user_orders);
+
+        let slug_a = future_slug();
+        let slug_b = format!("btc-updown-15m-{}", now_ms() / 1_000 + BTC_15M_INTERVAL_S * 2);
+
+        let desired = vec![DesiredOrder {
+            token_id: "token".to_string(),
+            level: 0,
+            price: 0.50,
+            size: 10.0,
+            post_only: true,
+            tif: TimeInForce::Gtc,
+        }];
+
+        manager
+            .handle_command_with_logger(
+                ExecCommand {
+                    slug: slug_a,
+                    desired: desired.clone(),
+                },
+                None,
+                None,
+            )
+            .await;
+
+        manager
+            .handle_command_with_logger(
+                ExecCommand {
+                    slug: slug_b,
+                    desired,
+                },
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(mock.calls(), vec!["sign", "post"]);
     }
 
     #[test]
