@@ -59,8 +59,7 @@ impl AppConfig {
             && self.inventory.completion_min_profit_per_share
                 != default_inventory.completion_min_profit_per_share
         {
-            self.completion.min_profit_per_share =
-                self.inventory.completion_min_profit_per_share;
+            self.completion.min_profit_per_share = self.inventory.completion_min_profit_per_share;
         }
 
         if self.completion.enabled == default_completion.enabled
@@ -230,6 +229,11 @@ pub struct InventoryConfig {
     /// Deprecated: use completion.enabled.
     pub allow_taker_completion: bool,
     pub allow_negative_completion: bool,
+
+    pub desync_watchdog_enabled: bool,
+    pub desync_watchdog_interval_s: u64,
+    pub desync_watchdog_mismatch_hold_s: u64,
+    pub desync_watchdog_max_abs_shares_diff: f64,
 }
 
 impl Default for InventoryConfig {
@@ -245,6 +249,10 @@ impl Default for InventoryConfig {
             completion_min_profit_per_share: 0.001,
             allow_taker_completion: true,
             allow_negative_completion: false,
+            desync_watchdog_enabled: true,
+            desync_watchdog_interval_s: 30,
+            desync_watchdog_mismatch_hold_s: 60,
+            desync_watchdog_max_abs_shares_diff: 0.05,
         }
     }
 }
@@ -261,6 +269,19 @@ impl InventoryConfig {
             return Err(BotError::Config(format!(
                 "inventory.max_unpaired_shares_global must be >0, got {}",
                 self.max_unpaired_shares_global
+            )));
+        }
+        if self.desync_watchdog_interval_s == 0 {
+            return Err(BotError::Config(
+                "inventory.desync_watchdog_interval_s must be >0".to_string(),
+            ));
+        }
+        if self.desync_watchdog_max_abs_shares_diff < 0.0
+            || !self.desync_watchdog_max_abs_shares_diff.is_finite()
+        {
+            return Err(BotError::Config(format!(
+                "inventory.desync_watchdog_max_abs_shares_diff must be finite and >=0, got {}",
+                self.desync_watchdog_max_abs_shares_diff
             )));
         }
         Ok(())
@@ -430,14 +451,10 @@ impl Default for MergeConfig {
 impl MergeConfig {
     pub fn validate(&self) -> BotResult<()> {
         if self.min_sets == 0 {
-            return Err(BotError::Config(
-                "merge.min_sets must be >0".to_string(),
-            ));
+            return Err(BotError::Config("merge.min_sets must be >0".to_string()));
         }
         if self.batch_sets == 0 {
-            return Err(BotError::Config(
-                "merge.batch_sets must be >0".to_string(),
-            ));
+            return Err(BotError::Config("merge.batch_sets must be >0".to_string()));
         }
         if self.batch_sets > self.min_sets {
             return Err(BotError::Config(format!(
@@ -446,9 +463,7 @@ impl MergeConfig {
             )));
         }
         if self.interval_s == 0 {
-            return Err(BotError::Config(
-                "merge.interval_s must be >0".to_string(),
-            ));
+            return Err(BotError::Config("merge.interval_s must be >0".to_string()));
         }
         if self.max_ops_per_minute == 0 {
             return Err(BotError::Config(
@@ -515,7 +530,8 @@ impl CompletionConfig {
         }
         if self.enabled && !self.use_explicit_price_cap {
             return Err(BotError::Config(
-                "completion.use_explicit_price_cap must be true when completion.enabled".to_string(),
+                "completion.use_explicit_price_cap must be true when completion.enabled"
+                    .to_string(),
             ));
         }
         Ok(())
@@ -685,39 +701,55 @@ impl KeysConfig {
             return Ok(());
         }
 
-        if self.private_key_source == PrivateKeySource::Env
-            && self.private_key.as_deref().unwrap_or_default().is_empty()
-        {
-            return Err(BotError::Config(
-                "missing required key: PMMB_KEYS__PRIVATE_KEY".to_string(),
-            ));
+        match self.private_key_source {
+            PrivateKeySource::Env => {
+                if self.private_key.as_deref().unwrap_or_default().is_empty() {
+                    return Err(BotError::Config(
+                        "missing required key: PMMB_KEYS__PRIVATE_KEY".to_string(),
+                    ));
+                }
+            }
+            PrivateKeySource::SecretsManager | PrivateKeySource::Kms => {
+                return Err(BotError::Config(format!(
+                    "keys.private_key_source={:?} is not implemented",
+                    self.private_key_source
+                )));
+            }
         }
 
-        if self.api_creds_source == ApiCredsSource::Explicit {
-            if self.clob_api_key.as_deref().unwrap_or_default().is_empty() {
-                return Err(BotError::Config(
-                    "missing required key: PMMB_KEYS__CLOB_API_KEY".to_string(),
-                ));
+        match self.api_creds_source {
+            ApiCredsSource::Explicit => {
+                if self.clob_api_key.as_deref().unwrap_or_default().is_empty() {
+                    return Err(BotError::Config(
+                        "missing required key: PMMB_KEYS__CLOB_API_KEY".to_string(),
+                    ));
+                }
+                if self
+                    .clob_api_secret
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    return Err(BotError::Config(
+                        "missing required key: PMMB_KEYS__CLOB_API_SECRET".to_string(),
+                    ));
+                }
+                if self
+                    .clob_api_passphrase
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    return Err(BotError::Config(
+                        "missing required key: PMMB_KEYS__CLOB_API_PASSPHRASE".to_string(),
+                    ));
+                }
             }
-            if self
-                .clob_api_secret
-                .as_deref()
-                .unwrap_or_default()
-                .is_empty()
-            {
-                return Err(BotError::Config(
-                    "missing required key: PMMB_KEYS__CLOB_API_SECRET".to_string(),
-                ));
-            }
-            if self
-                .clob_api_passphrase
-                .as_deref()
-                .unwrap_or_default()
-                .is_empty()
-            {
-                return Err(BotError::Config(
-                    "missing required key: PMMB_KEYS__CLOB_API_PASSPHRASE".to_string(),
-                ));
+            ApiCredsSource::Derive => {
+                return Err(BotError::Config(format!(
+                    "keys.api_creds_source={:?} is not implemented",
+                    self.api_creds_source
+                )));
             }
         }
 
@@ -801,5 +833,32 @@ mod tests {
         let err = cfg.validate().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("merge.wallet_mode"), "{msg}");
+    }
+
+    #[test]
+    fn unimplemented_private_key_sources_are_rejected_when_not_dry_run() {
+        for source in [PrivateKeySource::SecretsManager, PrivateKeySource::Kms] {
+            let mut cfg = AppConfig::default();
+            cfg.trading.dry_run = false;
+            cfg.keys.private_key_source = source;
+
+            let err = cfg.validate().unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("keys.private_key_source"), "{msg}");
+            assert!(msg.contains("not implemented"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn derive_api_creds_source_is_rejected_when_not_dry_run() {
+        let mut cfg = AppConfig::default();
+        cfg.trading.dry_run = false;
+        cfg.keys.private_key = Some("not-empty".to_string());
+        cfg.keys.api_creds_source = ApiCredsSource::Derive;
+
+        let err = cfg.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("keys.api_creds_source"), "{msg}");
+        assert!(msg.contains("not implemented"), "{msg}");
     }
 }

@@ -7,13 +7,17 @@ use std::{collections::HashMap, future::Future};
 
 use alloy_signer_local::PrivateKeySigner;
 use futures_util::future::BoxFuture;
-use polymarket_client_sdk::auth::{Credentials, Normal, Signer, Uuid};
 use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::clob::{Client as SdkClient, Config as SdkConfig};
-use polymarket_client_sdk::clob::types::{Amount, OrderType as SdkOrderType, Side, SignatureType, SignedOrder};
+use polymarket_client_sdk::auth::{Credentials, Normal, Signer, Uuid};
 use polymarket_client_sdk::clob::types::request::OrdersRequest;
-use polymarket_client_sdk::clob::types::response::{OpenOrderResponse, Page, PostOrderResponse};
-use polymarket_client_sdk::types::{Address, B256, Decimal, U256};
+use polymarket_client_sdk::clob::types::response::{
+    FeeRateResponse, OpenOrderResponse, Page, PostOrderResponse,
+};
+use polymarket_client_sdk::clob::types::{
+    Amount, OrderType as SdkOrderType, Side, SignatureType, SignedOrder,
+};
+use polymarket_client_sdk::clob::{Client as SdkClient, Config as SdkConfig};
+use polymarket_client_sdk::types::{Address, Decimal, B256, U256};
 use polymarket_client_sdk::POLYGON;
 
 use crate::config::{AppConfig, CompletionOrderType, HeartbeatsConfig, WalletMode};
@@ -63,7 +67,7 @@ struct SdkHandle {
     client: SdkAuthedClient,
     signer: PrivateKeySigner,
     fee_rate_cache: FeeRateCache,
-    sign_mutex: tokio::sync::Mutex<()>,
+    fee_rate_http: reqwest::Client,
 }
 
 #[derive(Clone)]
@@ -141,12 +145,7 @@ impl ClobRestClient {
             return Ok(Self { inner: None });
         }
 
-        let private_key = cfg
-            .keys
-            .private_key
-            .as_deref()
-            .unwrap_or_default()
-            .trim();
+        let private_key = cfg.keys.private_key.as_deref().unwrap_or_default().trim();
         if private_key.is_empty() {
             return Err(BotError::Config(
                 "missing required key: PMMB_KEYS__PRIVATE_KEY".to_string(),
@@ -159,12 +158,7 @@ impl ClobRestClient {
             .map_err(|e| BotError::Other(format!("invalid private key: {e}")))?
             .with_chain_id(Some(POLYGON));
 
-        let api_key = cfg
-            .keys
-            .clob_api_key
-            .as_deref()
-            .unwrap_or_default()
-            .trim();
+        let api_key = cfg.keys.clob_api_key.as_deref().unwrap_or_default().trim();
         let api_secret = cfg
             .keys
             .clob_api_secret
@@ -221,7 +215,7 @@ impl ClobRestClient {
                 client,
                 signer,
                 fee_rate_cache: FeeRateCache::new(DEFAULT_FEE_RATE_TTL_MS),
-                sign_mutex: tokio::sync::Mutex::new(()),
+                fee_rate_http: reqwest::Client::new(),
             })),
         })
     }
@@ -275,10 +269,7 @@ impl ClobRestClient {
             let price = parse_decimal(order.price, 8)?;
             let size = parse_decimal(order.size, 2)?;
 
-            let _guard = inner.sign_mutex.lock().await;
-            inner
-                .client
-                .set_fee_rate_bps(token_id, fee_rate_bps as u32);
+            inner.client.set_fee_rate_bps(token_id, fee_rate_bps as u32);
 
             let signable = inner
                 .client
@@ -322,16 +313,19 @@ impl ClobRestClient {
         let p_max = parse_decimal_trunc(p_max, 8)?;
         let fee_rate_bps = self.get_fee_rate_bps_for_id(token_id).await?;
 
-        let _guard = inner.sign_mutex.lock().await;
-        inner
-            .client
-            .set_fee_rate_bps(token_id, fee_rate_bps as u32);
+        inner.client.set_fee_rate_bps(token_id, fee_rate_bps as u32);
 
+        // NOTE: `polymarket-client-sdk` supports BUY market orders with `amount` specified in
+        // either shares or USDC. We use shares so the completion targets an exact share delta,
+        // while `p_max` acts as an explicit price cap (FAK/FOK).
         let signable = inner
             .client
             .market_order()
             .token_id(token_id)
-            .amount(Amount::shares(shares).map_err(|e| BotError::Other(format!("invalid shares: {e}")))?)
+            .amount(
+                Amount::shares(shares)
+                    .map_err(|e| BotError::Other(format!("invalid shares: {e}")))?,
+            )
             .side(Side::Buy)
             .order_type(map_completion_order_type(order_type))
             .price(p_max)
@@ -388,12 +382,10 @@ impl ClobRestClient {
         inner
             .fee_rate_cache
             .get_or_fetch(&cache_key, now, || async {
-                let resp = inner
-                    .client
-                    .fee_rate_bps(token_id)
-                    .await
-                    .map_err(|e| BotError::Other(format!("fee_rate fetch failed: {e}")))?;
-                Ok(resp.base_fee as u64)
+                // The SDK internally caches `fee_rate_bps` with no TTL. We bypass that cache so
+                // our TTL is honored, and then we explicitly seed the SDK cache right before
+                // signing via `set_fee_rate_bps(...)`.
+                fetch_fee_rate_bps_uncached(inner, token_id).await
             })
             .await
     }
@@ -412,7 +404,11 @@ impl ClobRestClient {
             )));
         }
 
-        Ok(result.accepted.into_iter().map(|item| item.order_id).collect())
+        Ok(result
+            .accepted
+            .into_iter()
+            .map(|item| item.order_id)
+            .collect())
     }
 
     pub async fn post_orders_result(
@@ -426,10 +422,8 @@ impl ClobRestClient {
             return Ok(PostOrdersResult::default());
         }
 
-        let token_ids: Vec<Option<String>> = orders
-            .iter()
-            .map(extract_signed_order_token_id)
-            .collect();
+        let token_ids: Vec<Option<String>> =
+            orders.iter().map(extract_signed_order_token_id).collect();
 
         let responses = inner
             .client
@@ -686,8 +680,7 @@ fn parse_condition_id(condition_id: &str) -> BotResult<B256> {
     if condition_id.is_empty() {
         return Err(BotError::Other("condition_id empty".to_string()));
     }
-    B256::from_str(condition_id)
-        .map_err(|e| BotError::Other(format!("invalid condition_id: {e}")))
+    B256::from_str(condition_id).map_err(|e| BotError::Other(format!("invalid condition_id: {e}")))
 }
 
 fn parse_decimal(value: f64, max_dp: usize) -> BotResult<Decimal> {
@@ -731,11 +724,7 @@ fn parse_decimal_trunc(value: f64, max_dp: usize) -> BotResult<Decimal> {
     let int_part = scaled / scale;
     let frac_part = scaled % scale;
 
-    let mut s = format!(
-        "{int_part}.{:0width$}",
-        frac_part,
-        width = max_dp
-    );
+    let mut s = format!("{int_part}.{:0width$}", frac_part, width = max_dp);
     while s.contains('.') && s.ends_with('0') {
         s.pop();
     }
@@ -757,6 +746,33 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+async fn fetch_fee_rate_bps_uncached(inner: &SdkHandle, token_id: U256) -> BotResult<u64> {
+    let base = inner.client.host().as_str().trim_end_matches('/');
+    let url = format!("{base}/fee-rate");
+
+    let resp = inner
+        .fee_rate_http
+        .get(url)
+        .query(&[("token_id", token_id.to_string())])
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "<failed to read response body>".to_string());
+        let body = body.chars().take(300).collect::<String>();
+        return Err(BotError::Other(format!(
+            "fee_rate fetch failed: status={status} token_id={token_id} body={body}"
+        )));
+    }
+
+    let parsed = resp.json::<FeeRateResponse>().await?;
+    Ok(parsed.base_fee as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,8 +780,14 @@ mod tests {
 
     #[test]
     fn completion_order_type_mapping() {
-        assert_eq!(map_completion_order_type(CompletionOrderType::Fak), SdkOrderType::FAK);
-        assert_eq!(map_completion_order_type(CompletionOrderType::Fok), SdkOrderType::FOK);
+        assert_eq!(
+            map_completion_order_type(CompletionOrderType::Fak),
+            SdkOrderType::FAK
+        );
+        assert_eq!(
+            map_completion_order_type(CompletionOrderType::Fok),
+            SdkOrderType::FOK
+        );
     }
 
     #[tokio::test]
@@ -801,9 +823,12 @@ mod tests {
             grace_ms: 25,
         };
 
-        let res = tokio::time::timeout(Duration::from_millis(500), run_heartbeat_supervisor(api.clone(), cfg))
-            .await
-            .expect("timeout");
+        let res = tokio::time::timeout(
+            Duration::from_millis(500),
+            run_heartbeat_supervisor(api.clone(), cfg),
+        )
+        .await
+        .expect("timeout");
         assert!(res.is_err(), "expected grace exceeded");
         assert_eq!(api.cancels.load(Ordering::SeqCst), 1);
     }
@@ -830,6 +855,37 @@ mod tests {
         assert_eq!(first, 42);
         assert_eq!(second, 42);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fee_rate_cache_refetches_after_ttl() {
+        let cache = FeeRateCache::new(100);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let fetch = |calls: Arc<AtomicUsize>| async move {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            Ok(40u64 + n as u64)
+        };
+
+        let first = cache
+            .get_or_fetch("token", 0, || fetch(calls.clone()))
+            .await
+            .expect("fetch failed");
+        let second = cache
+            .get_or_fetch("token", 101, || fetch(calls.clone()))
+            .await
+            .expect("fetch failed");
+
+        assert_eq!(first, 40);
+        assert_eq!(second, 41);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn parses_fee_rate_response_base_fee() {
+        let parsed: FeeRateResponse =
+            serde_json::from_str(r#"{"base_fee":12}"#).expect("parse FeeRateResponse");
+        assert_eq!(parsed.base_fee, 12);
     }
 
     #[test]
@@ -871,5 +927,60 @@ mod tests {
 
         assert_eq!(result.rejected[0].idx, 1);
         assert_eq!(result.rejected[0].error, "insufficient balance");
+    }
+
+    #[tokio::test]
+    async fn completion_order_buy_amount_can_be_shares_in_sdk() {
+        use polymarket_client_sdk::clob::types::TickSize;
+
+        let token_id = U256::from(123u64);
+
+        let signer: PrivateKeySigner =
+            "0000000000000000000000000000000000000000000000000000000000000001"
+                .parse::<PrivateKeySigner>()
+                .expect("parse signer")
+                .with_chain_id(Some(POLYGON));
+
+        let creds = Credentials::new(Uuid::nil(), "secret".to_string(), "pass".to_string());
+        let sdk = SdkClient::new("http://localhost", SdkConfig::default()).expect("sdk client");
+
+        let mut client = sdk
+            .authentication_builder(&signer)
+            .credentials(creds)
+            .signature_type(SignatureType::Eoa)
+            .authenticate()
+            .await
+            .expect("authenticate");
+        client.stop_heartbeats().await.expect("stop heartbeats");
+
+        client.set_tick_size(token_id, TickSize::Hundredth);
+        client.set_neg_risk(token_id, false);
+
+        let fee_rate_cache = FeeRateCache::new(DEFAULT_FEE_RATE_TTL_MS);
+        fee_rate_cache
+            .set(&token_id.to_string(), 12, now_ms())
+            .await;
+
+        let rest = ClobRestClient {
+            inner: Some(Arc::new(SdkHandle {
+                client,
+                signer,
+                fee_rate_cache,
+                fee_rate_http: reqwest::Client::new(),
+            })),
+        };
+
+        let signed = rest
+            .build_completion_order("123", 10.0, 0.35, CompletionOrderType::Fak, now_ms())
+            .await
+            .expect("build completion order");
+
+        assert_eq!(signed.order.tokenId, token_id);
+        assert_eq!(signed.order.side, Side::Buy as u8);
+        assert_eq!(signed.order_type, SdkOrderType::FAK);
+        assert_eq!(signed.post_only, None);
+        assert_eq!(signed.order.feeRateBps, U256::from(12u64));
+        assert_eq!(signed.order.takerAmount, U256::from(10_000_000u64));
+        assert_eq!(signed.order.makerAmount, U256::from(3_500_000u64));
     }
 }

@@ -22,6 +22,44 @@ use crate::time::BTC_15M_INTERVAL_S;
 const EPS: f64 = 1e-12;
 const BACKOFF_BASE_MS: u64 = 250;
 const BACKOFF_MAX_MS: u64 = 5_000;
+const UNKNOWN_USER_UPDATE_WARN_INTERVAL_MS: i64 = 30_000;
+const UNKNOWN_USER_UPDATE_CANCEL_INTERVAL_MS: i64 = 10_000;
+
+#[derive(Debug, Default)]
+struct UnknownUserUpdateLimiter {
+    last_warn_ms_by_token: HashMap<String, i64>,
+    last_cancel_ms_by_order: HashMap<String, i64>,
+}
+
+impl UnknownUserUpdateLimiter {
+    fn should_warn(&mut self, token_id: &str, now_ms: i64) -> bool {
+        if token_id.is_empty() {
+            return false;
+        }
+        if let Some(last) = self.last_warn_ms_by_token.get(token_id) {
+            if now_ms.saturating_sub(*last) < UNKNOWN_USER_UPDATE_WARN_INTERVAL_MS {
+                return false;
+            }
+        }
+        self.last_warn_ms_by_token
+            .insert(token_id.to_string(), now_ms);
+        true
+    }
+
+    fn should_cancel(&mut self, order_id: &str, now_ms: i64) -> bool {
+        if order_id.is_empty() {
+            return false;
+        }
+        if let Some(last) = self.last_cancel_ms_by_order.get(order_id) {
+            if now_ms.saturating_sub(*last) < UNKNOWN_USER_UPDATE_CANCEL_INTERVAL_MS {
+                return false;
+            }
+        }
+        self.last_cancel_ms_by_order
+            .insert(order_id.to_string(), now_ms);
+        true
+    }
+}
 
 trait OrderRestClient: Send + Sync {
     fn build_signed_orders(
@@ -33,10 +71,8 @@ trait OrderRestClient: Send + Sync {
         &self,
         orders: Vec<OrderRequest>,
     ) -> BoxFuture<'static, BotResult<PostOutcome>>;
-    fn cancel_orders(
-        &self,
-        order_ids: Vec<OrderId>,
-    ) -> BoxFuture<'static, BotResult<CancelResult>>;
+    fn cancel_orders(&self, order_ids: Vec<OrderId>)
+        -> BoxFuture<'static, BotResult<CancelResult>>;
 }
 
 impl OrderRestClient for ClobRestClient {
@@ -101,6 +137,7 @@ struct MarketOrderCache {
     live: HashMap<(String, usize), LiveOrder>,
     last_update_ms: HashMap<(String, usize), i64>,
     order_id_index: HashMap<String, (String, usize)>,
+    tracked_tokens: HashSet<String>,
     tick_size: HashMap<String, f64>,
     backoff_until_ms: i64,
     backoff_ms: u64,
@@ -111,7 +148,9 @@ impl MarketOrderCache {
         let key = (order.token_id.clone(), order.level);
         self.order_id_index
             .insert(order.order_id.clone(), key.clone());
-        self.last_update_ms.insert(key.clone(), order.last_update_ms);
+        self.last_update_ms
+            .insert(key.clone(), order.last_update_ms);
+        self.tracked_tokens.insert(order.token_id.clone());
         self.live.insert(key, order);
     }
 
@@ -119,6 +158,7 @@ impl MarketOrderCache {
         self.live.clear();
         self.last_update_ms.clear();
         self.order_id_index.clear();
+        self.tracked_tokens.clear();
     }
 
     fn remove_live_by_key(&mut self, key: &(String, usize)) -> Option<LiveOrder> {
@@ -134,7 +174,15 @@ impl MarketOrderCache {
         self.order_id_index.get(order_id).cloned()
     }
 
+    fn tracks_token(&self, token_id: &str) -> bool {
+        !token_id.is_empty() && self.tracked_tokens.contains(token_id)
+    }
+
     fn update_tick_cache(&mut self, desired: &[DesiredOrder], ladder_step_ticks: u64) {
+        for order in desired {
+            self.tracked_tokens.insert(order.token_id.clone());
+        }
+
         if desired.len() < 2 || ladder_step_ticks == 0 {
             return;
         }
@@ -202,6 +250,7 @@ pub struct OrderManager {
     markets: HashMap<String, MarketOrderCache>,
     owner: Option<String>,
     user_orders: Option<Receiver<UserOrderUpdate>>,
+    unknown_update_limiter: UnknownUserUpdateLimiter,
 }
 
 impl OrderManager {
@@ -224,6 +273,7 @@ impl OrderManager {
             markets: HashMap::new(),
             owner: default_owner_from_env(),
             user_orders: Some(user_orders),
+            unknown_update_limiter: UnknownUserUpdateLimiter::default(),
         }
     }
 
@@ -324,7 +374,7 @@ impl OrderManager {
                 tx_events,
                 log_tx,
             )
-                .await
+            .await
             {
                 apply_backoff(cache, &cmd.slug, now_ms, err);
                 return;
@@ -332,7 +382,11 @@ impl OrderManager {
         }
 
         let mut posts = plan.posts;
-        posts.retain(|post| !cache.live.contains_key(&(post.token_id.clone(), post.level)));
+        posts.retain(|post| {
+            !cache
+                .live
+                .contains_key(&(post.token_id.clone(), post.level))
+        });
 
         if posts.is_empty() {
             return;
@@ -382,20 +436,138 @@ impl OrderManager {
         }
     }
 
-    fn handle_user_order_update(&mut self, update: UserOrderUpdate, tx_events: Option<&Sender<AppEvent>>) {
+    fn handle_user_order_update(
+        &mut self,
+        update: UserOrderUpdate,
+        tx_events: Option<&Sender<AppEvent>>,
+    ) {
+        let mut tracked_slug: Option<String> = None;
+
         for (slug, cache) in self.markets.iter_mut() {
+            if tracked_slug.is_none() && cache.tracks_token(&update.token_id) {
+                tracked_slug = Some(slug.clone());
+            }
+
             if let Some(order_update) = apply_user_order_update(cache, &update, slug) {
                 emit_order_update(tx_events, order_update);
                 return;
             }
         }
 
-        tracing::debug!(
-            target: "order_manager",
-            order_id = %update.order_id,
-            token_id = %update.token_id,
-            "user order update did not match live cache"
+        let Some(slug) = tracked_slug else {
+            tracing::debug!(
+                target: "order_manager",
+                order_id = %update.order_id,
+                token_id = %update.token_id,
+                update_type = ?update.update_type,
+                "ignoring user order update for untracked token"
+            );
+            return;
+        };
+
+        let now_ms = if update.ts_ms > 0 {
+            update.ts_ms
+        } else {
+            now_ms()
+        };
+
+        let is_potentially_live = matches!(
+            update.update_type,
+            UserOrderUpdateType::Placement | UserOrderUpdateType::Update
         );
+
+        if is_potentially_live
+            && self
+                .unknown_update_limiter
+                .should_warn(&update.token_id, now_ms)
+        {
+            tracing::warn!(
+                target: "order_manager",
+                slug = %slug,
+                order_id = %update.order_id,
+                token_id = %update.token_id,
+                update_type = ?update.update_type,
+                price = update.price.unwrap_or_default(),
+                original_size = update.original_size.unwrap_or_default(),
+                size_matched = update.size_matched.unwrap_or_default(),
+                "user order update did not match live cache (possible desync)"
+            );
+        } else if !is_potentially_live {
+            tracing::debug!(
+                target: "order_manager",
+                slug = %slug,
+                order_id = %update.order_id,
+                token_id = %update.token_id,
+                update_type = ?update.update_type,
+                "user order update did not match live cache"
+            );
+        }
+
+        if self.cfg.dry_run {
+            return;
+        }
+
+        if !is_potentially_live {
+            return;
+        }
+
+        if !self
+            .unknown_update_limiter
+            .should_cancel(&update.order_id, now_ms)
+        {
+            return;
+        }
+
+        let rest = Arc::clone(&self.rest);
+        let slug_for_log = slug.clone();
+        let token_id = update.token_id.clone();
+        let order_id = update.order_id.clone();
+
+        tokio::spawn(async move {
+            match rest.cancel_orders(vec![order_id.clone()]).await {
+                Ok(result) => {
+                    if result.canceled.iter().any(|id| id == &order_id) {
+                        tracing::warn!(
+                            target: "order_manager",
+                            slug = %slug_for_log,
+                            token_id = %token_id,
+                            order_id = %order_id,
+                            action = "cancel_unknown_order",
+                            "canceled unknown order from user update"
+                        );
+                    } else if result.failed.iter().any(|id| id == &order_id) {
+                        tracing::warn!(
+                            target: "order_manager",
+                            slug = %slug_for_log,
+                            token_id = %token_id,
+                            order_id = %order_id,
+                            action = "cancel_unknown_order_failed",
+                            "failed to cancel unknown order from user update"
+                        );
+                    } else {
+                        tracing::info!(
+                            target: "order_manager",
+                            slug = %slug_for_log,
+                            token_id = %token_id,
+                            order_id = %order_id,
+                            action = "cancel_unknown_order_noop",
+                            "cancel attempt returned no status for unknown order"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "order_manager",
+                        slug = %slug_for_log,
+                        token_id = %token_id,
+                        order_id = %order_id,
+                        error = %err,
+                        action = "cancel_unknown_order_error",
+                        "cancel attempt errored for unknown order"
+                    );
+                }
+            }
+        });
     }
 }
 
@@ -429,13 +601,7 @@ async fn execute_cancels(
     }
 
     if !canceled_ids.is_empty() || !failed_ids.is_empty() {
-        log_cancel_result(
-            log_tx,
-            slug,
-            &canceled_ids,
-            &failed_ids,
-            now_ms,
-        );
+        log_cancel_result(log_tx, slug, &canceled_ids, &failed_ids, now_ms);
     }
 
     if !failed_ids.is_empty() {
@@ -490,9 +656,7 @@ async fn execute_posts(
 
     for post_batch in post_batches {
         log_post_batch(log_tx, slug, &post_batch, now_ms);
-        let signed = rest
-            .build_signed_orders(post_batch.clone(), now_ms)
-            .await?;
+        let signed = rest.build_signed_orders(post_batch.clone(), now_ms).await?;
         let outcome = rest.post_orders_partial(signed).await?;
 
         if outcome.results.len() != post_batch.len() {
@@ -554,7 +718,9 @@ async fn execute_posts(
         all_results.extend(outcome.results.into_iter());
     }
 
-    Ok(PostOutcome { results: all_results })
+    Ok(PostOutcome {
+        results: all_results,
+    })
 }
 
 fn apply_user_order_update(
@@ -607,18 +773,12 @@ fn apply_user_order_update(
         let mut size_updated = false;
         let mut matched_updated = false;
 
-        if let Some(size) = update
-            .original_size
-            .filter(|v| v.is_finite() && *v > 0.0)
-        {
+        if let Some(size) = update.original_size.filter(|v| v.is_finite() && *v > 0.0) {
             new_size = size;
             size_updated = true;
         }
 
-        if let Some(size) = update
-            .size_matched
-            .filter(|v| v.is_finite() && *v >= 0.0)
-        {
+        if let Some(size) = update.size_matched.filter(|v| v.is_finite() && *v >= 0.0) {
             matched = size;
             matched_updated = true;
         }
@@ -1136,6 +1296,11 @@ fn apply_post_orders_result(results: &mut [PostResult], expected: usize, result:
     }
 }
 
+fn is_expected_post_only_reject(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("post-only") || e.contains("post only") || e.contains("would cross")
+}
+
 #[derive(Debug, Clone, Default)]
 struct PostOutcome {
     results: Vec<PostResult>,
@@ -1145,7 +1310,15 @@ impl PostOutcome {
     fn failure_count(&self) -> usize {
         self.results
             .iter()
-            .filter(|result| result.order_id.is_none() || result.error.is_some())
+            .filter(|result| {
+                if result.order_id.is_some() && result.error.is_none() {
+                    return false;
+                }
+                !matches!(
+                    result.error.as_deref(),
+                    Some(err) if is_expected_post_only_reject(err)
+                )
+            })
             .count()
     }
 }
@@ -1332,11 +1505,7 @@ mod tests {
             let next_post = self.next_post.clone();
             Box::pin(async move {
                 calls.lock().unwrap().push("post");
-                let result = next_post
-                    .lock()
-                    .unwrap()
-                    .pop()
-                    .unwrap_or_else(Vec::new);
+                let result = next_post.lock().unwrap().pop().unwrap_or_else(Vec::new);
                 Ok(PostOutcome { results: result })
             })
         }
@@ -1349,11 +1518,7 @@ mod tests {
             let next_cancel = self.next_cancel.clone();
             Box::pin(async move {
                 calls.lock().unwrap().push("cancel");
-                let result = next_cancel
-                    .lock()
-                    .unwrap()
-                    .pop()
-                    .unwrap_or_default();
+                let result = next_cancel.lock().unwrap().pop().unwrap_or_default();
                 Ok(result)
             })
         }
@@ -1584,11 +1749,7 @@ mod tests {
         }];
 
         manager
-            .handle_command_with_logger(
-                ExecCommand { slug, desired },
-                None,
-                None,
-            )
+            .handle_command_with_logger(ExecCommand { slug, desired }, None, None)
             .await;
 
         let calls = mock.calls();
@@ -1666,12 +1827,7 @@ mod tests {
             update_type: UserOrderUpdateType::Update,
         };
 
-        assert!(apply_user_order_update(
-            &mut cache,
-            &update,
-            &future_slug()
-        )
-        .is_some());
+        assert!(apply_user_order_update(&mut cache, &update, &future_slug()).is_some());
 
         let desired = vec![DesiredOrder {
             token_id: "token".to_string(),
@@ -1740,6 +1896,116 @@ mod tests {
 
         let calls = mock.calls();
         assert_eq!(calls, vec!["cancel"]);
+    }
+
+    #[test]
+    fn expected_post_only_reject_classification_matches_common_phrases() {
+        assert!(is_expected_post_only_reject(
+            "post-only order would cross the book"
+        ));
+        assert!(is_expected_post_only_reject("Post only would cross"));
+        assert!(is_expected_post_only_reject("ORDER WOULD CROSS"));
+        assert!(!is_expected_post_only_reject("invalid signature"));
+    }
+
+    #[tokio::test]
+    async fn expected_post_only_reject_does_not_trigger_post_backoff() {
+        let cfg = TradingConfig {
+            dry_run: false,
+            min_update_interval_ms: 0,
+            ..TradingConfig::default()
+        };
+
+        let mock = MockRestClient::new();
+        // Note: MockRestClient pops LIFO, so push the second outcome first.
+        mock.push_post_result(vec!["order-ok".to_string()]);
+        mock.push_post_outcome(vec![PostResult {
+            order_id: None,
+            error: Some("post-only order would cross the book".to_string()),
+        }]);
+
+        let (_tx_user_orders, rx_user_orders) = mpsc::channel(1);
+        let mut manager = OrderManager::with_client(cfg, Arc::new(mock.clone()), rx_user_orders);
+        let slug = future_slug();
+
+        let desired = vec![DesiredOrder {
+            token_id: "token".to_string(),
+            level: 0,
+            price: 0.50,
+            size: 10.0,
+            post_only: true,
+            tif: TimeInForce::Gtc,
+        }];
+
+        manager
+            .handle_command_with_logger(
+                ExecCommand {
+                    slug: slug.clone(),
+                    desired: desired.clone(),
+                },
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(manager.markets.get(&slug).unwrap().backoff_ms, 0);
+
+        manager
+            .handle_command_with_logger(ExecCommand { slug, desired }, None, None)
+            .await;
+
+        assert_eq!(mock.calls(), vec!["sign", "post", "sign", "post"]);
+    }
+
+    #[tokio::test]
+    async fn unexpected_post_reject_triggers_post_backoff_and_suppresses_posts() {
+        let cfg = TradingConfig {
+            dry_run: false,
+            min_update_interval_ms: 0,
+            ..TradingConfig::default()
+        };
+
+        let mock = MockRestClient::new();
+        mock.push_post_outcome(vec![PostResult {
+            order_id: None,
+            error: Some("invalid signature".to_string()),
+        }]);
+
+        let (_tx_user_orders, rx_user_orders) = mpsc::channel(1);
+        let mut manager = OrderManager::with_client(cfg, Arc::new(mock.clone()), rx_user_orders);
+        let slug = future_slug();
+        manager.markets.entry(slug.clone()).or_default().backoff_ms = BACKOFF_MAX_MS / 2;
+
+        let desired = vec![DesiredOrder {
+            token_id: "token".to_string(),
+            level: 0,
+            price: 0.50,
+            size: 10.0,
+            post_only: true,
+            tif: TimeInForce::Gtc,
+        }];
+
+        manager
+            .handle_command_with_logger(
+                ExecCommand {
+                    slug: slug.clone(),
+                    desired: desired.clone(),
+                },
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            manager.markets.get(&slug).unwrap().backoff_ms,
+            BACKOFF_MAX_MS
+        );
+
+        manager
+            .handle_command_with_logger(ExecCommand { slug, desired }, None, None)
+            .await;
+
+        assert_eq!(mock.calls(), vec!["sign", "post"]);
     }
 
     #[tokio::test]
@@ -1816,22 +2082,95 @@ mod tests {
             update_type: UserOrderUpdateType::Cancellation,
         };
 
-        assert!(apply_user_order_update(
-            &mut cache,
-            &update,
-            &future_slug()
-        )
-        .is_none());
+        assert!(apply_user_order_update(&mut cache, &update, &future_slug()).is_none());
 
         let mut cache = MarketOrderCache::default();
         cache.insert_live(order);
-        assert!(apply_user_order_update(
-            &mut cache,
-            &update,
-            &future_slug()
-        )
-        .is_some());
+        assert!(apply_user_order_update(&mut cache, &update, &future_slug()).is_some());
         assert!(!cache.order_id_index.contains_key("order-1"));
+    }
+
+    #[tokio::test]
+    async fn unknown_user_update_for_tracked_token_triggers_safe_cancel() {
+        let mut cfg = TradingConfig::default();
+        cfg.dry_run = false;
+
+        let mock = MockRestClient::new();
+        mock.push_cancel_result(CancelResult {
+            canceled: vec!["order-unknown".to_string()],
+            failed: Vec::new(),
+        });
+
+        let (_tx_user_orders, rx_user_orders) = mpsc::channel(1);
+        let mut manager = OrderManager::with_client(cfg, Arc::new(mock.clone()), rx_user_orders);
+        let slug = future_slug();
+        manager
+            .markets
+            .entry(slug)
+            .or_default()
+            .insert_live(make_live("order-known", "token-tracked", 0, 0.50, 10.0));
+
+        manager.handle_user_order_update(
+            UserOrderUpdate {
+                order_id: "order-unknown".to_string(),
+                token_id: "token-tracked".to_string(),
+                price: None,
+                original_size: None,
+                size_matched: None,
+                ts_ms: now_ms(),
+                update_type: UserOrderUpdateType::Placement,
+            },
+            None,
+        );
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if mock.calls().contains(&"cancel") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected cancel attempt for unknown tracked order");
+    }
+
+    #[tokio::test]
+    async fn unknown_user_update_for_untracked_token_does_not_cancel() {
+        let mut cfg = TradingConfig::default();
+        cfg.dry_run = false;
+
+        let mock = MockRestClient::new();
+        let (_tx_user_orders, rx_user_orders) = mpsc::channel(1);
+        let mut manager = OrderManager::with_client(cfg, Arc::new(mock.clone()), rx_user_orders);
+        let slug = future_slug();
+        manager
+            .markets
+            .entry(slug)
+            .or_default()
+            .insert_live(make_live("order-known", "token-tracked", 0, 0.50, 10.0));
+
+        manager.handle_user_order_update(
+            UserOrderUpdate {
+                order_id: "order-unknown".to_string(),
+                token_id: "token-untracked".to_string(),
+                price: None,
+                original_size: None,
+                size_matched: None,
+                ts_ms: now_ms(),
+                update_type: UserOrderUpdateType::Placement,
+            },
+            None,
+        );
+
+        // Give the scheduler a chance in case the implementation spawns tasks.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            !mock.calls().contains(&"cancel"),
+            "unexpected cancel for untracked token"
+        );
     }
 
     fn make_live(order_id: &str, token_id: &str, level: usize, price: f64, size: f64) -> LiveOrder {
@@ -2024,12 +2363,7 @@ mod tests {
             update_type: UserOrderUpdateType::Rejection,
         };
 
-        assert!(apply_user_order_update(
-            &mut cache,
-            &update,
-            &future_slug()
-        )
-        .is_some());
+        assert!(apply_user_order_update(&mut cache, &update, &future_slug()).is_some());
         assert!(cache.live.is_empty());
         assert!(!cache.order_id_index.contains_key("order-1"));
     }

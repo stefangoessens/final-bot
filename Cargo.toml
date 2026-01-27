@@ -11,7 +11,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "1"
 figment = { version = "0.10", features = ["env", "toml", "json"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Keep rustls provider selection explicit (aws-lc-rs) and install it at startup.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
@@ -21,3 +23,6 @@ alloy = "1.4.3"
 rust_decimal = "1"
 hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 prometheus = "0.13"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

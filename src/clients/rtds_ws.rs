@@ -3,6 +3,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::Sender;
+use tokio::time::Instant;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::error::{BotError, BotResult};
@@ -17,6 +18,7 @@ const CHAINLINK_SYMBOL: &str = "btc/usd";
 const MAX_RAW_LOG_BYTES: usize = 8 * 1024;
 const REDACT_PLACEHOLDER: &str = "[REDACTED]";
 const CHAINLINK_WATCHDOG_POLL_MS: u64 = 250;
+const PING_INTERVAL_MS: u64 = 10_000;
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -108,23 +110,28 @@ impl RTDSLoop {
 }
 
 async fn read_loop(
-    mut ws: WsStream,
+    ws: WsStream,
     tx_events: &Sender<AppEvent>,
     log_tx: Option<Sender<LogEvent>>,
     chainlink_stale_ms: i64,
 ) -> BotResult<()> {
+    let (mut write, mut read) = ws.split();
     let connected_ms = now_ms();
     let mut last_chainlink_ms: Option<i64> = None;
     let mut chainlink_stale_logged = false;
     let mut watchdog = tokio::time::interval(Duration::from_millis(CHAINLINK_WATCHDOG_POLL_MS));
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut next_ping = Instant::now() + Duration::from_millis(PING_INTERVAL_MS);
 
     loop {
         tokio::select! {
-            msg = ws.next() => {
+            msg = read.next() => {
                 let Some(msg) = msg else { break };
                 match msg {
                     Ok(Message::Text(text)) => {
+                        if text.trim().eq_ignore_ascii_case("pong") {
+                            continue;
+                        }
                         let ts_ms = now_ms();
                         log_raw_frame(&log_tx, "ws.rtds.raw", ts_ms, &text);
                         if let Some(update) = parse_rtds_update(&text) {
@@ -178,7 +185,7 @@ async fn read_loop(
                         }
                     },
                     Ok(Message::Ping(payload)) => {
-                        let _ = ws.send(Message::Pong(payload)).await;
+                        let _ = write.send(Message::Pong(payload)).await;
                     }
                     Ok(Message::Pong(_)) => {}
                     Ok(Message::Close(frame)) => {
@@ -204,6 +211,10 @@ async fn read_loop(
                     );
                     chainlink_stale_logged = true;
                 }
+            }
+            _ = tokio::time::sleep_until(next_ping) => {
+                next_ping = Instant::now() + Duration::from_millis(PING_INTERVAL_MS);
+                let _ = write.send(Message::Text("PING".to_string().into())).await;
             }
         }
     }
@@ -294,12 +305,7 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn log_raw_frame(
-    log_tx: &Option<Sender<LogEvent>>,
-    event: &str,
-    ts_ms: i64,
-    text: &str,
-) {
+fn log_raw_frame(log_tx: &Option<Sender<LogEvent>>, event: &str, ts_ms: i64, text: &str) {
     let Some(tx) = log_tx else {
         return;
     };
@@ -493,6 +499,31 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
 
+    async fn recv_with_advance(
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        timeout: Duration,
+    ) -> String {
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let step = Duration::from_millis(10);
+        let mut waited = Duration::ZERO;
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => return msg,
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => panic!("server channel disconnected"),
+            }
+
+            if waited >= timeout {
+                panic!("timed out waiting for server message");
+            }
+
+            tokio::time::advance(step).await;
+            tokio::task::yield_now().await;
+            waited += step;
+        }
+    }
+
     #[test]
     fn parses_binance_btcusdt_update() {
         let msg = r#"{"topic":"crypto_prices","type":"update","timestamp":1753314088421,"payload":{"symbol":"btcusdt","timestamp":1753314088395,"value":67234.5}}"#;
@@ -514,7 +545,10 @@ mod tests {
         let mut saw_chainlink = false;
         let mut saw_binance = false;
         for sub in subs {
-            let topic = sub.get("topic").and_then(|v| v.as_str()).unwrap_or_default();
+            let topic = sub
+                .get("topic")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             match topic {
                 TOPIC_CHAINLINK => {
                     saw_chainlink = true;
@@ -537,5 +571,64 @@ mod tests {
 
         assert!(saw_chainlink, "missing chainlink subscription");
         assert!(saw_binance, "missing binance subscription");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sends_text_ping_keepalives() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let (tx_frames, mut rx_frames) = tokio::sync::mpsc::channel::<String>(8);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept_async");
+
+            while let Some(msg) = ws.next().await {
+                let Ok(msg) = msg else { break };
+                match msg {
+                    Message::Text(text) => {
+                        let text = text.to_string();
+                        if tx_frames.send(text.clone()).await.is_err() {
+                            break;
+                        }
+                        if text.eq_ignore_ascii_case("PING") {
+                            let _ = ws.send(Message::Text("PONG".to_string().into())).await;
+                            let _ = ws.close(None).await;
+                            break;
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        let _ = ws.send(Message::Pong(payload)).await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let url = format!("ws://{}", addr);
+        let client = RTDSLoop::new(url, 60_000);
+        let (tx_events, _rx_events) = tokio::sync::mpsc::channel::<AppEvent>(8);
+        let client_task =
+            tokio::spawn(async move { client.connect_and_run(&tx_events, None).await });
+
+        let subscribe = recv_with_advance(&mut rx_frames, Duration::from_secs(1)).await;
+        assert!(subscribe.contains("\"action\":\"subscribe\""));
+
+        tokio::time::advance(Duration::from_millis(PING_INTERVAL_MS)).await;
+        tokio::task::yield_now().await;
+
+        let ping = recv_with_advance(&mut rx_frames, Duration::from_secs(1)).await;
+        assert!(
+            ping.eq_ignore_ascii_case("PING"),
+            "expected PING, got {ping:?}"
+        );
+
+        server.await.expect("server task");
+        client_task.await.expect("client task").expect("client ok");
     }
 }

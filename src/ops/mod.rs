@@ -2,6 +2,7 @@ pub mod health;
 pub mod logging;
 pub mod metrics;
 pub mod shutdown;
+pub mod tls;
 
 use std::net::SocketAddr;
 

@@ -61,3 +61,15 @@ Task status:
 - [x] W7.16 Event-log disk budget + rotation + sampling policy
 - [ ] W7.17 Replace synthetic reject fixture with captured live user-WS reject frame
 - [x] W7.18 Data API mergeable/redeemable readiness integration (remove stubs)
+
+## Wave 8 (Stability hardening)
+- [x] W8.1 User WS order-update backpressure (non-blocking forward)
+- [x] W8.2 Fee-rate refresh semantics + remove sign_mutex
+- [x] W8.3 OrderManager unknown order-update handling (token-aware + rate-limited)
+
+## Wave 9 (Review-driven hardening)
+- [x] W9.1 Completion order construction audit (shares semantics + strict cap)
+- [x] W9.2 RTDS WS keepalive ping (text PING/PONG)
+- [x] W9.3 Execution backoff: ignore expected post-only rejects
+- [x] W9.4 Inventory desync watchdog (Data API compare -> cancel+shutdown)
+- [x] W9.5 Config validation: reject unimplemented key sources/modes

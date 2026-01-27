@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{BotError, BotResult};
 
@@ -22,10 +22,14 @@ impl ClobPublicClient {
         }
 
         let url = format!("{}/books", self.base_url.trim_end_matches('/'));
+        let body: Vec<BooksRequestItem<'_>> = token_ids
+            .iter()
+            .map(|token_id| BooksRequestItem { token_id })
+            .collect();
         let resp = self
             .http
             .post(url)
-            .json(&serde_json::json!({ "token_ids": token_ids }))
+            .json(&body)
             .send()
             .await?;
 
@@ -59,6 +63,11 @@ struct BookResponse {
     tick_size: f64,
 }
 
+#[derive(Debug, Serialize)]
+struct BooksRequestItem<'a> {
+    token_id: &'a str,
+}
+
 fn de_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -90,5 +99,15 @@ mod tests {
         assert_eq!(parsed[0].asset_id, "1");
         assert!((parsed[0].tick_size - 0.01).abs() < 1e-12);
     }
-}
 
+    #[test]
+    fn serializes_books_request_body() {
+        let token_ids = ["1".to_string(), "2".to_string()];
+        let body: Vec<BooksRequestItem<'_>> = token_ids
+            .iter()
+            .map(|token_id| BooksRequestItem { token_id })
+            .collect();
+        let value = serde_json::to_value(&body).expect("serialize books");
+        assert_eq!(value, serde_json::json!([{"token_id":"1"},{"token_id":"2"}]));
+    }
+}

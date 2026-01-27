@@ -20,12 +20,15 @@ mod reconciliation;
 
 use crate::error::BotResult;
 use crate::persistence::{spawn_event_logger, EventLogConfig};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> BotResult<()> {
     let cfg = config::load_config()?;
     ops::logging::init_with_default(&cfg.infra.log_level);
+    // Install rustls crypto provider before any TLS clients are constructed.
+    ops::tls::install_rustls_provider();
     let ops_state = ops::OpsState::new(&cfg);
     let (shutdown_trigger, shutdown) = ops::start_http_servers(&cfg, ops_state.clone());
 
@@ -50,6 +53,18 @@ async fn main() -> BotResult<()> {
     let (tx_user_orders, rx_user_orders) = mpsc::channel(256);
     let rewards_enabled = cfg.rewards.enable_liquidity_rewards_chasing;
     let (fatal_tx, fatal_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+    let data_api_user = reconciliation::resolve_data_api_user(&cfg);
+    let enable_desync_watchdog = !cfg.trading.dry_run
+        && cfg.inventory.desync_watchdog_enabled
+        && data_api_user.is_some()
+        && !cfg.endpoints.data_api_base_url.trim().is_empty();
+
+    let (tx_quote_desync, rx_quote_desync) = if enable_desync_watchdog {
+        let (tx, rx) = mpsc::channel(64);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
 
     tokio::spawn(
         state::state_manager::StateManager::new(
@@ -67,10 +82,12 @@ async fn main() -> BotResult<()> {
         let tx_quote_strategy = tx_quote_strategy;
         let tx_quote_inventory = tx_quote_inventory;
         let tx_quote_rewards = tx_quote_rewards;
+        let tx_quote_desync = tx_quote_desync;
         let rewards_enabled = rewards_enabled;
 
         while let Some(tick) = rx_quote_raw.recv().await {
             let tick_for_strategy = tick.clone();
+            let tick_for_desync = tx_quote_desync.as_ref().map(|_| tick.clone());
             let tick_for_rewards = if rewards_enabled {
                 Some(tick.clone())
             } else {
@@ -100,6 +117,15 @@ async fn main() -> BotResult<()> {
                     target: "quote_fanout",
                     "inventory loop lagging; dropping quote tick"
                 );
+            }
+
+            if let (Some(tx_quote_desync), Some(tick)) = (&tx_quote_desync, tick_for_desync) {
+                if tx_quote_desync.try_send(tick).is_err() {
+                    tracing::debug!(
+                        target: "quote_fanout",
+                        "desync watchdog lagging; dropping quote tick"
+                    );
+                }
             }
 
             if rewards_enabled {
@@ -160,7 +186,9 @@ async fn main() -> BotResult<()> {
                     return Err(err);
                 }
             } else if !reconciliation.cancel_order_ids.is_empty() {
-                if let Err(err) = rest.cancel_orders(reconciliation.cancel_order_ids.clone()).await
+                if let Err(err) = rest
+                    .cancel_orders(reconciliation.cancel_order_ids.clone())
+                    .await
                 {
                     tracing::warn!(
                         target: "startup",
@@ -225,11 +253,35 @@ async fn main() -> BotResult<()> {
         inventory::InventoryExecutor::new(tx_onchain),
         cfg.merge.interval_s,
     );
-    if let (Some(data_api), Some(user)) = (data_api.clone(), reconciliation::resolve_data_api_user(&cfg)) {
+    if let (Some(data_api), Some(user)) = (data_api.clone(), data_api_user.clone()) {
         inventory_loop =
             inventory_loop.with_readiness(data_api, user, cfg.merge.readiness_poll_interval_s);
     }
     tokio::spawn(inventory_loop.run(rx_quote_inventory));
+
+    if let (Some(rx_quote_desync), Some(data_api), Some(user)) =
+        (rx_quote_desync, data_api.clone(), data_api_user.clone())
+    {
+        tracing::info!(
+            target: "desync_watchdog",
+            interval_s = cfg.inventory.desync_watchdog_interval_s,
+            mismatch_hold_s = cfg.inventory.desync_watchdog_mismatch_hold_s,
+            max_abs_shares_diff = cfg.inventory.desync_watchdog_max_abs_shares_diff,
+            "starting inventory desync watchdog"
+        );
+        inventory::spawn_desync_watchdog(
+            inventory::DesyncWatchdogConfig {
+                interval_s: cfg.inventory.desync_watchdog_interval_s,
+                mismatch_hold_s: cfg.inventory.desync_watchdog_mismatch_hold_s,
+                max_abs_shares_diff: cfg.inventory.desync_watchdog_max_abs_shares_diff,
+            },
+            rx_quote_desync,
+            Arc::new(data_api),
+            user,
+            fatal_tx.clone(),
+            shutdown_trigger.clone(),
+        );
+    }
 
     let mut order_manager = execution::order_manager::OrderManager::new(
         cfg.trading.clone(),
@@ -248,11 +300,7 @@ async fn main() -> BotResult<()> {
 
     let completion_executor =
         execution::completion::CompletionExecutor::new(cfg.completion.clone(), rest.clone());
-    tokio::spawn(completion_executor.run(
-        rx_completion,
-        Some(tx_log.clone()),
-        cfg.trading.dry_run,
-    ));
+    tokio::spawn(completion_executor.run(rx_completion, Some(tx_log.clone()), cfg.trading.dry_run));
 
     let market_ws =
         clients::clob_ws_market::MarketWsLoop::new(cfg.endpoints.clob_ws_market_url.clone());
@@ -285,9 +333,7 @@ async fn main() -> BotResult<()> {
                     error = %err,
                     "heartbeat supervisor exited; shutting down"
                 );
-                let _ = fatal_tx.send(Some(format!(
-                    "heartbeat supervisor exited: {err}"
-                )));
+                let _ = fatal_tx.send(Some(format!("heartbeat supervisor exited: {err}")));
                 shutdown_trigger.trigger();
             }
         });

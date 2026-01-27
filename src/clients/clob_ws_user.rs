@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -18,6 +20,8 @@ const BACKOFF_MAX_MS: u64 = 20_000;
 const BACKOFF_MULTIPLIER: f64 = 1.7;
 const MAX_RAW_LOG_BYTES: usize = 8 * 1024;
 const REDACT_PLACEHOLDER: &str = "[REDACTED]";
+
+static ORDER_UPDATE_DROPPED: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserOrderUpdateType {
@@ -279,11 +283,32 @@ impl UserWsLoop {
                     heartbeat_ts = Some(update.ts_ms);
                     log_user_order_update(log_tx, &update);
                     if let Some(tx_orders) = tx_order_updates {
-                        if tx_orders.send(update).await.is_err() {
-                            tracing::warn!(
-                                target: "clob_ws_user",
-                                "order update channel closed"
-                            );
+                        match tx_orders.try_send(update) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(update)) => {
+                                let count =
+                                    ORDER_UPDATE_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                                tracing::debug!(
+                                    target: "clob_ws_user",
+                                    order_id = %update.order_id,
+                                    token_id = %update.token_id,
+                                    dropped = count,
+                                    "order update channel full; dropping update"
+                                );
+                                if count.is_multiple_of(100) {
+                                    tracing::warn!(
+                                        target: "clob_ws_user",
+                                        dropped = count,
+                                        "order update channel full; dropping updates"
+                                    );
+                                }
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                tracing::warn!(
+                                    target: "clob_ws_user",
+                                    "order update channel closed"
+                                );
+                            }
                         }
                     }
                 }
@@ -765,6 +790,7 @@ fn is_word_char(byte: Option<u8>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::{timeout, Duration};
 
     #[test]
     fn parse_trade_message_into_fill_event() {
@@ -900,5 +926,49 @@ mod tests {
         assert_eq!(update.original_size, None);
         assert_eq!(update.size_matched, None);
         assert_eq!(update.ts_ms, 1_672_290_687_000);
+    }
+
+    #[tokio::test]
+    async fn handle_text_does_not_block_when_order_update_channel_full() {
+        let loop_ = UserWsLoop::new(
+            "ws://127.0.0.1".to_string(),
+            "api_key".to_string(),
+            "api_secret".to_string(),
+            "api_passphrase".to_string(),
+            Vec::new(),
+            None,
+        );
+
+        let (tx_events, _rx_events) = tokio::sync::mpsc::channel::<AppEvent>(8);
+        let (tx_orders, _rx_orders) = tokio::sync::mpsc::channel::<UserOrderUpdate>(1);
+
+        // Fill the channel so a send() would have to await.
+        tx_orders
+            .try_send(UserOrderUpdate {
+                order_id: "order".to_string(),
+                token_id: "token".to_string(),
+                price: None,
+                original_size: None,
+                size_matched: None,
+                ts_ms: 0,
+                update_type: UserOrderUpdateType::Update,
+            })
+            .expect("fill");
+
+        let raw = r#"{
+            "asset_id": "token",
+            "event_type": "order",
+            "id": "order-2",
+            "timestamp": "1672290687",
+            "type": "UPDATE"
+        }"#;
+
+        timeout(
+            Duration::from_millis(50),
+            loop_.handle_text(raw, &tx_events, Some(&tx_orders), None),
+        )
+        .await
+        .expect("handle_text should not block")
+        .expect("handle_text ok");
     }
 }
