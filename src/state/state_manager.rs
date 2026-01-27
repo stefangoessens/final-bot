@@ -5,7 +5,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use crate::config::{AlphaConfig, OracleConfig, TradingConfig};
 use crate::ops::health::HealthState;
 use crate::ops::metrics::Metrics;
-use crate::state::inventory::TokenSide;
+use crate::state::inventory::{TokenSide, USDC_BASE_UNITS_F64};
 use crate::state::market_state::{MarketIdentity, MarketState};
 
 #[derive(Debug, Clone)]
@@ -61,6 +61,12 @@ pub enum AppEvent {
     MarketWsUpdate(MarketWsUpdate),
     UserWsUpdate(UserWsUpdate),
     RTDSUpdate(RTDSUpdate),
+    OnchainMerge {
+        condition_id: String,
+        qty_base_units: u64,
+        ts_ms: i64,
+    },
+    OnchainRedeem { condition_id: String, ts_ms: i64 },
     TimerTick { now_ms: i64 },
 }
 
@@ -105,6 +111,8 @@ impl StateManager {
                 AppEvent::MarketWsUpdate(u) => (u.ts_ms, false),
                 AppEvent::UserWsUpdate(UserWsUpdate::Fill(f)) => (f.ts_ms, false),
                 AppEvent::RTDSUpdate(u) => (u.ts_ms, false),
+                AppEvent::OnchainMerge { ts_ms, .. } => (*ts_ms, false),
+                AppEvent::OnchainRedeem { ts_ms, .. } => (*ts_ms, false),
                 AppEvent::MarketDiscovered(_) | AppEvent::SetTrackedMarkets { .. } => {
                     (now_ms(), false)
                 }
@@ -165,6 +173,16 @@ impl StateManager {
                     RTDSSource::ChainlinkBtcUsd => self.health.mark_chainlink(update.ts_ms),
                 }
                 self.apply_rtds_update(update);
+            }
+            AppEvent::OnchainMerge {
+                condition_id,
+                qty_base_units,
+                ..
+            } => {
+                self.apply_onchain_merge(&condition_id, qty_base_units);
+            }
+            AppEvent::OnchainRedeem { condition_id, .. } => {
+                self.apply_onchain_redeem(&condition_id);
             }
             AppEvent::TimerTick { .. } => {
                 self.update_health_metrics(now_ms);
@@ -253,6 +271,28 @@ impl StateManager {
                         ts_ms: update.ts_ms,
                     });
                 }
+            }
+        }
+    }
+
+    fn apply_onchain_merge(&mut self, condition_id: &str, qty_base_units: u64) {
+        if qty_base_units == 0 {
+            return;
+        }
+        let shares = (qty_base_units as f64) / USDC_BASE_UNITS_F64;
+        for state in self.markets.values_mut() {
+            if state.identity.condition_id == condition_id {
+                state.inventory.apply_merge(shares);
+                return;
+            }
+        }
+    }
+
+    fn apply_onchain_redeem(&mut self, condition_id: &str) {
+        for state in self.markets.values_mut() {
+            if state.identity.condition_id == condition_id {
+                state.inventory.apply_redeem();
+                return;
             }
         }
     }
@@ -356,5 +396,89 @@ mod tests {
         assert_eq!(state.down_book.tick_size, 0.001);
         assert_eq!(state.down_book.best_bid, Some(0.49));
         assert_eq!(state.down_book.best_ask, Some(0.51));
+    }
+
+    #[test]
+    fn onchain_merge_updates_inventory_proportionally() {
+        let ops = OpsState::new(&AppConfig::default());
+        let mut sm = StateManager::new(
+            AlphaConfig::default(),
+            OracleConfig::default(),
+            TradingConfig::default(),
+            ops.health,
+            ops.metrics,
+        );
+        sm.apply_event(AppEvent::MarketDiscovered(make_identity()), 0);
+
+        sm.apply_event(
+            AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
+                token_id: "up".to_string(),
+                price: 0.4,
+                shares: 10.0,
+                ts_ms: 1_000,
+            })),
+            1_000,
+        );
+        sm.apply_event(
+            AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
+                token_id: "down".to_string(),
+                price: 0.6,
+                shares: 10.0,
+                ts_ms: 1_000,
+            })),
+            1_000,
+        );
+
+        sm.apply_event(
+            AppEvent::OnchainMerge {
+                condition_id: "cond".to_string(),
+                qty_base_units: 5_000_000,
+                ts_ms: 2_000,
+            },
+            2_000,
+        );
+
+        let state = sm.market_state("btc-updown-15m-0").unwrap();
+        assert_eq!(state.inventory.up.shares, 5.0);
+        assert!((state.inventory.up.notional_usdc - 2.0).abs() < 1e-12);
+        assert_eq!(state.inventory.down.shares, 5.0);
+        assert!((state.inventory.down.notional_usdc - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn onchain_redeem_clears_inventory() {
+        let ops = OpsState::new(&AppConfig::default());
+        let mut sm = StateManager::new(
+            AlphaConfig::default(),
+            OracleConfig::default(),
+            TradingConfig::default(),
+            ops.health,
+            ops.metrics,
+        );
+        sm.apply_event(AppEvent::MarketDiscovered(make_identity()), 0);
+
+        sm.apply_event(
+            AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
+                token_id: "up".to_string(),
+                price: 0.45,
+                shares: 4.0,
+                ts_ms: 1_000,
+            })),
+            1_000,
+        );
+
+        sm.apply_event(
+            AppEvent::OnchainRedeem {
+                condition_id: "cond".to_string(),
+                ts_ms: 2_000,
+            },
+            2_000,
+        );
+
+        let state = sm.market_state("btc-updown-15m-0").unwrap();
+        assert_eq!(state.inventory.up.shares, 0.0);
+        assert_eq!(state.inventory.up.notional_usdc, 0.0);
+        assert_eq!(state.inventory.down.shares, 0.0);
+        assert_eq!(state.inventory.down.notional_usdc, 0.0);
     }
 }

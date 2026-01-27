@@ -12,9 +12,15 @@ use crate::inventory::onchain::OnchainRequest;
 use crate::state::market_state::MarketState;
 use crate::state::state_manager::QuoteTick;
 
+const USDC_BASE_UNITS: u64 = 1_000_000;
+const USDC_BASE_UNITS_F64: f64 = 1_000_000.0;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InventoryAction {
-    Merge { condition_id: String, qty_sets: u64 },
+    Merge {
+        condition_id: String,
+        qty_base_units: u64,
+    },
     Redeem { condition_id: String },
     PauseMerges { reason: String },
 }
@@ -55,11 +61,15 @@ impl InventoryEngine {
         let mut pause_fast_move_emitted = false;
         let mut pause_interval_emitted = false;
         let mut pause_rate_limit_emitted = false;
-        let min_sets = self.merge_cfg.min_sets;
+        let min_sets_base_units = self.merge_cfg.min_sets.saturating_mul(USDC_BASE_UNITS);
+        let batch_sets_base_units = self.merge_cfg.batch_sets.saturating_mul(USDC_BASE_UNITS);
 
         for market in market_states_snapshot {
-            let full_sets = full_sets_u64(market.inventory.up.shares, market.inventory.down.shares);
-            if full_sets < min_sets {
+            let full_sets_base_units = mergeable_base_units(
+                market.inventory.up.shares,
+                market.inventory.down.shares,
+            );
+            if full_sets_base_units < min_sets_base_units {
                 continue;
             }
 
@@ -95,14 +105,18 @@ impl InventoryEngine {
                 }
             }
 
-            let merge_qty = (full_sets / self.merge_cfg.batch_sets) * self.merge_cfg.batch_sets;
-            if merge_qty == 0 {
+            if batch_sets_base_units == 0 {
+                continue;
+            }
+            let merge_qty_base_units =
+                (full_sets_base_units / batch_sets_base_units) * batch_sets_base_units;
+            if merge_qty_base_units == 0 {
                 continue;
             }
 
             actions.push(InventoryAction::Merge {
                 condition_id: market.identity.condition_id.clone(),
-                qty_sets: merge_qty,
+                qty_base_units: merge_qty_base_units,
             });
             self.record_merge(&market.identity.condition_id, now_ms);
         }
@@ -228,20 +242,20 @@ impl InventoryExecutor {
             match action {
                 InventoryAction::Merge {
                     condition_id,
-                    qty_sets,
+                    qty_base_units,
                 } => {
                     if self
                         .tx_onchain
                         .try_send(OnchainRequest::Merge {
                             condition_id: condition_id.clone(),
-                            qty_sets: *qty_sets,
+                            qty_base_units: *qty_base_units,
                         })
                         .is_err()
                     {
                         tracing::warn!(
                             target: "inventory_engine",
                             condition_id = %condition_id,
-                            qty_sets,
+                            qty_base_units,
                             "onchain queue full; dropping merge request"
                         );
                     }
@@ -320,12 +334,17 @@ impl InventoryLoop {
     }
 }
 
-fn full_sets_u64(up: f64, down: f64) -> u64 {
+fn mergeable_base_units(up: f64, down: f64) -> u64 {
     let min = up.min(down);
     if !min.is_finite() || min <= 0.0 {
         return 0;
     }
-    min.floor() as u64
+    let base = (min * USDC_BASE_UNITS_F64).floor();
+    if base <= 0.0 {
+        0
+    } else {
+        base as u64
+    }
 }
 
 fn latest_market_ws_ms(market: &MarketState) -> Option<i64> {
@@ -344,12 +363,12 @@ fn log_inventory_actions(actions: &[InventoryAction]) {
         match action {
             InventoryAction::Merge {
                 condition_id,
-                qty_sets,
+                qty_base_units,
             } => {
                 tracing::info!(
                     target: "inventory_engine",
                     condition_id = %condition_id,
-                    qty_sets,
+                    qty_base_units,
                     "merge decision"
                 );
             }
@@ -430,7 +449,7 @@ mod tests {
             actions,
             vec![InventoryAction::Merge {
                 condition_id: "cond".to_string(),
-                qty_sets: 50,
+                qty_base_units: 50_000_000,
             }]
         );
     }
@@ -523,7 +542,7 @@ mod tests {
             actions,
             vec![InventoryAction::Merge {
                 condition_id: "cond".to_string(),
-                qty_sets: 50,
+                qty_base_units: 50_000_000,
             }]
         );
     }
@@ -535,7 +554,7 @@ mod tests {
         exec.execute(&[
             InventoryAction::Merge {
                 condition_id: "cond".to_string(),
-                qty_sets: 25,
+                qty_base_units: 25_000_000,
             },
             InventoryAction::Redeem {
                 condition_id: "cond2".to_string(),
@@ -545,9 +564,12 @@ mod tests {
 
         let first = rx.recv().await.expect("first request");
         match first {
-            OnchainRequest::Merge { condition_id, qty_sets } => {
+            OnchainRequest::Merge {
+                condition_id,
+                qty_base_units,
+            } => {
                 assert_eq!(condition_id, "cond");
-                assert_eq!(qty_sets, 25);
+                assert_eq!(qty_base_units, 25_000_000);
             }
             _ => panic!("expected merge request"),
         }

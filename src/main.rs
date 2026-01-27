@@ -26,7 +26,7 @@ async fn main() -> BotResult<()> {
     let cfg = config::load_config()?;
     ops::logging::init_with_default(&cfg.infra.log_level);
     let ops_state = ops::OpsState::new(&cfg);
-    let shutdown = ops::start_http_servers(&cfg, ops_state.clone());
+    let (shutdown_trigger, shutdown) = ops::start_http_servers(&cfg, ops_state.clone());
 
     let event_log_cfg = EventLogConfig::default();
     let tx_log = spawn_event_logger(event_log_cfg);
@@ -47,6 +47,7 @@ async fn main() -> BotResult<()> {
     let (tx_market_ws_cmd, rx_market_ws_cmd) = mpsc::channel(256);
     let (tx_user_orders, rx_user_orders) = mpsc::channel(256);
     let rewards_enabled = cfg.rewards.enable_liquidity_rewards_chasing;
+    let (fatal_tx, fatal_rx) = tokio::sync::watch::channel::<Option<String>>(None);
 
     tokio::spawn(
         state::state_manager::StateManager::new(
@@ -109,6 +110,23 @@ async fn main() -> BotResult<()> {
 
     let rest = clients::clob_rest::ClobRestClient::from_config(&cfg).await?;
 
+    if !cfg.trading.dry_run {
+        if rest.authenticated() {
+            if let Err(err) = rest.cancel_all_orders().await {
+                tracing::warn!(
+                    target: "startup",
+                    error = %err,
+                    "startup cancel_all_orders failed"
+                );
+            }
+        } else {
+            tracing::warn!(
+                target: "startup",
+                "rest client not authenticated; skipping startup cancel_all_orders"
+            );
+        }
+    }
+
     let rewards_rx = if cfg.rewards.enable_liquidity_rewards_chasing {
         let (reward_engine, rewards_rx) =
             strategy::reward_engine::RewardEngine::new(cfg.rewards.clone(), rest.clone());
@@ -139,6 +157,8 @@ async fn main() -> BotResult<()> {
             rpc_url: cfg.endpoints.polygon_rpc_url.clone(),
             private_key: cfg.keys.private_key.clone(),
         },
+        // P5: send onchain merge/redeem updates to StateManager.
+        Some(tx_events.clone()),
         Some(tx_log.clone()),
     );
     let inventory_loop = inventory::InventoryLoop::new(
@@ -173,6 +193,8 @@ async fn main() -> BotResult<()> {
     if !cfg.trading.dry_run && cfg.heartbeats.enabled {
         let api = rest.heartbeat_api()?;
         let hb_cfg = cfg.heartbeats.clone();
+        let shutdown_trigger = shutdown_trigger.clone();
+        let fatal_tx = fatal_tx.clone();
         tokio::spawn(async move {
             if let Err(err) = clients::clob_rest::run_heartbeat_supervisor(api, hb_cfg).await {
                 tracing::error!(
@@ -180,7 +202,10 @@ async fn main() -> BotResult<()> {
                     error = %err,
                     "heartbeat supervisor exited; shutting down"
                 );
-                std::process::exit(2);
+                let _ = fatal_tx.send(Some(format!(
+                    "heartbeat supervisor exited: {err}"
+                )));
+                shutdown_trigger.trigger();
             }
         });
     }
@@ -238,6 +263,10 @@ async fn main() -> BotResult<()> {
         if let Err(err) = rest.cancel_all_orders().await {
             tracing::warn!(target: "shutdown", error = %err, "best-effort cancel_all_orders failed");
         }
+    }
+
+    if let Some(reason) = fatal_rx.borrow().clone() {
+        return Err(crate::error::BotError::Other(reason));
     }
 
     Ok(())

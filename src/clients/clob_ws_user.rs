@@ -19,6 +19,7 @@ const BACKOFF_MIN_MS: u64 = 500;
 const BACKOFF_MAX_MS: u64 = 20_000;
 const BACKOFF_MULTIPLIER: f64 = 1.7;
 const MAX_RAW_LOG_BYTES: usize = 8 * 1024;
+const REDACT_PLACEHOLDER: &str = "[REDACTED]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserOrderUpdateType {
@@ -41,9 +42,9 @@ pub struct UserWsLoop {
 pub struct UserOrderUpdate {
     pub order_id: String,
     pub token_id: String,
-    pub price: f64,
-    pub original_size: f64,
-    pub size_matched: f64,
+    pub price: Option<f64>,
+    pub original_size: Option<f64>,
+    pub size_matched: Option<f64>,
     pub ts_ms: i64,
     pub update_type: UserOrderUpdateType,
 }
@@ -456,38 +457,26 @@ fn parse_order_event(text: &str) -> BotResult<Option<UserOrderUpdate>> {
         Some(id) => id,
         None => return Ok(None),
     };
-    let token_id = match value.get("asset_id").and_then(|v| v.as_str()) {
-        Some(asset) => asset,
-        None => return Ok(None),
-    };
-    let price = match value
+    let token_id = value
+        .get("asset_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let price = value
         .get("price")
         .and_then(value_to_string)
         .and_then(|s| s.parse::<f64>().ok())
-    {
-        Some(price) => price,
-        None => return Ok(None),
-    };
-    let original_size = match value
+        .filter(|v| v.is_finite());
+    let original_size = value
         .get("original_size")
         .and_then(value_to_string)
         .and_then(|s| s.parse::<f64>().ok())
-    {
-        Some(size) => size,
-        None => return Ok(None),
-    };
-    let size_matched = match value
+        .filter(|v| v.is_finite());
+    let size_matched = value
         .get("size_matched")
         .and_then(value_to_string)
         .and_then(|s| s.parse::<f64>().ok())
-    {
-        Some(size) => size,
-        None => return Ok(None),
-    };
-    let ts_ms = match extract_timestamp_from_value(&value) {
-        Some(ts_ms) => ts_ms,
-        None => return Ok(None),
-    };
+        .filter(|v| v.is_finite());
+    let ts_ms = extract_timestamp_from_value(&value).unwrap_or_else(now_ms);
 
     let update_type = match update_type.as_str() {
         "PLACEMENT" => UserOrderUpdateType::Placement,
@@ -559,8 +548,9 @@ fn log_raw_frame(
     let Some(tx) = log_tx else {
         return;
     };
+    let redacted = redact_frame(text);
     let payload = json!({
-        "frame": truncate_utf8(text, MAX_RAW_LOG_BYTES),
+        "frame": truncate_utf8(&redacted, MAX_RAW_LOG_BYTES),
     });
     let _ = tx.try_send(LogEvent {
         ts_ms,
@@ -620,6 +610,151 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> String {
     text[..end].to_string()
 }
 
+fn redact_frame(text: &str) -> String {
+    match serde_json::from_str::<Value>(text) {
+        Ok(mut value) => {
+            redact_json_value(&mut value);
+            value.to_string()
+        }
+        Err(_) => redact_non_json(text),
+    }
+}
+
+fn redact_json_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                if is_sensitive_key(key) {
+                    *val = Value::String(REDACT_PLACEHOLDER.to_string());
+                } else {
+                    redact_json_value(val);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_json_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let normalized = normalize_key(key);
+    matches!(
+        normalized.as_str(),
+        "secret"
+            | "passphrase"
+            | "apikey"
+            | "authorization"
+            | "auth"
+            | "signature"
+            | "sig"
+            | "token"
+            | "owner"
+            | "wallet"
+            | "address"
+            | "from"
+            | "to"
+            | "funder"
+    )
+}
+
+fn normalize_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn redact_non_json(text: &str) -> String {
+    let mut bytes = text.as_bytes().to_vec();
+    for key in ["apikey", "api_key", "secret", "passphrase"] {
+        bytes = redact_bytes(&bytes, key.as_bytes());
+    }
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+fn redact_bytes(input: &[u8], key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if match_key_at(input, i, key) {
+            let before = i.checked_sub(1).and_then(|idx| input.get(idx).copied());
+            let after = input.get(i + key.len()).copied();
+            if is_word_char(before) || is_word_char(after) {
+                out.push(input[i]);
+                i += 1;
+                continue;
+            }
+            out.extend_from_slice(&input[i..i + key.len()]);
+            let mut j = i + key.len();
+            while j < input.len() && input[j].is_ascii_whitespace() {
+                out.push(input[j]);
+                j += 1;
+            }
+            if j < input.len() && (input[j] == b':' || input[j] == b'=') {
+                out.push(input[j]);
+                j += 1;
+                while j < input.len() && input[j].is_ascii_whitespace() {
+                    out.push(input[j]);
+                    j += 1;
+                }
+                if j < input.len() && (input[j] == b'"' || input[j] == b'\'') {
+                    let quote = input[j];
+                    out.push(quote);
+                    j += 1;
+                    out.extend_from_slice(REDACT_PLACEHOLDER.as_bytes());
+                    while j < input.len() && input[j] != quote {
+                        j += 1;
+                    }
+                    if j < input.len() {
+                        out.push(quote);
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+                out.extend_from_slice(REDACT_PLACEHOLDER.as_bytes());
+                while j < input.len() {
+                    let c = input[j];
+                    if matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b',' | b'&') {
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            i += key.len();
+            continue;
+        }
+        out.push(input[i]);
+        i += 1;
+    }
+    out
+}
+
+fn match_key_at(input: &[u8], pos: usize, key: &[u8]) -> bool {
+    if pos + key.len() > input.len() {
+        return false;
+    }
+    for (offset, key_byte) in key.iter().enumerate() {
+        if !input[pos + offset].eq_ignore_ascii_case(key_byte) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_word_char(byte: Option<u8>) -> bool {
+    match byte {
+        Some(b) => b.is_ascii_alphanumeric() || b == b'_',
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,9 +808,9 @@ mod tests {
             "52114319501245915516055106046884209969926127482827954674443846427813813222426"
         );
         assert_eq!(update.update_type, UserOrderUpdateType::Placement);
-        assert!((update.price - 0.57).abs() < 1e-12);
-        assert!((update.original_size - 10.0).abs() < 1e-12);
-        assert!((update.size_matched - 0.0).abs() < 1e-12);
+        assert_eq!(update.price, Some(0.57));
+        assert_eq!(update.original_size, Some(10.0));
+        assert_eq!(update.size_matched, Some(0.0));
         assert_eq!(update.ts_ms, 1_672_290_687_000);
     }
 
@@ -700,8 +835,8 @@ mod tests {
 
         let update = parse_order_event(raw).unwrap().unwrap();
         assert_eq!(update.update_type, UserOrderUpdateType::Update);
-        assert!((update.size_matched - 3.0).abs() < 1e-12);
-        assert!((update.original_size - 10.0).abs() < 1e-12);
+        assert_eq!(update.size_matched, Some(3.0));
+        assert_eq!(update.original_size, Some(10.0));
         assert_eq!(update.ts_ms, 1_672_290_687_000);
     }
 
@@ -726,6 +861,24 @@ mod tests {
 
         let update = parse_order_event(raw).unwrap().unwrap();
         assert_eq!(update.update_type, UserOrderUpdateType::Cancellation);
-        assert!((update.size_matched - 0.0).abs() < 1e-12);
+        assert_eq!(update.size_matched, Some(0.0));
+    }
+
+    #[test]
+    fn parse_order_message_partial_update_missing_sizes() {
+        let raw = r#"{
+            "asset_id": "52114319501245915516055106046884209969926127482827954674443846427813813222426",
+            "event_type": "order",
+            "id": "0xff354cd7ca7539dfa9c28d90943ab5779a4eac34b9b37a757d7b32bdfb11790b",
+            "timestamp": "1672290687",
+            "type": "UPDATE"
+        }"#;
+
+        let update = parse_order_event(raw).unwrap().unwrap();
+        assert_eq!(update.update_type, UserOrderUpdateType::Update);
+        assert_eq!(update.price, None);
+        assert_eq!(update.original_size, None);
+        assert_eq!(update.size_matched, None);
+        assert_eq!(update.ts_ms, 1_672_290_687_000);
     }
 }

@@ -450,26 +450,37 @@ fn apply_user_order_update(
             return true;
         }
 
-        let new_size = if update.original_size.is_finite() && update.original_size > 0.0 {
-            update.original_size
-        } else {
-            live.size
-        };
-        let matched = if update.size_matched.is_finite() && update.size_matched >= 0.0 {
-            update.size_matched
-        } else {
-            0.0
-        };
-        let remaining = if new_size.is_finite() && new_size > 0.0 {
+        let mut new_size = live.size;
+        let mut matched = (live.size - live.remaining).max(0.0);
+        let mut size_updated = false;
+        let mut matched_updated = false;
+
+        if let Some(size) = update
+            .original_size
+            .filter(|v| v.is_finite() && *v > 0.0)
+        {
+            new_size = size;
+            size_updated = true;
+        }
+
+        if let Some(size) = update
+            .size_matched
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            matched = size;
+            matched_updated = true;
+        }
+
+        let remaining = if size_updated || matched_updated {
             (new_size - matched).max(0.0)
         } else {
             live.remaining
         };
-        let price = if update.price.is_finite() && update.price > 0.0 {
-            update.price
-        } else {
-            live.price
-        };
+
+        let price = update
+            .price
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(live.price);
 
         live.size = new_size;
         live.remaining = remaining;
@@ -1134,9 +1145,9 @@ mod tests {
         let update = UserOrderUpdate {
             order_id: "order-1".to_string(),
             token_id: "token".to_string(),
-            price: 0.50,
-            original_size: 10.0,
-            size_matched: 5.0,
+            price: Some(0.50),
+            original_size: Some(10.0),
+            size_matched: Some(5.0),
             ts_ms: 1_000,
             update_type: UserOrderUpdateType::Update,
         };

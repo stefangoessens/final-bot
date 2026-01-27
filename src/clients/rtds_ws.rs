@@ -15,6 +15,7 @@ const TOPIC_CHAINLINK: &str = "crypto_prices_chainlink";
 const BINANCE_SYMBOL: &str = "btcusdt";
 const CHAINLINK_SYMBOL: &str = "btc/usd";
 const MAX_RAW_LOG_BYTES: usize = 8 * 1024;
+const REDACT_PLACEHOLDER: &str = "[REDACTED]";
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -241,8 +242,9 @@ fn log_raw_frame(
     let Some(tx) = log_tx else {
         return;
     };
+    let redacted = redact_frame(text);
     let payload = json!({
-        "frame": truncate_utf8(text, MAX_RAW_LOG_BYTES),
+        "frame": truncate_utf8(&redacted, MAX_RAW_LOG_BYTES),
     });
     let _ = tx.try_send(LogEvent {
         ts_ms,
@@ -268,6 +270,151 @@ fn log_rtds_update(log_tx: &Option<Sender<LogEvent>>, update: &RTDSUpdate) {
         event: "ws.rtds.update".to_string(),
         payload,
     });
+}
+
+fn redact_frame(text: &str) -> String {
+    match serde_json::from_str::<Value>(text) {
+        Ok(mut value) => {
+            redact_json_value(&mut value);
+            value.to_string()
+        }
+        Err(_) => redact_non_json(text),
+    }
+}
+
+fn redact_json_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                if is_sensitive_key(key) {
+                    *val = Value::String(REDACT_PLACEHOLDER.to_string());
+                } else {
+                    redact_json_value(val);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_json_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let normalized = normalize_key(key);
+    matches!(
+        normalized.as_str(),
+        "secret"
+            | "passphrase"
+            | "apikey"
+            | "authorization"
+            | "auth"
+            | "signature"
+            | "sig"
+            | "token"
+            | "owner"
+            | "wallet"
+            | "address"
+            | "from"
+            | "to"
+            | "funder"
+    )
+}
+
+fn normalize_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn redact_non_json(text: &str) -> String {
+    let mut bytes = text.as_bytes().to_vec();
+    for key in ["apikey", "api_key", "secret", "passphrase"] {
+        bytes = redact_bytes(&bytes, key.as_bytes());
+    }
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+fn redact_bytes(input: &[u8], key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if match_key_at(input, i, key) {
+            let before = i.checked_sub(1).and_then(|idx| input.get(idx).copied());
+            let after = input.get(i + key.len()).copied();
+            if is_word_char(before) || is_word_char(after) {
+                out.push(input[i]);
+                i += 1;
+                continue;
+            }
+            out.extend_from_slice(&input[i..i + key.len()]);
+            let mut j = i + key.len();
+            while j < input.len() && input[j].is_ascii_whitespace() {
+                out.push(input[j]);
+                j += 1;
+            }
+            if j < input.len() && (input[j] == b':' || input[j] == b'=') {
+                out.push(input[j]);
+                j += 1;
+                while j < input.len() && input[j].is_ascii_whitespace() {
+                    out.push(input[j]);
+                    j += 1;
+                }
+                if j < input.len() && (input[j] == b'"' || input[j] == b'\'') {
+                    let quote = input[j];
+                    out.push(quote);
+                    j += 1;
+                    out.extend_from_slice(REDACT_PLACEHOLDER.as_bytes());
+                    while j < input.len() && input[j] != quote {
+                        j += 1;
+                    }
+                    if j < input.len() {
+                        out.push(quote);
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+                out.extend_from_slice(REDACT_PLACEHOLDER.as_bytes());
+                while j < input.len() {
+                    let c = input[j];
+                    if matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b',' | b'&') {
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            i += key.len();
+            continue;
+        }
+        out.push(input[i]);
+        i += 1;
+    }
+    out
+}
+
+fn match_key_at(input: &[u8], pos: usize, key: &[u8]) -> bool {
+    if pos + key.len() > input.len() {
+        return false;
+    }
+    for (offset, key_byte) in key.iter().enumerate() {
+        if !input[pos + offset].eq_ignore_ascii_case(key_byte) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_word_char(byte: Option<u8>) -> bool {
+    match byte {
+        Some(b) => b.is_ascii_alphanumeric() || b == b'_',
+        None => false,
+    }
 }
 
 fn truncate_utf8(text: &str, max_bytes: usize) -> String {

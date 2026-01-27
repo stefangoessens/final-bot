@@ -126,7 +126,7 @@ pub fn should_taker_complete(
     };
     let min_profit = min_profit.max(-emergency_loss_per_share);
 
-    let p_max = max_taker_price(avg_cost, min_profit)?;
+    let p_max = max_taker_price(avg_cost, min_profit, unpaired)?;
     let best_ask = missing_ask?;
     if best_ask > p_max {
         return None;
@@ -140,8 +140,8 @@ pub fn should_taker_complete(
     })
 }
 
-fn max_taker_price(avg_cost: f64, min_profit: f64) -> Option<f64> {
-    if !avg_cost.is_finite() || !min_profit.is_finite() {
+fn max_taker_price(avg_cost: f64, min_profit: f64, shares: f64) -> Option<f64> {
+    if !avg_cost.is_finite() || !min_profit.is_finite() || !shares.is_finite() || shares <= 0.0 {
         return None;
     }
 
@@ -157,7 +157,8 @@ fn max_taker_price(avg_cost: f64, min_profit: f64) -> Option<f64> {
     let mut hi = 1.0;
     for _ in 0..48 {
         let mid = (lo + hi) * 0.5;
-        let spend = mid + fee::taker_fee_per_share(mid);
+        let fee_per_share = fee::taker_fee_usdc(shares, mid) / shares;
+        let spend = mid + fee_per_share;
         if spend > target {
             hi = mid;
         } else {
@@ -290,10 +291,28 @@ mod tests {
         completion_cfg.min_profit_per_share = 0.01;
         completion_cfg.max_loss_usdc = 0.0;
 
-        let p_max = max_taker_price(0.8, 0.01).expect("p_max should be computable");
+        let p_max = max_taker_price(0.8, 0.01, 1.0).expect("p_max should be computable");
         state.down_book.best_ask = Some(p_max + 0.05);
 
         let action = should_taker_complete(&state, &inventory_cfg, &completion_cfg, 0);
         assert!(action.is_none(), "expected completion to be blocked");
+    }
+
+    fn assert_taker_price_cap(avg_cost: f64, min_profit: f64, shares: f64) {
+        let p_max = max_taker_price(avg_cost, min_profit, shares)
+            .expect("expected p_max to be computable");
+        let target = 1.0 - avg_cost - min_profit;
+        let spend = p_max + fee::taker_fee_usdc(shares, p_max) / shares;
+        assert!(spend <= target + 1e-12, "expected spend <= target");
+    }
+
+    #[test]
+    fn taker_price_cap_small_q() {
+        assert_taker_price_cap(0.4, 0.01, 0.01);
+    }
+
+    #[test]
+    fn taker_price_cap_large_q() {
+        assert_taker_price_cap(0.4, 0.01, 10_000.0);
     }
 }

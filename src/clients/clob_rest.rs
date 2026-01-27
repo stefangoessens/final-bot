@@ -36,11 +36,11 @@ pub struct ClobRestClient {
     inner: Option<Arc<SdkHandle>>,
 }
 
-#[derive(Clone)]
 struct SdkHandle {
     client: SdkAuthedClient,
     signer: PrivateKeySigner,
     fee_rate_cache: FeeRateCache,
+    sign_mutex: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -198,6 +198,7 @@ impl ClobRestClient {
                 client,
                 signer,
                 fee_rate_cache: FeeRateCache::new(DEFAULT_FEE_RATE_TTL_MS),
+                sign_mutex: tokio::sync::Mutex::new(()),
             })),
         })
     }
@@ -248,11 +249,13 @@ impl ClobRestClient {
         for order in desired {
             let token_id = parse_token_id(&order.token_id)?;
             let fee_rate_bps = self.get_fee_rate_bps_for_id(token_id).await?;
+            let price = parse_decimal(order.price, 8)?;
+            let size = parse_decimal(order.size, 2)?;
+
+            let _guard = inner.sign_mutex.lock().await;
             inner
                 .client
                 .set_fee_rate_bps(token_id, fee_rate_bps as u32);
-            let price = parse_decimal(order.price, 8)?;
-            let size = parse_decimal(order.size, 2)?;
 
             let signable = inner
                 .client
@@ -293,7 +296,13 @@ impl ClobRestClient {
 
         let token_id = parse_token_id(token_id)?;
         let shares = parse_decimal(shares, 2)?;
-        let p_max = parse_decimal(p_max, 8)?;
+        let p_max = parse_decimal_trunc(p_max, 8)?;
+        let fee_rate_bps = self.get_fee_rate_bps_for_id(token_id).await?;
+
+        let _guard = inner.sign_mutex.lock().await;
+        inner
+            .client
+            .set_fee_rate_bps(token_id, fee_rate_bps as u32);
 
         let signable = inner
             .client
@@ -524,6 +533,47 @@ fn parse_decimal(value: f64, max_dp: usize) -> BotResult<Decimal> {
         return Err(BotError::Other(format!("invalid decimal {value}")));
     }
     let mut s = format!("{value:.max_dp$}");
+    while s.contains('.') && s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    if s.is_empty() {
+        s.push('0');
+    }
+    s.parse::<Decimal>()
+        .map_err(|e| BotError::Other(format!("invalid decimal string {s}: {e}")))
+}
+
+fn parse_decimal_trunc(value: f64, max_dp: usize) -> BotResult<Decimal> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(BotError::Other(format!("invalid decimal {value}")));
+    }
+    if max_dp == 0 {
+        let int_part = value.floor();
+        let s = format!("{int_part:.0}");
+        return s
+            .parse::<Decimal>()
+            .map_err(|e| BotError::Other(format!("invalid decimal string {s}: {e}")));
+    }
+
+    let scale = 10u128
+        .checked_pow(max_dp as u32)
+        .ok_or_else(|| BotError::Other("decimal scale overflow".to_string()))?;
+    let scaled = (value * scale as f64).floor();
+    if !scaled.is_finite() {
+        return Err(BotError::Other(format!("invalid decimal {value}")));
+    }
+    let scaled = scaled as u128;
+    let int_part = scaled / scale;
+    let frac_part = scaled % scale;
+
+    let mut s = format!(
+        "{int_part}.{:0width$}",
+        frac_part,
+        width = max_dp
+    );
     while s.contains('.') && s.ends_with('0') {
         s.pop();
     }

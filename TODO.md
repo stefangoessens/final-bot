@@ -33,3 +33,11 @@ Task status:
 - [x] T15 InventoryEngine (Merge + Redeem)
 - [x] T16 Observability: metrics + health + structured logging
 - [x] T17 Event logging + replay + stress harness
+
+## Wave 6 (Post-review fixes)
+- [x] P1 Completion signing safety (feeRateBps + cap rounding + concurrency)
+- [x] P2 Startup/shutdown safety (cancel-on-boot + heartbeat graceful shutdown)
+- [x] P3 Raw WS logging redaction (no secrets/PII)
+- [x] P4 User WS order parsing robustness (partial updates)
+- [x] P5 Merge/redeem correctness (e6 units + readiness gates + state sync)
+- [x] P6 Size-aware taker EV math (fee depends on Q)
