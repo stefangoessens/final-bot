@@ -237,7 +237,13 @@ impl UserWsLoop {
                         Message::Ping(payload) => {
                             write.send(Message::Pong(payload)).await?;
                         }
-                        Message::Pong(_) => {}
+                        Message::Pong(_) => {
+                            let _ = tx_events
+                                .send(AppEvent::UserWsUpdate(UserWsUpdate::Heartbeat {
+                                    ts_ms: now_ms(),
+                                }))
+                                .await;
+                        }
                         Message::Close(_) => {
                             return Err(BotError::Other("ws close received".to_string()));
                         }
@@ -246,7 +252,7 @@ impl UserWsLoop {
                 }
                 _ = tokio::time::sleep_until(next_ping) => {
                     next_ping = Instant::now() + Duration::from_millis(PING_INTERVAL_MS);
-                    let _ = write.send(Message::Text("PING".to_string().into())).await;
+                    let _ = write.send(Message::Ping(Vec::new().into())).await;
                 }
             }
         }
