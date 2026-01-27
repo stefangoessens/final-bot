@@ -68,8 +68,35 @@ Notes:
 - Keeping `PMMB_TRADING__DRY_RUN=true` will prevent posting orders, but the bot may still need API creds to connect to Polymarket data feeds.
 - Enabling live trading must comply with repo rule: **do not bypass geoblocks**.
 
+## First-time bring-up checklist (common “stale feeds” issue)
+
+If `./ops/aws/pmmm_aws.sh health <instance-id>` shows:
+- `ws_market_connected 0` / `rtds_connected 0`
+- feed `status: stale`
+
+then you likely haven’t provided Polymarket API credentials on the instance yet.
+
+On the AWS instance, set (at minimum) the CLOB API creds and restart:
+
+```bash
+aws ssm start-session --region eu-west-1 --target <instance-id>
+sudoedit /etc/pmmm/pmmm.env
+sudo systemctl restart pmmm-bot.service
+```
+
+Expected success signal:
+- `/healthz` shows feeds as `ok` (not `stale`)
+- metrics include `ws_market_connected 1` and `rtds_connected 1` (after warm-up)
+
+## “restricted market …” / quoting halted
+
+If `/healthz` reports `halted_reason` or `quoting_block_reason` like `restricted market ...`, the bot is intentionally refusing to quote.
+
+Action:
+- Treat this as a compliance/safety block and investigate the underlying API response (via logs).
+- Do **not** patch around it; the repo rule is explicit: **do not bypass geoblocks**.
+
 ## Safe defaults / hardening
 
 - The deploy script creates an SG with **no inbound rules** (SSM-only).
 - Health/metrics bind to `0.0.0.0` by default; keep SG inbound closed unless you intentionally expose them.
-
