@@ -222,6 +222,9 @@ async fn read_loop(
 }
 
 fn build_subscribe_message() -> String {
+    // RTDS expects `filters` to be a string; for Chainlink it is a JSON string like:
+    // {"symbol":"btc/usd"}.
+    let chainlink_filters = serde_json::json!({ "symbol": CHAINLINK_SYMBOL }).to_string();
     serde_json::json!({
         "action": "subscribe",
         "subscriptions": [
@@ -233,7 +236,7 @@ fn build_subscribe_message() -> String {
             {
                 "topic": TOPIC_CHAINLINK,
                 "type": "*",
-                "filters": { "symbol": CHAINLINK_SYMBOL }
+                "filters": chainlink_filters
             }
         ]
     })
@@ -534,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_message_uses_chainlink_filter_object() {
+    fn subscribe_message_uses_chainlink_filter_string() {
         let msg = build_subscribe_message();
         let value: Value = serde_json::from_str(&msg).expect("valid json");
         let subs = value
@@ -552,9 +555,13 @@ mod tests {
             match topic {
                 TOPIC_CHAINLINK => {
                     saw_chainlink = true;
-                    let filters = sub.get("filters").expect("chainlink filters");
-                    assert!(filters.is_object(), "chainlink filters must be object");
-                    let symbol = filters
+                    let filters = sub
+                        .get("filters")
+                        .and_then(|v| v.as_str())
+                        .expect("chainlink filters string");
+                    let parsed: Value =
+                        serde_json::from_str(filters).expect("filters must be json string");
+                    let symbol = parsed
                         .get("symbol")
                         .and_then(|v| v.as_str())
                         .unwrap_or_default();
