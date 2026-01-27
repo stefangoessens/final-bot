@@ -325,6 +325,8 @@ fn parse_best_bid_ask(
     };
     let best_bid = value.get("best_bid").and_then(parse_f64);
     let best_ask = value.get("best_ask").and_then(parse_f64);
+    // Docs only specify tick_size_change for tick updates; capture tick_size if present.
+    let tick_size = value.get("tick_size").and_then(parse_f64);
     let ts_ms = value.get("timestamp").and_then(parse_i64).unwrap_or(now_ms);
 
     let entry = last_best.entry(asset_id.clone()).or_default();
@@ -335,7 +337,7 @@ fn parse_best_bid_ask(
         entry.best_ask = best_ask;
     }
 
-    if entry.best_bid.is_none() && entry.best_ask.is_none() {
+    if entry.best_bid.is_none() && entry.best_ask.is_none() && tick_size.is_none() {
         return Ok(Vec::new());
     }
 
@@ -343,7 +345,7 @@ fn parse_best_bid_ask(
         token_id: asset_id,
         best_bid: entry.best_bid,
         best_ask: entry.best_ask,
-        tick_size: None,
+        tick_size,
         ts_ms,
     }])
 }
@@ -389,7 +391,8 @@ fn parse_price_change(
         };
         let best_bid = change.get("best_bid").and_then(parse_f64);
         let best_ask = change.get("best_ask").and_then(parse_f64);
-        if best_bid.is_none() && best_ask.is_none() {
+        let tick_size = change.get("tick_size").and_then(parse_f64);
+        if best_bid.is_none() && best_ask.is_none() && tick_size.is_none() {
             continue;
         }
 
@@ -405,7 +408,7 @@ fn parse_price_change(
             token_id: asset_id,
             best_bid: entry.best_bid,
             best_ask: entry.best_ask,
-            tick_size: None,
+            tick_size,
             ts_ms,
         });
     }
@@ -685,5 +688,26 @@ mod tests {
         assert_eq!(update.best_ask, Some(0.77));
         assert_eq!(update.tick_size, None);
         assert_eq!(update.ts_ms, 1_766_789_469_958);
+    }
+
+    #[test]
+    fn parses_best_bid_ask_tick_size_when_present() {
+        let sample = r#"{
+          "event_type": "best_bid_ask",
+          "market": "0x0005c0d312de0be897668695bae9f32b624b4a1ae8b140c49f08447fcc74f442",
+          "asset_id": "85354956062430465315924116860125388538595433819574542752031640332592237464430",
+          "best_bid": "0.73",
+          "best_ask": "0.77",
+          "tick_size": "0.01",
+          "timestamp": "1766789469958"
+        }"#;
+
+        let mut last_best = HashMap::new();
+        let updates = parse_updates(sample, &mut last_best, 0).expect("parse should succeed");
+        assert_eq!(updates.len(), 1);
+        let update = &updates[0];
+        assert_eq!(update.best_bid, Some(0.73));
+        assert_eq!(update.best_ask, Some(0.77));
+        assert_eq!(update.tick_size, Some(0.01));
     }
 }

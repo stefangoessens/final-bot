@@ -1,0 +1,16 @@
+{
+  "asset_id": "token-reject",
+  "event_type": "order",
+  "id": "0xreject",
+  "market": "0xmarket",
+  "order_owner": "user",
+  "original_size": "10",
+  "outcome": "YES",
+  "owner": "user",
+  "price": "0.57",
+  "side": "BUY",
+  "size_matched": "0",
+  "status": "REJECTED",
+  "timestamp": "1672290687",
+  "type": "REJECTION"
+}

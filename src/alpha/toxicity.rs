@@ -24,12 +24,11 @@ pub fn evaluate_regime(
     oracle_cfg: &OracleConfig,
     rtds_primary: Option<RTDSPrice>,
     rtds_sanity: Option<RTDSPrice>,
-    market_ws_last_ms: Option<i64>,
+    market_ws_stale: bool,
     var_per_s: f64,
 ) -> RegimeEval {
     let chainlink_stale = is_stale(now_ms, oracle_cfg.chainlink_stale_ms, rtds_sanity);
     let binance_stale = is_stale(now_ms, oracle_cfg.binance_stale_ms, rtds_primary);
-    let market_ws_stale = is_market_ws_stale(now_ms, cfg.rtds_stale_ms, market_ws_last_ms);
     let oracle_disagree = oracle_disagree(rtds_primary, rtds_sanity, oracle_cfg);
     let fast_move = is_fast_move(
         alpha,
@@ -65,13 +64,6 @@ fn is_stale(now_ms: i64, stale_ms: i64, price: Option<RTDSPrice>) -> bool {
     match price {
         Some(p) => now_ms.saturating_sub(p.ts_ms) > stale_ms,
         None => true,
-    }
-}
-
-fn is_market_ws_stale(now_ms: i64, stale_ms: i64, market_ws_last_ms: Option<i64>) -> bool {
-    match market_ws_last_ms {
-        Some(ts) if ts > 0 => now_ms.saturating_sub(ts) > stale_ms,
-        _ => false,
     }
 }
 
@@ -190,7 +182,7 @@ mod tests {
             &oracle_cfg,
             Some(primary),
             None,
-            None,
+            false,
             0.0,
         );
         assert_eq!(regime.regime, Regime::StaleOracle);
@@ -223,7 +215,7 @@ mod tests {
             &oracle_cfg,
             Some(binance),
             Some(chainlink),
-            None,
+            false,
             0.0,
         );
         assert_eq!(regime.regime, Regime::StaleBinance);
@@ -256,7 +248,7 @@ mod tests {
             &oracle_cfg,
             Some(binance),
             Some(chainlink),
-            None,
+            false,
             0.0,
         );
         assert_eq!(regime.regime, Regime::Normal);

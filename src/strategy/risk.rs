@@ -103,17 +103,19 @@ pub fn should_taker_complete(
         return None;
     }
 
-    let (missing_token, missing_ask, excess_avg_cost) = if up_shares < down_shares {
+    let (missing_token, missing_ask, excess_avg_cost, tick_size) = if up_shares < down_shares {
         (
             state.identity.token_up.as_str(),
             state.up_book.best_ask,
             state.inventory.down.avg_cost(),
+            state.up_book.tick_size,
         )
     } else {
         (
             state.identity.token_down.as_str(),
             state.down_book.best_ask,
             state.inventory.up.avg_cost(),
+            state.down_book.tick_size,
         )
     };
 
@@ -126,7 +128,11 @@ pub fn should_taker_complete(
     };
     let min_profit = min_profit.max(-emergency_loss_per_share);
 
-    let p_max = max_taker_price(avg_cost, min_profit, unpaired)?;
+    let p_max_raw = max_taker_price(avg_cost, min_profit, unpaired)?;
+    let p_max = round_down_to_tick(p_max_raw, tick_size)?;
+    if p_max <= 0.0 {
+        return None;
+    }
     let best_ask = missing_ask?;
     if best_ask > p_max {
         return None;
@@ -167,6 +173,21 @@ fn max_taker_price(avg_cost: f64, min_profit: f64, shares: f64) -> Option<f64> {
     }
 
     Some(lo)
+}
+
+fn round_down_to_tick(price: f64, tick: f64) -> Option<f64> {
+    if !price.is_finite() || price < 0.0 {
+        return None;
+    }
+    if !tick.is_finite() || tick <= 0.0 {
+        return Some(price);
+    }
+    let steps = (price / tick).floor();
+    if !steps.is_finite() {
+        return None;
+    }
+    let rounded = steps * tick;
+    Some(rounded.min(price))
 }
 
 #[cfg(test)]
@@ -314,5 +335,42 @@ mod tests {
     #[test]
     fn taker_price_cap_large_q() {
         assert_taker_price_cap(0.4, 0.01, 10_000.0);
+    }
+
+    #[test]
+    fn p_max_tick_rounds_down() {
+        let raw = 0.503;
+        let tick = 0.01;
+        let rounded = round_down_to_tick(raw, tick).expect("rounded");
+        assert!(rounded <= raw + 1e-12);
+        assert!(((rounded / tick).round() - (rounded / tick)).abs() < 1e-9);
+        assert!((rounded - 0.50).abs() < 1e-12);
+    }
+
+    #[test]
+    fn should_taker_complete_rounds_pmax_to_tick() {
+        let mut state = make_state(30_000);
+        state.inventory.up.shares = 1.0;
+        state.inventory.up.notional_usdc = 0.2;
+        state.inventory.down.shares = 0.0;
+        state.down_book.best_ask = Some(0.1);
+        state.down_book.tick_size = 0.01;
+
+        let mut inventory_cfg = InventoryConfig::default();
+        inventory_cfg.taker_window_s = 30;
+
+        let mut completion_cfg = CompletionConfig::default();
+        completion_cfg.enabled = true;
+        completion_cfg.order_type = CompletionOrderType::Fok;
+        completion_cfg.min_profit_per_share = 0.0;
+        completion_cfg.max_loss_usdc = 0.0;
+
+        let raw = max_taker_price(0.2, 0.0, 1.0).expect("raw p_max");
+        let action =
+            should_taker_complete(&state, &inventory_cfg, &completion_cfg, 0)
+                .expect("expected taker completion");
+
+        assert!(action.p_max <= raw + 1e-12);
+        assert!(((action.p_max / 0.01).round() - (action.p_max / 0.01)).abs() < 1e-9);
     }
 }

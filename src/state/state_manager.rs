@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{error::TrySendError, Receiver, Sender};
 
 use crate::config::{AlphaConfig, OracleConfig, TradingConfig};
 use crate::ops::health::HealthState;
 use crate::ops::metrics::Metrics;
-use crate::state::inventory::{TokenSide, USDC_BASE_UNITS_F64};
+use crate::state::inventory::{InventorySide, TokenSide, USDC_BASE_UNITS_F64};
 use crate::state::market_state::{MarketIdentity, MarketState};
+use crate::state::order_state::LiveOrder;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // fields will be used by StrategyEngine + OrderManager in later tasks
@@ -26,6 +27,13 @@ pub struct MarketWsUpdate {
 }
 
 #[derive(Debug, Clone)]
+pub struct TickSizeSeed {
+    pub token_id: String,
+    pub tick_size: f64,
+    pub ts_ms: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct FillEvent {
     pub token_id: String,
     pub price: f64,
@@ -37,6 +45,7 @@ pub struct FillEvent {
 #[allow(dead_code)] // populated by the user WS client task
 pub enum UserWsUpdate {
     Fill(FillEvent),
+    Heartbeat { ts_ms: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,13 +63,54 @@ pub struct RTDSUpdate {
 }
 
 #[derive(Debug, Clone)]
+pub enum OrderUpdate {
+    Upsert { slug: String, order: LiveOrder },
+    Remove {
+        slug: String,
+        token_id: String,
+        level: usize,
+        order_id: String,
+        ts_ms: i64,
+    },
+}
+
+impl OrderUpdate {
+    fn ts_ms(&self) -> i64 {
+        match self {
+            OrderUpdate::Upsert { order, .. } => order.last_update_ms,
+            OrderUpdate::Remove { ts_ms, .. } => *ts_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderSeed {
+    pub slug: String,
+    pub orders: Vec<LiveOrder>,
+    pub ts_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct InventorySeed {
+    pub slug: String,
+    pub up: InventorySide,
+    pub down: InventorySide,
+    pub ts_ms: i64,
+}
+
+#[derive(Debug, Clone)]
 #[allow(dead_code)] // event variants will be used by feed + strategy tasks
 pub enum AppEvent {
     MarketDiscovered(MarketIdentity),
     SetTrackedMarkets { slugs: Vec<String> },
     MarketWsUpdate(MarketWsUpdate),
+    TickSizeSeed(TickSizeSeed),
     UserWsUpdate(UserWsUpdate),
     RTDSUpdate(RTDSUpdate),
+    SeedOrders(OrderSeed),
+    SeedInventory(InventorySeed),
+    // W7.15: OrderManager emits live order updates for rewards scoring.
+    OrderUpdate(OrderUpdate),
     OnchainMerge {
         condition_id: String,
         qty_base_units: u64,
@@ -109,8 +159,13 @@ impl StateManager {
             let (now_ms, is_timer) = match &event {
                 AppEvent::TimerTick { now_ms } => (*now_ms, true),
                 AppEvent::MarketWsUpdate(u) => (u.ts_ms, false),
+                AppEvent::TickSizeSeed(u) => (u.ts_ms, false),
                 AppEvent::UserWsUpdate(UserWsUpdate::Fill(f)) => (f.ts_ms, false),
+                AppEvent::UserWsUpdate(UserWsUpdate::Heartbeat { ts_ms }) => (*ts_ms, false),
                 AppEvent::RTDSUpdate(u) => (u.ts_ms, false),
+                AppEvent::SeedOrders(seed) => (seed.ts_ms, false),
+                AppEvent::SeedInventory(seed) => (seed.ts_ms, false),
+                AppEvent::OrderUpdate(u) => (u.ts_ms(), false),
                 AppEvent::OnchainMerge { ts_ms, .. } => (*ts_ms, false),
                 AppEvent::OnchainRedeem { ts_ms, .. } => (*ts_ms, false),
                 AppEvent::MarketDiscovered(_) | AppEvent::SetTrackedMarkets { .. } => {
@@ -122,13 +177,28 @@ impl StateManager {
 
             if is_timer {
                 for (slug, state) in &self.markets {
-                    let _ = tx_quote
-                        .send(QuoteTick {
-                            slug: slug.clone(),
-                            now_ms,
-                            state: state.clone(),
-                        })
-                        .await;
+                    let tick = QuoteTick {
+                        slug: slug.clone(),
+                        now_ms,
+                        state: state.clone(),
+                    };
+                    if let Err(err) = tx_quote.try_send(tick) {
+                        match err {
+                            TrySendError::Full(_) => {
+                                tracing::debug!(
+                                    target: "state_manager",
+                                    slug = %slug,
+                                    "quote tick channel full; dropping tick"
+                                );
+                            }
+                            TrySendError::Closed(_) => {
+                                tracing::warn!(
+                                    target: "state_manager",
+                                    "quote tick channel closed; dropping tick"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -163,8 +233,13 @@ impl StateManager {
                 self.health.mark_market_ws(update.ts_ms);
                 self.apply_market_ws_update(update);
             }
+            AppEvent::TickSizeSeed(seed) => {
+                self.apply_tick_size_seed(seed);
+            }
             AppEvent::UserWsUpdate(update) => {
-                self.health.mark_user_ws(now_ms);
+                if let UserWsUpdate::Heartbeat { ts_ms } = &update {
+                    self.health.mark_user_ws(*ts_ms);
+                }
                 self.apply_user_ws_update(update, now_ms);
             }
             AppEvent::RTDSUpdate(update) => {
@@ -173,6 +248,15 @@ impl StateManager {
                     RTDSSource::ChainlinkBtcUsd => self.health.mark_chainlink(update.ts_ms),
                 }
                 self.apply_rtds_update(update);
+            }
+            AppEvent::SeedOrders(seed) => {
+                self.apply_order_seed(seed);
+            }
+            AppEvent::SeedInventory(seed) => {
+                self.apply_inventory_seed(seed);
+            }
+            AppEvent::OrderUpdate(update) => {
+                self.apply_order_update(update);
             }
             AppEvent::OnchainMerge {
                 condition_id,
@@ -186,7 +270,24 @@ impl StateManager {
             }
             AppEvent::TimerTick { .. } => {
                 self.update_health_metrics(now_ms);
+                let user_ws_fresh = if self.trading_cfg.dry_run {
+                    true
+                } else {
+                    self.health.user_ws_fresh(now_ms)
+                };
+                let mut enabled_markets = 0usize;
+                let mut total_markets = 0usize;
+                let mut first_block_reason: Option<String> = None;
+
                 for state in self.markets.values_mut() {
+                    total_markets += 1;
+                    if state.identity.restricted {
+                        self.health.set_halt_reason(Some(format!(
+                            "restricted market {}",
+                            state.identity.slug
+                        )));
+                    }
+
                     let out = crate::alpha::update_alpha(
                         state,
                         now_ms,
@@ -194,7 +295,38 @@ impl StateManager {
                         &self.oracle_cfg,
                         &self.trading_cfg,
                     );
-                    state.quoting_enabled = now_ms < state.cutoff_ts_ms && out.size_scalar > 0.0;
+
+                    let tradable = state.identity.active
+                        && state.identity.accepting_orders
+                        && !state.identity.closed
+                        && !state.identity.restricted;
+
+                    let halted = self.health.is_halted();
+                    let mut block_reason = None;
+                    if halted {
+                        block_reason = self
+                            .health
+                            .halt_reason()
+                            .or_else(|| Some("halted".to_string()));
+                    } else if !user_ws_fresh {
+                        block_reason = Some("user_ws_stale".to_string());
+                    } else if !tradable {
+                        block_reason = Some(format!(
+                            "market_not_tradable: {}",
+                            state.identity.slug
+                        ));
+                    }
+
+                    let alpha_ok = now_ms < state.cutoff_ts_ms && out.size_scalar > 0.0;
+                    let quoting_enabled = alpha_ok && block_reason.is_none();
+                    state.quoting_enabled = quoting_enabled;
+
+                    if quoting_enabled {
+                        enabled_markets += 1;
+                    } else if first_block_reason.is_none() {
+                        first_block_reason = block_reason;
+                    }
+
                     tracing::debug!(
                         target: "alpha",
                         slug = %state.identity.slug,
@@ -205,9 +337,23 @@ impl StateManager {
                         cap_down = out.cap_down,
                         target_total = out.target_total,
                         size_scalar = out.size_scalar,
+                        quoting_enabled,
                         "alpha update"
                     );
                 }
+
+                let block_reason = if enabled_markets == 0 {
+                    if let Some(reason) = first_block_reason {
+                        Some(reason)
+                    } else if total_markets == 0 {
+                        Some("no_markets_tracked".to_string())
+                    } else {
+                        Some("quoting_disabled".to_string())
+                    }
+                } else {
+                    None
+                };
+                self.health.set_quoting_status(enabled_markets, block_reason);
             }
         }
     }
@@ -235,10 +381,38 @@ impl StateManager {
         }
     }
 
+    fn apply_tick_size_seed(&mut self, seed: TickSizeSeed) {
+        if !seed.tick_size.is_finite() || seed.tick_size <= 0.0 {
+            tracing::warn!(
+                target: "state_manager",
+                token_id = %seed.token_id,
+                tick_size = seed.tick_size,
+                "invalid tick size seed"
+            );
+            return;
+        }
+
+        for state in self.markets.values_mut() {
+            if seed.token_id == state.identity.token_up {
+                if state.up_book.tick_size <= 0.0 {
+                    state.up_book.tick_size = seed.tick_size;
+                }
+                return;
+            }
+            if seed.token_id == state.identity.token_down {
+                if state.down_book.tick_size <= 0.0 {
+                    state.down_book.tick_size = seed.tick_size;
+                }
+                return;
+            }
+        }
+    }
+
     fn apply_user_ws_update(&mut self, update: UserWsUpdate, now_ms: i64) {
         self.last_user_ws_msg_ms = Some(now_ms);
         match update {
             UserWsUpdate::Fill(fill) => self.apply_fill(fill),
+            UserWsUpdate::Heartbeat { .. } => {}
         }
     }
 
@@ -270,6 +444,102 @@ impl StateManager {
                         price: update.price,
                         ts_ms: update.ts_ms,
                     });
+                }
+            }
+        }
+    }
+
+    fn apply_order_seed(&mut self, seed: OrderSeed) {
+        if let Some(state) = self.markets.get_mut(&seed.slug) {
+            if !state.orders.live.is_empty() {
+                tracing::warn!(
+                    target: "state_manager",
+                    slug = %seed.slug,
+                    existing = state.orders.live.len(),
+                    incoming = seed.orders.len(),
+                    "order seed skipped; existing live orders present"
+                );
+                return;
+            }
+            for order in seed.orders {
+                state.orders.upsert(order);
+            }
+        } else {
+            tracing::debug!(
+                target: "state_manager",
+                slug = %seed.slug,
+                "order seed ignored; market not tracked"
+            );
+        }
+    }
+
+    fn apply_inventory_seed(&mut self, seed: InventorySeed) {
+        if let Some(state) = self.markets.get_mut(&seed.slug) {
+            if seed.ts_ms < state.inventory.last_trade_ms {
+                tracing::debug!(
+                    target: "state_manager",
+                    slug = %seed.slug,
+                    seed_ts = seed.ts_ms,
+                    last_trade_ms = state.inventory.last_trade_ms,
+                    "inventory seed ignored; newer fills observed"
+                );
+                return;
+            }
+            state.inventory.up = seed.up;
+            state.inventory.down = seed.down;
+            state.inventory.last_trade_ms = seed.ts_ms;
+        } else {
+            tracing::debug!(
+                target: "state_manager",
+                slug = %seed.slug,
+                "inventory seed ignored; market not tracked"
+            );
+        }
+    }
+
+    fn apply_order_update(&mut self, update: OrderUpdate) {
+        match update {
+            OrderUpdate::Upsert { slug, order } => {
+                if let Some(state) = self.markets.get_mut(&slug) {
+                    state.orders.upsert(order);
+                } else {
+                    tracing::debug!(
+                        target: "state_manager",
+                        slug = %slug,
+                        "order update for unknown market"
+                    );
+                }
+            }
+            OrderUpdate::Remove {
+                slug,
+                token_id,
+                level,
+                order_id,
+                ..
+            } => {
+                if let Some(state) = self.markets.get_mut(&slug) {
+                    let key = (token_id.clone(), level);
+                    if let Some(existing) = state.orders.live.get(&key) {
+                        if existing.order_id != order_id {
+                            tracing::debug!(
+                                target: "state_manager",
+                                slug = %slug,
+                                token_id = %token_id,
+                                level,
+                                order_id = %order_id,
+                                existing_id = %existing.order_id,
+                                "order removal ignored due to id mismatch"
+                            );
+                            return;
+                        }
+                    }
+                    state.orders.remove(&token_id, level);
+                } else {
+                    tracing::debug!(
+                        target: "state_manager",
+                        slug = %slug,
+                        "order removal for unknown market"
+                    );
                 }
             }
         }
@@ -338,6 +608,21 @@ mod tests {
         }
     }
 
+    fn make_identity_with_flags(
+        active: bool,
+        accepting_orders: bool,
+        closed: bool,
+        restricted: bool,
+    ) -> MarketIdentity {
+        MarketIdentity {
+            active,
+            accepting_orders,
+            closed,
+            restricted,
+            ..make_identity()
+        }
+    }
+
     #[test]
     fn applying_fill_updates_cost_basis() {
         let ops = OpsState::new(&AppConfig::default());
@@ -366,6 +651,32 @@ mod tests {
         let avg = state.inventory.up.avg_cost().unwrap();
         assert!((avg - 0.49).abs() < 1e-12, "avg_cost={avg}");
         assert_eq!(state.inventory.unpaired_shares(), 10.0);
+    }
+
+    #[test]
+    fn heartbeat_updates_health_without_inventory_mutation() {
+        let ops = OpsState::new(&AppConfig::default());
+        let mut sm = StateManager::new(
+            AlphaConfig::default(),
+            OracleConfig::default(),
+            TradingConfig::default(),
+            ops.health.clone(),
+            ops.metrics,
+        );
+        sm.apply_event(AppEvent::MarketDiscovered(make_identity()), 0);
+
+        sm.apply_event(
+            AppEvent::UserWsUpdate(UserWsUpdate::Heartbeat { ts_ms: 1_000 }),
+            1_000,
+        );
+
+        let state = sm.market_state("btc-updown-15m-0").unwrap();
+        assert_eq!(state.inventory.up.shares, 0.0);
+        assert_eq!(state.inventory.down.shares, 0.0);
+
+        let report = sm.health.report(1_000);
+        assert_eq!(report.feeds.user_ws.last_update_ms, 1_000);
+        assert_eq!(report.feeds.user_ws.status, "healthy");
     }
 
     #[test]
@@ -480,5 +791,188 @@ mod tests {
         assert_eq!(state.inventory.up.notional_usdc, 0.0);
         assert_eq!(state.inventory.down.shares, 0.0);
         assert_eq!(state.inventory.down.notional_usdc, 0.0);
+    }
+
+    #[test]
+    fn order_update_upsert_and_remove() {
+        let ops = OpsState::new(&AppConfig::default());
+        let mut sm = StateManager::new(
+            AlphaConfig::default(),
+            OracleConfig::default(),
+            TradingConfig::default(),
+            ops.health,
+            ops.metrics,
+        );
+        sm.apply_event(AppEvent::MarketDiscovered(make_identity()), 0);
+
+        let order = LiveOrder {
+            order_id: "order-1".to_string(),
+            token_id: "up".to_string(),
+            level: 0,
+            price: 0.48,
+            size: 5.0,
+            remaining: 5.0,
+            status: crate::state::order_state::OrderStatus::Open,
+            last_update_ms: 1_000,
+        };
+
+        sm.apply_event(
+            AppEvent::OrderUpdate(OrderUpdate::Upsert {
+                slug: "btc-updown-15m-0".to_string(),
+                order: order.clone(),
+            }),
+            1_000,
+        );
+
+        let state = sm.market_state("btc-updown-15m-0").unwrap();
+        let live = state
+            .orders
+            .live
+            .get(&(order.token_id.clone(), order.level))
+            .expect("live order stored");
+        assert_eq!(live.order_id, "order-1");
+
+        sm.apply_event(
+            AppEvent::OrderUpdate(OrderUpdate::Remove {
+                slug: "btc-updown-15m-0".to_string(),
+                token_id: "up".to_string(),
+                level: 0,
+                order_id: "order-1".to_string(),
+                ts_ms: 2_000,
+            }),
+            2_000,
+        );
+
+        let state = sm.market_state("btc-updown-15m-0").unwrap();
+        assert!(state.orders.live.is_empty());
+    }
+
+    #[test]
+    fn quoting_disabled_when_user_ws_stale() {
+        let mut cfg = AppConfig::default();
+        cfg.trading.dry_run = false;
+        let ops = OpsState::new(&cfg);
+        let mut sm = StateManager::new(
+            AlphaConfig::default(),
+            OracleConfig::default(),
+            cfg.trading.clone(),
+            ops.health.clone(),
+            ops.metrics,
+        );
+        sm.apply_event(AppEvent::MarketDiscovered(make_identity()), 0);
+        sm.apply_event(
+            AppEvent::MarketWsUpdate(MarketWsUpdate {
+                token_id: "up".to_string(),
+                best_bid: Some(0.49),
+                best_ask: Some(0.51),
+                tick_size: Some(0.001),
+                ts_ms: 9_500,
+            }),
+            9_500,
+        );
+        sm.apply_event(
+            AppEvent::RTDSUpdate(RTDSUpdate {
+                source: RTDSSource::ChainlinkBtcUsd,
+                price: 40_000.0,
+                ts_ms: 9_500,
+            }),
+            9_500,
+        );
+        sm.health.mark_user_ws(0);
+
+        sm.apply_event(AppEvent::TimerTick { now_ms: 10_000 }, 10_000);
+
+        let state = sm.market_state("btc-updown-15m-0").unwrap();
+        assert!(!state.quoting_enabled);
+
+        let report = sm.health.report(10_000);
+        assert_eq!(report.quoting_enabled_markets, 0);
+        assert_eq!(report.quoting_block_reason, Some("user_ws_stale".to_string()));
+    }
+
+    #[test]
+    fn quoting_disabled_when_market_ws_stale_both_tokens() {
+        let ops = OpsState::new(&AppConfig::default());
+        let alpha_cfg = AlphaConfig {
+            market_ws_stale_ms: 500,
+            ..AlphaConfig::default()
+        };
+        let mut sm = StateManager::new(
+            alpha_cfg,
+            OracleConfig::default(),
+            TradingConfig::default(),
+            ops.health,
+            ops.metrics,
+        );
+        sm.apply_event(AppEvent::MarketDiscovered(make_identity()), 0);
+
+        sm.apply_event(
+            AppEvent::MarketWsUpdate(MarketWsUpdate {
+                token_id: "up".to_string(),
+                best_bid: Some(0.49),
+                best_ask: Some(0.51),
+                tick_size: Some(0.001),
+                ts_ms: 1_000,
+            }),
+            1_000,
+        );
+        sm.apply_event(
+            AppEvent::MarketWsUpdate(MarketWsUpdate {
+                token_id: "down".to_string(),
+                best_bid: Some(0.49),
+                best_ask: Some(0.51),
+                tick_size: Some(0.001),
+                ts_ms: 1_000,
+            }),
+            1_000,
+        );
+        sm.apply_event(
+            AppEvent::RTDSUpdate(RTDSUpdate {
+                source: RTDSSource::ChainlinkBtcUsd,
+                price: 40_000.0,
+                ts_ms: 2_000,
+            }),
+            2_000,
+        );
+
+        sm.apply_event(AppEvent::TimerTick { now_ms: 2_000 }, 2_000);
+
+        let state = sm.market_state("btc-updown-15m-0").unwrap();
+        assert_eq!(state.alpha.size_scalar, 0.0);
+        assert!(!state.quoting_enabled);
+    }
+
+    #[test]
+    fn restricted_market_latches_halt() {
+        let mut cfg = AppConfig::default();
+        cfg.trading.dry_run = false;
+        let ops = OpsState::new(&cfg);
+        let mut sm = StateManager::new(
+            AlphaConfig::default(),
+            OracleConfig::default(),
+            cfg.trading.clone(),
+            ops.health.clone(),
+            ops.metrics,
+        );
+        sm.apply_event(
+            AppEvent::MarketDiscovered(make_identity_with_flags(true, true, false, true)),
+            0,
+        );
+        sm.apply_event(
+            AppEvent::RTDSUpdate(RTDSUpdate {
+                source: RTDSSource::ChainlinkBtcUsd,
+                price: 40_000.0,
+                ts_ms: 9_500,
+            }),
+            9_500,
+        );
+
+        sm.apply_event(AppEvent::TimerTick { now_ms: 10_000 }, 10_000);
+
+        let state = sm.market_state("btc-updown-15m-0").unwrap();
+        assert!(!state.quoting_enabled);
+
+        let report = sm.health.report(10_000);
+        assert!(report.halted_reason.is_some());
     }
 }

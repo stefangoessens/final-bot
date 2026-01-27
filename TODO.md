@@ -41,3 +41,23 @@ Task status:
 - [x] P4 User WS order parsing robustness (partial updates)
 - [x] P5 Merge/redeem correctness (e6 units + readiness gates + state sync)
 - [x] P6 Size-aware taker EV math (fee depends on Q)
+
+## Wave 7 (Post-review fixes v2)
+- [x] W7.1 RTDS Chainlink subscribe payload + watchdog
+- [x] W7.2 QuoteTick backpressure removal (StateManager + fanout non-blocking)
+- [x] W7.3 Batch post partial-success safety (REST + OrderManager)
+- [x] W7.4 Cancels bypass REST post-backoff + execution-layer cutoff suppresses posts
+- [x] W7.5 Quoting gates: user WS health + market tradability; restricted => halt
+- [x] W7.6 Heartbeats mandatory validation (non-dry-run)
+- [x] W7.7 Market discovery grace tracking for previous market + deduped emits
+- [x] W7.8 Taker completion wired end-to-end (FOK/FAK + explicit cap + tick-round p_max)
+- [x] W7.9 Startup cancel-all fail-closed
+- [x] W7.10 Deterministic execution race tests (OrderManager invariants)
+- [x] W7.11 Maker-only compliance integration test
+- [x] W7.12 Restart reconciliation (seed open orders + inventory from truth)
+- [x] W7.13 Market WS per-token staleness gating + config knob
+- [x] W7.14 Tick-size readiness gating (do not quote until known)
+- [x] W7.15 Liquidity rewards scoring integration end-to-end
+- [x] W7.16 Event-log disk budget + rotation + sampling policy
+- [ ] W7.17 Replace synthetic reject fixture with captured live user-WS reject frame
+- [x] W7.18 Data API mergeable/redeemable readiness integration (remove stubs)

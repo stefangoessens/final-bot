@@ -29,10 +29,10 @@ pub fn build_desired_orders(
 
     let mut cap_up = state.alpha.cap_up;
     let mut cap_down = state.alpha.cap_down;
-    if !cap_up.is_finite() || cap_up <= 0.0 {
+    if !cap_up.is_finite() || cap_up < 0.0 {
         cap_up = 0.5 * target_total;
     }
-    if !cap_down.is_finite() || cap_down <= 0.0 {
+    if !cap_down.is_finite() || cap_down < 0.0 {
         cap_down = 0.5 * target_total;
     }
 
@@ -217,7 +217,10 @@ mod tests {
             accepting_orders: true,
             restricted: false,
         };
-        MarketState::new(identity, 900_000)
+        let mut state = MarketState::new(identity, 900_000);
+        state.up_book.tick_size = 0.01;
+        state.down_book.tick_size = 0.01;
+        state
     }
 
     #[test]
@@ -251,6 +254,25 @@ mod tests {
             sum <= state.alpha.target_total + 1e-12,
             "combined cap violated: {sum}"
         );
+    }
+
+    #[test]
+    fn no_orders_until_tick_size_known() {
+        let mut state = base_state();
+        state.up_book.tick_size = 0.0;
+        state.down_book.tick_size = 0.01;
+        state.up_book.best_bid = Some(0.49);
+        state.up_book.best_ask = Some(0.50);
+        state.down_book.best_bid = Some(0.49);
+        state.down_book.best_ask = Some(0.50);
+        state.alpha.target_total = 0.98;
+        state.alpha.cap_up = 0.98;
+        state.alpha.cap_down = 0.98;
+        state.alpha.size_scalar = 1.0;
+
+        let cfg = TradingConfig::default();
+        let desired = build_desired_orders(&state, &cfg, 1000);
+        assert!(desired.is_empty(), "expected no orders before tick known");
     }
 
     #[test]

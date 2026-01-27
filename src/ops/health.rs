@@ -30,8 +30,10 @@ struct HealthInner {
     last_chainlink_ms: AtomicI64,
     last_binance_ms: AtomicI64,
     tracked_markets: AtomicUsize,
+    quoting_enabled_markets: AtomicUsize,
     started_ms: i64,
     halt_reason: RwLock<Option<String>>,
+    quote_block_reason: RwLock<Option<String>>,
 }
 
 impl HealthState {
@@ -49,8 +51,10 @@ impl HealthState {
                 last_chainlink_ms: AtomicI64::new(now_ms),
                 last_binance_ms: AtomicI64::new(now_ms),
                 tracked_markets: AtomicUsize::new(0),
+                quoting_enabled_markets: AtomicUsize::new(0),
                 started_ms: now_ms,
                 halt_reason: RwLock::new(None),
+                quote_block_reason: RwLock::new(None),
             }),
         }
     }
@@ -78,6 +82,12 @@ impl HealthState {
         );
 
         let halted_reason = self.inner.halt_reason.read().ok().and_then(|r| r.clone());
+        let quote_block_reason = self
+            .inner
+            .quote_block_reason
+            .read()
+            .ok()
+            .and_then(|r| r.clone());
         let required_healthy = market_ws.is_healthy()
             && chainlink.is_healthy()
             && (!self.inner.require_user_ws || user_ws.is_healthy());
@@ -99,6 +109,8 @@ impl HealthState {
             uptime_ms: now_ms.saturating_sub(self.inner.started_ms),
             tracked_markets: self.inner.tracked_markets.load(Ordering::Relaxed),
             halted_reason,
+            quoting_enabled_markets: self.inner.quoting_enabled_markets.load(Ordering::Relaxed),
+            quoting_block_reason: quote_block_reason,
             feeds: FeedReportSet {
                 market_ws,
                 user_ws,
@@ -139,6 +151,41 @@ impl HealthState {
             *guard = reason;
         }
     }
+
+    #[allow(dead_code)]
+    pub fn is_halted(&self) -> bool {
+        self.inner
+            .halt_reason
+            .read()
+            .ok()
+            .and_then(|r| r.clone())
+            .is_some()
+    }
+
+    #[allow(dead_code)]
+    pub fn halt_reason(&self) -> Option<String> {
+        self.inner.halt_reason.read().ok().and_then(|r| r.clone())
+    }
+
+    #[allow(dead_code)]
+    pub fn user_ws_fresh(&self, now_ms: i64) -> bool {
+        let report = feed_report(
+            self.inner.last_user_ws_ms.load(Ordering::Relaxed),
+            self.inner.user_ws_stale_ms,
+            now_ms,
+        );
+        report.is_healthy()
+    }
+
+    #[allow(dead_code)]
+    pub fn set_quoting_status(&self, enabled_markets: usize, block_reason: Option<String>) {
+        self.inner
+            .quoting_enabled_markets
+            .store(enabled_markets, Ordering::Relaxed);
+        if let Ok(mut guard) = self.inner.quote_block_reason.write() {
+            *guard = block_reason;
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -149,6 +196,8 @@ pub struct HealthReport {
     pub uptime_ms: i64,
     pub tracked_markets: usize,
     pub halted_reason: Option<String>,
+    pub quoting_enabled_markets: usize,
+    pub quoting_block_reason: Option<String>,
     pub feeds: FeedReportSet,
 }
 

@@ -9,11 +9,19 @@ use tokio::time;
 use crate::alpha::{toxicity, volatility};
 use crate::config::{AlphaConfig, MergeConfig, OracleConfig};
 use crate::inventory::onchain::OnchainRequest;
+use crate::clients::data_api::DataApiClient;
 use crate::state::market_state::MarketState;
 use crate::state::state_manager::QuoteTick;
 
 const USDC_BASE_UNITS: u64 = 1_000_000;
 const USDC_BASE_UNITS_F64: f64 = 1_000_000.0;
+
+#[derive(Debug, Default, Clone)]
+struct ReadinessGate {
+    // TODO(data-api): wire mergeable/redeemable readiness from Data API once available.
+    mergeable: HashMap<String, bool>,
+    redeemable: HashMap<String, bool>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InventoryAction {
@@ -30,6 +38,7 @@ pub struct InventoryEngine {
     merge_cfg: MergeConfig,
     alpha_cfg: AlphaConfig,
     oracle_cfg: OracleConfig,
+    readiness: ReadinessGate,
     last_merge_ms: HashMap<String, i64>,
     last_redeem_ms: HashMap<String, i64>,
     recent_ops: VecDeque<i64>,
@@ -41,10 +50,23 @@ impl InventoryEngine {
             merge_cfg,
             alpha_cfg,
             oracle_cfg,
+            readiness: ReadinessGate::default(),
             last_merge_ms: HashMap::new(),
             last_redeem_ms: HashMap::new(),
             recent_ops: VecDeque::new(),
         }
+    }
+
+    pub fn set_mergeable_readiness(&mut self, condition_id: &str, ready: bool) {
+        self.readiness
+            .mergeable
+            .insert(condition_id.to_string(), ready);
+    }
+
+    pub fn set_redeemable_readiness(&mut self, condition_id: &str, ready: bool) {
+        self.readiness
+            .redeemable
+            .insert(condition_id.to_string(), ready);
     }
 
     pub fn tick(
@@ -61,10 +83,24 @@ impl InventoryEngine {
         let mut pause_fast_move_emitted = false;
         let mut pause_interval_emitted = false;
         let mut pause_rate_limit_emitted = false;
+        let mut pause_readiness_emitted = false;
         let min_sets_base_units = self.merge_cfg.min_sets.saturating_mul(USDC_BASE_UNITS);
         let batch_sets_base_units = self.merge_cfg.batch_sets.saturating_mul(USDC_BASE_UNITS);
 
         for market in market_states_snapshot {
+            if matches!(
+                self.readiness.mergeable.get(&market.identity.condition_id),
+                Some(false)
+            ) {
+                if !pause_readiness_emitted {
+                    actions.push(InventoryAction::PauseMerges {
+                        reason: "readiness_gate".to_string(),
+                    });
+                    pause_readiness_emitted = true;
+                }
+                continue;
+            }
+
             let full_sets_base_units = mergeable_base_units(
                 market.inventory.up.shares,
                 market.inventory.down.shares,
@@ -126,6 +162,19 @@ impl InventoryEngine {
                 continue;
             }
             if market.inventory.up.shares <= 0.0 && market.inventory.down.shares <= 0.0 {
+                continue;
+            }
+            if matches!(
+                self.readiness
+                    .redeemable
+                    .get(&market.identity.condition_id),
+                Some(false)
+            ) {
+                tracing::info!(
+                    target: "inventory_engine",
+                    condition_id = %market.identity.condition_id,
+                    "redeem blocked by readiness gate"
+                );
                 continue;
             }
             if self
@@ -206,7 +255,8 @@ impl InventoryEngine {
     fn is_fast_move(&self, market: &MarketState, now_ms: i64) -> bool {
         let mut alpha_state = market.alpha.clone();
         let var_per_s = volatility::var_per_s(&alpha_state);
-        let market_ws_last_ms = latest_market_ws_ms(market);
+        let market_ws_stale =
+            market_ws_all_stale(market, now_ms, self.alpha_cfg.market_ws_stale_ms);
         let eval = toxicity::evaluate_regime(
             &mut alpha_state,
             now_ms,
@@ -214,7 +264,7 @@ impl InventoryEngine {
             &self.oracle_cfg,
             market.rtds_primary,
             market.rtds_sanity,
-            market_ws_last_ms,
+            market_ws_stale,
             var_per_s,
         );
         eval.fast_move
@@ -286,6 +336,9 @@ pub struct InventoryLoop {
     engine: InventoryEngine,
     executor: InventoryExecutor,
     merge_interval_s: u64,
+    readiness_client: Option<DataApiClient>,
+    readiness_user: Option<String>,
+    readiness_interval_s: u64,
 }
 
 impl InventoryLoop {
@@ -294,20 +347,80 @@ impl InventoryLoop {
             engine,
             executor,
             merge_interval_s,
+            readiness_client: None,
+            readiness_user: None,
+            readiness_interval_s: 0,
         }
+    }
+
+    pub fn with_readiness(
+        mut self,
+        client: DataApiClient,
+        user: String,
+        interval_s: u64,
+    ) -> Self {
+        self.readiness_client = Some(client);
+        self.readiness_user = Some(user);
+        self.readiness_interval_s = interval_s.max(1);
+        self
     }
 
     pub async fn run(mut self, mut rx_quote: Receiver<QuoteTick>) {
         let interval_s = self.merge_interval_s.max(1);
         let mut tick = time::interval(Duration::from_secs(interval_s));
+        let mut readiness_tick = if self.readiness_client.is_some() && self.readiness_user.is_some() {
+            Some(time::interval(Duration::from_secs(
+                self.readiness_interval_s.max(1),
+            )))
+        } else {
+            None
+        };
         let mut latest: HashMap<String, MarketState> = HashMap::new();
+        let mut last_full_sets: HashMap<String, u64> = HashMap::new();
+        let mut last_trade_ms: HashMap<String, i64> = HashMap::new();
 
         loop {
             tokio::select! {
                 maybe_tick = rx_quote.recv() => {
                     match maybe_tick {
-                        Some(QuoteTick { slug, state, .. }) => {
+                        Some(QuoteTick { slug, state, now_ms, .. }) => {
+                            let slug_key = slug.clone();
+                            let full_sets = mergeable_base_units(
+                                state.inventory.up.shares,
+                                state.inventory.down.shares,
+                            );
+                            let prev_full_sets = last_full_sets.get(&slug).copied().unwrap_or(0);
+                            let prev_trade_ms = last_trade_ms.get(&slug).copied().unwrap_or(0);
+                            let trade_ms = state.inventory.last_trade_ms;
+
                             latest.insert(slug, state);
+
+                            last_full_sets.insert(slug_key.clone(), full_sets);
+                            last_trade_ms.insert(slug_key, trade_ms);
+
+                            // Fill-driven fast path: if full sets increased on a new trade, attempt merge immediately.
+                            if self.engine.merge_cfg.enabled && self.engine.merge_cfg.batch_sets > 0 {
+                                let min_sets_base_units =
+                                    self.engine.merge_cfg.min_sets.saturating_mul(USDC_BASE_UNITS);
+                                let batch_sets_base_units =
+                                    self.engine.merge_cfg.batch_sets.saturating_mul(USDC_BASE_UNITS);
+                                let has_new_fills = trade_ms > prev_trade_ms;
+                                let grew_by_batch =
+                                    full_sets >= prev_full_sets.saturating_add(batch_sets_base_units);
+                                if has_new_fills
+                                    && grew_by_batch
+                                    && full_sets >= min_sets_base_units
+                                    && !latest.is_empty()
+                                {
+                                    let snapshot: Vec<MarketState> =
+                                        latest.values().cloned().collect();
+                                    let actions = self.engine.tick(now_ms, &snapshot);
+                                    if !actions.is_empty() {
+                                        log_inventory_actions(&actions);
+                                        self.executor.execute(&actions).await;
+                                    }
+                                }
+                            }
                         }
                         None => break,
                     }
@@ -329,6 +442,56 @@ impl InventoryLoop {
 
                     self.executor.execute(&actions).await;
                 }
+                _ = async {
+                    match &mut readiness_tick {
+                        Some(tick) => {
+                            tick.tick().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    if !latest.is_empty() {
+                        self.refresh_readiness(&latest).await;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn refresh_readiness(&mut self, latest: &HashMap<String, MarketState>) {
+        let Some(client) = &self.readiness_client else {
+            return;
+        };
+        let Some(user) = &self.readiness_user else {
+            return;
+        };
+
+        let condition_ids: Vec<String> = latest
+            .values()
+            .map(|state| state.identity.condition_id.clone())
+            .collect();
+
+        match client.fetch_positions(user, Some(&condition_ids)).await {
+            Ok(positions) => {
+                let mut by_condition: HashMap<String, (bool, bool)> = HashMap::new();
+                for pos in positions {
+                    let entry = by_condition
+                        .entry(pos.condition_id.clone())
+                        .or_insert((false, false));
+                    entry.0 |= pos.mergeable;
+                    entry.1 |= pos.redeemable;
+                }
+                for (condition_id, (mergeable, redeemable)) in by_condition {
+                    self.engine.set_mergeable_readiness(&condition_id, mergeable);
+                    self.engine.set_redeemable_readiness(&condition_id, redeemable);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "inventory_engine",
+                    error = %err,
+                    "data api readiness fetch failed"
+                );
             }
         }
     }
@@ -347,15 +510,14 @@ fn mergeable_base_units(up: f64, down: f64) -> u64 {
     }
 }
 
-fn latest_market_ws_ms(market: &MarketState) -> Option<i64> {
-    let up_ms = market.up_book.last_update_ms;
-    let down_ms = market.down_book.last_update_ms;
-    match (up_ms > 0, down_ms > 0) {
-        (true, true) => Some(up_ms.max(down_ms)),
-        (true, false) => Some(up_ms),
-        (false, true) => Some(down_ms),
-        (false, false) => None,
-    }
+fn market_ws_all_stale(market: &MarketState, now_ms: i64, stale_ms: i64) -> bool {
+    let up_stale = is_market_ws_stale(now_ms, stale_ms, market.up_book.last_update_ms);
+    let down_stale = is_market_ws_stale(now_ms, stale_ms, market.down_book.last_update_ms);
+    up_stale && down_stale
+}
+
+fn is_market_ws_stale(now_ms: i64, stale_ms: i64, last_update_ms: i64) -> bool {
+    last_update_ms > 0 && now_ms.saturating_sub(last_update_ms) > stale_ms
 }
 
 fn log_inventory_actions(actions: &[InventoryAction]) {
@@ -369,7 +531,7 @@ fn log_inventory_actions(actions: &[InventoryAction]) {
                     target: "inventory_engine",
                     condition_id = %condition_id,
                     qty_base_units,
-                    "merge decision"
+                    "merge requested"
                 );
             }
             InventoryAction::Redeem {
@@ -432,6 +594,7 @@ mod tests {
             max_ops_per_minute: 6,
             pause_during_fast_move: false,
             wallet_mode: MergeWalletMode::Eoa,
+            readiness_poll_interval_s: 30, // W7.15: keep tests aligned with config fields.
         };
         let mut engine = InventoryEngine::new(
             merge_cfg,
@@ -464,6 +627,7 @@ mod tests {
             max_ops_per_minute: 10,
             pause_during_fast_move: false,
             wallet_mode: MergeWalletMode::Eoa,
+            readiness_poll_interval_s: 30,
         };
         let mut engine = InventoryEngine::new(
             merge_cfg,
@@ -497,6 +661,7 @@ mod tests {
             max_ops_per_minute: 1,
             pause_during_fast_move: false,
             wallet_mode: MergeWalletMode::Eoa,
+            readiness_poll_interval_s: 30,
         };
         let mut engine = InventoryEngine::new(
             merge_cfg,
@@ -516,6 +681,36 @@ mod tests {
     }
 
     #[test]
+    fn readiness_gate_blocks_merge_and_redeem() {
+        let merge_cfg = MergeConfig {
+            enabled: true,
+            min_sets: 25,
+            batch_sets: 25,
+            interval_s: 10,
+            max_ops_per_minute: 6,
+            pause_during_fast_move: false,
+            wallet_mode: MergeWalletMode::Eoa,
+            readiness_poll_interval_s: 30,
+        };
+        let mut engine = InventoryEngine::new(
+            merge_cfg,
+            AlphaConfig::default(),
+            OracleConfig::default(),
+        );
+        engine.set_mergeable_readiness("cond", false);
+
+        let market = make_market("cond", 60.0, 55.0);
+        let actions = engine.tick(0, &[market]);
+        assert!(!actions.iter().any(|action| matches!(action, InventoryAction::Merge { .. })));
+
+        engine.set_redeemable_readiness("cond", false);
+        let mut closed_market = make_market("cond", 10.0, 10.0);
+        closed_market.identity.closed = true;
+        let actions = engine.tick(10_000, &[closed_market]);
+        assert!(!actions.iter().any(|action| matches!(action, InventoryAction::Redeem { .. })));
+    }
+
+    #[test]
     fn wallet_mode_relayer_still_respects_min_sets() {
         let merge_cfg = MergeConfig {
             enabled: true,
@@ -525,6 +720,7 @@ mod tests {
             max_ops_per_minute: 6,
             pause_during_fast_move: false,
             wallet_mode: MergeWalletMode::Relayer,
+            readiness_poll_interval_s: 30,
         };
         let mut engine = InventoryEngine::new(
             merge_cfg,

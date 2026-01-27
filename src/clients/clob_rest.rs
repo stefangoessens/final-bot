@@ -11,7 +11,9 @@ use polymarket_client_sdk::auth::{Credentials, Normal, Signer, Uuid};
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob::{Client as SdkClient, Config as SdkConfig};
 use polymarket_client_sdk::clob::types::{Amount, OrderType as SdkOrderType, Side, SignatureType, SignedOrder};
-use polymarket_client_sdk::types::{Address, Decimal, U256};
+use polymarket_client_sdk::clob::types::request::OrdersRequest;
+use polymarket_client_sdk::clob::types::response::{OpenOrderResponse, Page, PostOrderResponse};
+use polymarket_client_sdk::types::{Address, B256, Decimal, U256};
 use polymarket_client_sdk::POLYGON;
 
 use crate::config::{AppConfig, CompletionOrderType, HeartbeatsConfig, WalletMode};
@@ -27,6 +29,27 @@ const DEFAULT_FEE_RATE_TTL_MS: i64 = 60_000;
 pub struct CancelResult {
     pub canceled: Vec<OrderId>,
     pub failed: Vec<OrderId>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostOrdersResult {
+    pub accepted: Vec<PostOrderAccepted>,
+    pub rejected: Vec<PostOrderRejected>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostOrderAccepted {
+    pub idx: usize,
+    pub order_id: OrderId,
+    pub token_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostOrderRejected {
+    pub idx: usize,
+    pub error: String,
+    pub order_id: Option<OrderId>,
+    pub token_id: Option<String>,
 }
 
 type SdkAuthedClient = SdkClient<Authenticated<Normal>>;
@@ -328,6 +351,34 @@ impl ClobRestClient {
         self.get_fee_rate_bps_for_id(token_id).await
     }
 
+    pub async fn get_active_orders_for_market(
+        &self,
+        condition_id: &str,
+    ) -> BotResult<Vec<OpenOrderResponse>> {
+        let inner = self.inner.as_ref().ok_or_else(|| {
+            BotError::Other("active_orders unavailable: client not authenticated".to_string())
+        })?;
+        let market = parse_condition_id(condition_id)?;
+        let request = OrdersRequest::builder().market(market).build();
+
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page: Page<OpenOrderResponse> = inner
+                .client
+                .orders(&request, cursor.clone())
+                .await
+                .map_err(|e| BotError::Other(format!("active_orders fetch failed: {e}")))?;
+            out.extend(page.data);
+            if page.next_cursor.trim().is_empty() {
+                break;
+            }
+            cursor = Some(page.next_cursor);
+        }
+
+        Ok(out)
+    }
+
     async fn get_fee_rate_bps_for_id(&self, token_id: U256) -> BotResult<u64> {
         let inner = self.inner.as_ref().ok_or_else(|| {
             BotError::Other("fee_rate unavailable: client not authenticated".to_string())
@@ -348,27 +399,10 @@ impl ClobRestClient {
     }
 
     pub async fn post_orders(&self, orders: Vec<OrderRequest>) -> BotResult<Vec<OrderId>> {
-        let inner = self.inner.as_ref().ok_or_else(|| {
-            BotError::Other("post_orders unavailable: client not authenticated".to_string())
-        })?;
-        let responses = inner
-            .client
-            .post_orders(orders)
-            .await
-            .map_err(|e| BotError::Other(format!("post_orders failed: {e}")))?;
-
-        let mut order_ids = Vec::with_capacity(responses.len());
+        let result = self.post_orders_result(orders).await?;
         let mut failures = Vec::new();
-        for resp in responses {
-            if !resp.success {
-                failures.push(resp.error_msg.unwrap_or_else(|| "unknown error".into()));
-                continue;
-            }
-            if let Some(err) = resp.error_msg {
-                failures.push(err);
-                continue;
-            }
-            order_ids.push(resp.order_id);
+        for rejected in &result.rejected {
+            failures.push(rejected.error.clone());
         }
 
         if !failures.is_empty() {
@@ -378,7 +412,32 @@ impl ClobRestClient {
             )));
         }
 
-        Ok(order_ids)
+        Ok(result.accepted.into_iter().map(|item| item.order_id).collect())
+    }
+
+    pub async fn post_orders_result(
+        &self,
+        orders: Vec<OrderRequest>,
+    ) -> BotResult<PostOrdersResult> {
+        let inner = self.inner.as_ref().ok_or_else(|| {
+            BotError::Other("post_orders unavailable: client not authenticated".to_string())
+        })?;
+        if orders.is_empty() {
+            return Ok(PostOrdersResult::default());
+        }
+
+        let token_ids: Vec<Option<String>> = orders
+            .iter()
+            .map(extract_signed_order_token_id)
+            .collect();
+
+        let responses = inner
+            .client
+            .post_orders(orders)
+            .await
+            .map_err(|e| BotError::Other(format!("post_orders failed: {e}")))?;
+
+        Ok(post_orders_result_from_responses(responses, &token_ids))
     }
 
     pub async fn cancel_orders(&self, order_ids: Vec<OrderId>) -> BotResult<CancelResult> {
@@ -415,6 +474,100 @@ impl ClobRestClient {
             failed: resp.not_canceled.into_keys().collect(),
         })
     }
+}
+
+fn extract_signed_order_token_id(order: &OrderRequest) -> Option<String> {
+    Some(order.order.tokenId.to_string())
+}
+
+fn post_orders_result_from_responses(
+    responses: Vec<PostOrderResponse>,
+    token_ids: &[Option<String>],
+) -> PostOrdersResult {
+    let mut result = PostOrdersResult::default();
+    let response_len = responses.len();
+    for (idx, resp) in responses.into_iter().enumerate() {
+        let token_id = token_ids.get(idx).cloned().unwrap_or(None);
+        let mut error = None;
+
+        if !resp.success {
+            error = Some(resp.error_msg.unwrap_or_else(|| "unknown error".into()));
+        } else if let Some(err) = resp.error_msg {
+            error = Some(err);
+        } else if resp.order_id.trim().is_empty() {
+            error = Some("missing order_id".to_string());
+        }
+
+        match error {
+            Some(err) => {
+                let order_id = if resp.order_id.trim().is_empty() {
+                    None
+                } else {
+                    Some(resp.order_id)
+                };
+                tracing::warn!(
+                    target: "clob_rest",
+                    idx,
+                    token_id = ?token_id,
+                    order_id = order_id.as_deref().unwrap_or(""),
+                    error = %err,
+                    action = "post_order_reject",
+                    "order rejected"
+                );
+                result.rejected.push(PostOrderRejected {
+                    idx,
+                    error: err,
+                    order_id,
+                    token_id,
+                });
+            }
+            None => {
+                tracing::info!(
+                    target: "clob_rest",
+                    idx,
+                    token_id = ?token_id,
+                    order_id = %resp.order_id,
+                    action = "post_order_accept",
+                    "order accepted"
+                );
+                result.accepted.push(PostOrderAccepted {
+                    idx,
+                    order_id: resp.order_id,
+                    token_id,
+                });
+            }
+        }
+    }
+
+    if response_len < token_ids.len() {
+        for idx in response_len..token_ids.len() {
+            let token_id = token_ids.get(idx).cloned().unwrap_or(None);
+            let err = "missing response".to_string();
+            tracing::warn!(
+                target: "clob_rest",
+                idx,
+                token_id = ?token_id,
+                error = %err,
+                action = "post_order_reject",
+                "order rejected"
+            );
+            result.rejected.push(PostOrderRejected {
+                idx,
+                error: err,
+                order_id: None,
+                token_id,
+            });
+        }
+    } else if response_len > token_ids.len() {
+        tracing::warn!(
+            target: "clob_rest",
+            response_len,
+            request_len = token_ids.len(),
+            "post_orders returned more responses than requests"
+        );
+    }
+
+    result
 }
 
 pub trait HeartbeatApi: Send + Sync {
@@ -526,6 +679,15 @@ fn parse_token_id(token_id: &str) -> BotResult<U256> {
             .parse::<U256>()
             .map_err(|e| BotError::Other(format!("invalid token_id: {e}")))
     }
+}
+
+fn parse_condition_id(condition_id: &str) -> BotResult<B256> {
+    let condition_id = condition_id.trim();
+    if condition_id.is_empty() {
+        return Err(BotError::Other("condition_id empty".to_string()));
+    }
+    B256::from_str(condition_id)
+        .map_err(|e| BotError::Other(format!("invalid condition_id: {e}")))
 }
 
 fn parse_decimal(value: f64, max_dp: usize) -> BotResult<Decimal> {
@@ -668,5 +830,46 @@ mod tests {
         assert_eq!(first, 42);
         assert_eq!(second, 42);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn post_orders_result_keeps_accepted_on_partial_failure() {
+        fn resp(success: bool, order_id: &str, error: Option<&str>) -> PostOrderResponse {
+            serde_json::from_value(serde_json::json!({
+                "errorMsg": error,
+                "makingAmount": "0",
+                "takingAmount": "0",
+                "orderID": order_id,
+                "status": "LIVE",
+                "success": success,
+                "transactionHashes": [],
+                "tradeIds": [],
+            }))
+            .expect("deserialize PostOrderResponse")
+        }
+
+        let responses = vec![
+            resp(true, "order-1", None),
+            resp(false, "", Some("insufficient balance")),
+            resp(true, "order-3", None),
+        ];
+        let token_ids = vec![
+            Some("100".to_string()),
+            Some("200".to_string()),
+            Some("300".to_string()),
+        ];
+
+        let result = post_orders_result_from_responses(responses, &token_ids);
+
+        assert_eq!(result.accepted.len(), 2);
+        assert_eq!(result.rejected.len(), 1);
+
+        assert_eq!(result.accepted[0].idx, 0);
+        assert_eq!(result.accepted[0].order_id, "order-1");
+        assert_eq!(result.accepted[1].idx, 2);
+        assert_eq!(result.accepted[1].order_id, "order-3");
+
+        assert_eq!(result.rejected[0].idx, 1);
+        assert_eq!(result.rejected[0].error, "insufficient balance");
     }
 }

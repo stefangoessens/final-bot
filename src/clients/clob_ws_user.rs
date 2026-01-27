@@ -12,8 +12,6 @@ use crate::persistence::LogEvent;
 use crate::state::state_manager::{AppEvent, FillEvent, UserWsUpdate};
 
 const USER_CHANNEL: &str = "user";
-const HEARTBEAT_TOKEN_ID: &str = "__user_ws_heartbeat__";
-
 const PING_INTERVAL_MS: u64 = 10_000;
 const BACKOFF_MIN_MS: u64 = 500;
 const BACKOFF_MAX_MS: u64 = 20_000;
@@ -26,6 +24,7 @@ pub enum UserOrderUpdateType {
     Placement,
     Update,
     Cancellation,
+    Rejection,
 }
 
 #[derive(Debug, Clone)]
@@ -245,8 +244,11 @@ impl UserWsLoop {
         tx_order_updates: Option<&Sender<UserOrderUpdate>>,
         log_tx: Option<&Sender<LogEvent>>,
     ) -> BotResult<()> {
+        let mut heartbeat_ts = None;
+
         match parse_fill_event(text) {
             Ok(Some(fill)) => {
+                heartbeat_ts = Some(fill.ts_ms);
                 log_fill_event(log_tx, &fill);
                 tracing::info!(
                     target: "clob_ws_user",
@@ -263,7 +265,6 @@ impl UserWsLoop {
                 {
                     return Err(BotError::Other("event channel closed".to_string()));
                 }
-                Ok(())
             }
             Ok(None) => {
                 let order_update = match parse_order_event(text) {
@@ -274,7 +275,6 @@ impl UserWsLoop {
                     }
                 };
 
-                let mut heartbeat_ts = None;
                 if let Some(update) = order_update {
                     heartbeat_ts = Some(update.ts_ms);
                     log_user_order_update(log_tx, &update);
@@ -287,30 +287,23 @@ impl UserWsLoop {
                         }
                     }
                 }
-
-                if heartbeat_ts.is_none() {
-                    heartbeat_ts = extract_event_timestamp_ms(text).unwrap_or(None);
-                }
-
-                if let Some(ts_ms) = heartbeat_ts {
-                    let heartbeat = FillEvent {
-                        // placeholder token to advance last_user_ws_msg_ms without touching inventory
-                        token_id: HEARTBEAT_TOKEN_ID.to_string(),
-                        price: 0.0,
-                        shares: 0.0,
-                        ts_ms,
-                    };
-                    let _ = tx_events
-                        .send(AppEvent::UserWsUpdate(UserWsUpdate::Fill(heartbeat)))
-                        .await;
-                }
-                Ok(())
             }
             Err(err) => {
                 tracing::warn!(target: "clob_ws_user", error = %err, "parse error");
-                Ok(())
             }
         }
+
+        if heartbeat_ts.is_none() {
+            heartbeat_ts = extract_event_timestamp_ms(text).unwrap_or(None);
+        }
+
+        if let Some(ts_ms) = heartbeat_ts {
+            let _ = tx_events
+                .send(AppEvent::UserWsUpdate(UserWsUpdate::Heartbeat { ts_ms }))
+                .await;
+        }
+
+        Ok(())
     }
 
     fn subscribe_payload(&self) -> BotResult<String> {
@@ -440,12 +433,21 @@ fn parse_order_event(text: &str) -> BotResult<Option<UserOrderUpdate>> {
 
     let raw_update_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let update_type = raw_update_type.to_ascii_uppercase();
+    let status = value
+        .get("status")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("order_status").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let status = status.to_ascii_uppercase();
+    let is_rejection = matches!(update_type.as_str(), "REJECTION" | "REJECTED")
+        || matches!(status.as_str(), "REJECTION" | "REJECTED" | "REJECT")
+        || matches!(event_type.as_str(), "rejection" | "rejected" | "reject");
     let is_order_type = matches!(
         update_type.as_str(),
-        "PLACEMENT" | "UPDATE" | "CANCELLATION"
+        "PLACEMENT" | "UPDATE" | "CANCELLATION" | "REJECTION" | "REJECTED"
     );
 
-    if event_type != "order" && !is_order_type {
+    if event_type != "order" && !is_order_type && !is_rejection {
         return Ok(None);
     }
 
@@ -478,12 +480,16 @@ fn parse_order_event(text: &str) -> BotResult<Option<UserOrderUpdate>> {
         .filter(|v| v.is_finite());
     let ts_ms = extract_timestamp_from_value(&value).unwrap_or_else(now_ms);
 
-    let update_type = match update_type.as_str() {
-        "PLACEMENT" => UserOrderUpdateType::Placement,
-        "UPDATE" => UserOrderUpdateType::Update,
-        "CANCELLATION" => UserOrderUpdateType::Cancellation,
-        "" if event_type == "order" => UserOrderUpdateType::Update,
-        _ => return Ok(None),
+    let update_type = if is_rejection {
+        UserOrderUpdateType::Rejection
+    } else {
+        match update_type.as_str() {
+            "PLACEMENT" => UserOrderUpdateType::Placement,
+            "UPDATE" => UserOrderUpdateType::Update,
+            "CANCELLATION" => UserOrderUpdateType::Cancellation,
+            "" if event_type == "order" => UserOrderUpdateType::Update,
+            _ => return Ok(None),
+        }
     };
 
     Ok(Some(UserOrderUpdate {
@@ -583,6 +589,7 @@ fn log_user_order_update(log_tx: Option<&Sender<LogEvent>>, update: &UserOrderUp
         UserOrderUpdateType::Placement => "PLACEMENT",
         UserOrderUpdateType::Update => "UPDATE",
         UserOrderUpdateType::Cancellation => "CANCELLATION",
+        UserOrderUpdateType::Rejection => "REJECTION",
     };
     let payload = json!({
         "order_id": update.order_id,
@@ -861,6 +868,19 @@ mod tests {
 
         let update = parse_order_event(raw).unwrap().unwrap();
         assert_eq!(update.update_type, UserOrderUpdateType::Cancellation);
+        assert_eq!(update.size_matched, Some(0.0));
+    }
+
+    #[test]
+    fn parse_order_message_rejection_fixture() {
+        // Synthetic fixture; real reject schema needs capture; update fixture when we record a live frame.
+        let raw = include_str!("../../fixtures/user_ws_reject.json");
+        let update = parse_order_event(raw).unwrap().unwrap();
+        assert_eq!(update.update_type, UserOrderUpdateType::Rejection);
+        assert_eq!(update.order_id, "0xreject");
+        assert_eq!(update.token_id, "token-reject");
+        assert_eq!(update.price, Some(0.57));
+        assert_eq!(update.original_size, Some(10.0));
         assert_eq!(update.size_matched, Some(0.0));
     }
 

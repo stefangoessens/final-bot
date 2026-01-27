@@ -16,6 +16,7 @@ mod strategy;
 mod time;
 
 mod ops;
+mod reconciliation;
 
 use crate::error::BotResult;
 use crate::persistence::{spawn_event_logger, EventLogConfig};
@@ -44,6 +45,7 @@ async fn main() -> BotResult<()> {
     let (tx_quote_inventory, rx_quote_inventory) = mpsc::channel(64);
     let (tx_quote_rewards, rx_quote_rewards) = mpsc::channel(64);
     let (tx_exec, rx_exec) = mpsc::channel(256);
+    let (tx_completion, rx_completion) = mpsc::channel(256);
     let (tx_market_ws_cmd, rx_market_ws_cmd) = mpsc::channel(256);
     let (tx_user_orders, rx_user_orders) = mpsc::channel(256);
     let rewards_enabled = cfg.rewards.enable_liquidity_rewards_chasing;
@@ -75,12 +77,22 @@ async fn main() -> BotResult<()> {
                 None
             };
 
-            if tx_quote_strategy.send(tick_for_strategy).await.is_err() {
-                tracing::warn!(
-                    target: "quote_fanout",
-                    "strategy quote channel closed; stopping fanout"
-                );
-                break;
+            if let Err(err) = tx_quote_strategy.try_send(tick_for_strategy) {
+                match err {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        tracing::debug!(
+                            target: "quote_fanout",
+                            "strategy loop lagging; dropping quote tick"
+                        );
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        tracing::warn!(
+                            target: "quote_fanout",
+                            "strategy quote channel closed; stopping fanout"
+                        );
+                        break;
+                    }
+                }
             }
 
             if tx_quote_inventory.try_send(tick).is_err() {
@@ -110,20 +122,61 @@ async fn main() -> BotResult<()> {
 
     let rest = clients::clob_rest::ClobRestClient::from_config(&cfg).await?;
 
+    let data_api = if cfg.endpoints.data_api_base_url.trim().is_empty() {
+        None
+    } else {
+        Some(clients::data_api::DataApiClient::new(
+            cfg.endpoints.data_api_base_url.clone(),
+        ))
+    };
+
+    let reconciler = reconciliation::StartupReconciler::new(
+        clients::gamma::GammaClient::new(cfg.endpoints.gamma_base_url.clone()),
+        rest.clone(),
+        data_api.clone(),
+    );
+    let seed_orders = !cfg.trading.startup_cancel_all;
+    let reconciliation = reconciler
+        .run(&cfg, &tx_events, seed_orders)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "startup",
+                error = %e,
+                "startup reconciliation failed"
+            );
+            e
+        })?;
+
     if !cfg.trading.dry_run {
         if rest.authenticated() {
-            if let Err(err) = rest.cancel_all_orders().await {
-                tracing::warn!(
-                    target: "startup",
-                    error = %err,
-                    "startup cancel_all_orders failed"
-                );
+            if cfg.trading.startup_cancel_all {
+                if let Err(err) = rest.cancel_all_orders().await {
+                    tracing::error!(
+                        target: "startup",
+                        error = %err,
+                        "startup cancel_all_orders failed; refusing to trade"
+                    );
+                    return Err(err);
+                }
+            } else if !reconciliation.cancel_order_ids.is_empty() {
+                if let Err(err) = rest.cancel_orders(reconciliation.cancel_order_ids.clone()).await
+                {
+                    tracing::warn!(
+                        target: "startup",
+                        error = %err,
+                        "startup cancel_orders failed"
+                    );
+                }
             }
         } else {
-            tracing::warn!(
+            tracing::error!(
                 target: "startup",
-                "rest client not authenticated; skipping startup cancel_all_orders"
+                "rest client not authenticated; refusing to trade"
             );
+            return Err(error::BotError::Other(
+                "rest client not authenticated; refusing to trade".to_string(),
+            ));
         }
     }
 
@@ -139,17 +192,23 @@ async fn main() -> BotResult<()> {
     let strategy_engine = strategy::engine::StrategyEngine::new(
         cfg.trading.clone(),
         cfg.inventory.clone(),
+        cfg.completion.clone(),
         cfg.rewards.clone(),
         rewards_rx,
     );
     tokio::spawn(strategy_engine.run_with_logger(
         rx_quote_strategy,
         tx_exec,
+        tx_completion,
         Some(tx_log.clone()),
     ));
 
-    let inventory_engine =
+    let mut inventory_engine =
         inventory::InventoryEngine::new(cfg.merge.clone(), cfg.alpha.clone(), cfg.oracle.clone());
+    for (condition_id, flags) in &reconciliation.readiness_by_condition {
+        inventory_engine.set_mergeable_readiness(condition_id, flags.mergeable);
+        inventory_engine.set_redeemable_readiness(condition_id, flags.redeemable);
+    }
     let tx_onchain = inventory::spawn_onchain_worker(
         inventory::OnchainWorkerConfig {
             enabled: cfg.merge.enabled && !cfg.trading.dry_run,
@@ -161,25 +220,49 @@ async fn main() -> BotResult<()> {
         Some(tx_events.clone()),
         Some(tx_log.clone()),
     );
-    let inventory_loop = inventory::InventoryLoop::new(
+    let mut inventory_loop = inventory::InventoryLoop::new(
         inventory_engine,
         inventory::InventoryExecutor::new(tx_onchain),
         cfg.merge.interval_s,
     );
+    if let (Some(data_api), Some(user)) = (data_api.clone(), reconciliation::resolve_data_api_user(&cfg)) {
+        inventory_loop =
+            inventory_loop.with_readiness(data_api, user, cfg.merge.readiness_poll_interval_s);
+    }
     tokio::spawn(inventory_loop.run(rx_quote_inventory));
 
-    let order_manager = execution::order_manager::OrderManager::new(
+    let mut order_manager = execution::order_manager::OrderManager::new(
         cfg.trading.clone(),
         rest.clone(),
         rx_user_orders,
     );
-    tokio::spawn(order_manager.run(rx_exec, Some(tx_log.clone())));
+    if !cfg.trading.startup_cancel_all {
+        for (slug, orders) in &reconciliation.orders_by_slug {
+            if !orders.is_empty() {
+                order_manager.seed_live_orders(slug, orders.clone());
+            }
+        }
+    }
+    // W7.15: forward live order updates to StateManager for rewards scoring.
+    tokio::spawn(order_manager.run(rx_exec, tx_events.clone(), Some(tx_log.clone())));
+
+    let completion_executor =
+        execution::completion::CompletionExecutor::new(cfg.completion.clone(), rest.clone());
+    tokio::spawn(completion_executor.run(
+        rx_completion,
+        Some(tx_log.clone()),
+        cfg.trading.dry_run,
+    ));
 
     let market_ws =
         clients::clob_ws_market::MarketWsLoop::new(cfg.endpoints.clob_ws_market_url.clone());
     tokio::spawn(market_ws.run(rx_market_ws_cmd, tx_events.clone(), Some(tx_log.clone())));
 
-    let rtds_ws = clients::rtds_ws::RTDSLoop::new(cfg.endpoints.rtds_ws_url.clone());
+    // P0.1: pass chainlink_stale_ms explicitly to avoid config reload inside RTDS loop.
+    let rtds_ws = clients::rtds_ws::RTDSLoop::new(
+        cfg.endpoints.rtds_ws_url.clone(),
+        cfg.oracle.chainlink_stale_ms,
+    );
     let tx_log_rtds = tx_log.clone();
     tokio::spawn({
         let tx_events = tx_events.clone();
@@ -225,11 +308,15 @@ async fn main() -> BotResult<()> {
     }
 
     let gamma = clients::gamma::GammaClient::new(cfg.endpoints.gamma_base_url.clone());
+    let clob_public =
+        clients::clob_public::ClobPublicClient::new(cfg.endpoints.clob_rest_base_url.clone());
     let discovery = market_discovery::MarketDiscoveryLoop::new(
         gamma,
+        clob_public,
         tx_events.clone(),
         Some(tx_market_ws_cmd),
         cfg.infra.market_discovery_interval_ms,
+        cfg.infra.market_discovery_grace_s, // grace window for previous market tracking
     );
     tokio::spawn(async move {
         if let Err(e) = discovery.run().await {

@@ -68,8 +68,8 @@ impl MarketState {
     pub fn new(identity: MarketIdentity, cutoff_ts_ms: i64) -> Self {
         Self {
             identity,
-            up_book: TokenBookTop::with_tick_size(0.01),
-            down_book: TokenBookTop::with_tick_size(0.01),
+            up_book: TokenBookTop::with_tick_size(0.0),
+            down_book: TokenBookTop::with_tick_size(0.0),
             start_btc_price: None,
             start_price_ts_ms: None,
             rtds_primary: None,
@@ -90,5 +90,30 @@ impl MarketState {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MarketIdentity, MarketState};
+
+    #[test]
+    fn new_market_state_has_unknown_tick_size() {
+        let identity = MarketIdentity {
+            slug: "btc-updown-15m-0".to_string(),
+            interval_start_ts: 0,
+            interval_end_ts: 0,
+            condition_id: "cond".to_string(),
+            token_up: "up".to_string(),
+            token_down: "down".to_string(),
+            active: true,
+            closed: false,
+            accepting_orders: true,
+            restricted: false,
+        };
+
+        let state = MarketState::new(identity, 0);
+        assert_eq!(state.up_book.tick_size, 0.0);
+        assert_eq!(state.down_book.tick_size, 0.0);
     }
 }

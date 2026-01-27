@@ -77,6 +77,20 @@ pub fn spawn_onchain_worker(
             }
         };
 
+        let relayer_mode = matches!(cfg.wallet_mode, MergeWalletMode::Relayer);
+        if relayer_mode {
+            tracing::error!(
+                target: "onchain_worker",
+                "merge wallet_mode=RELAYER requested but relayer integration is not implemented; merges/redeems disabled"
+            );
+            log_onchain_event(
+                &log_tx,
+                now_ms(),
+                "onchain.relayer_unimplemented",
+                json!({ "wallet_mode": "RELAYER" }),
+            );
+        }
+
         let ctf = match cfg.wallet_mode {
             MergeWalletMode::Eoa => match build_ctf_client(&cfg, chain_id).await {
                 Ok(client) => Some(client),
@@ -86,10 +100,6 @@ pub fn spawn_onchain_worker(
                 }
             },
             MergeWalletMode::Relayer => {
-                tracing::warn!(
-                    target: "onchain_worker",
-                    "merge wallet_mode=RELAYER requested but relayer integration is not implemented; merges/redeems disabled"
-                );
                 None
             }
         };
@@ -97,9 +107,54 @@ pub fn spawn_onchain_worker(
             .as_ref()
             .map(|client| IConditionalTokensRead::new(conditional_tokens, client.provider().clone()));
         let mut readiness_cache = ReadinessCache::default();
+        let mut relayer_drop_logged = false;
 
         while let Some(req) = rx.recv().await {
             if !cfg.enabled {
+                continue;
+            }
+            if relayer_mode {
+                if !relayer_drop_logged {
+                    tracing::error!(
+                        target: "onchain_worker",
+                        "dropping onchain request; RELAYER mode is not implemented"
+                    );
+                    relayer_drop_logged = true;
+                } else {
+                    tracing::warn!(
+                        target: "onchain_worker",
+                        "dropping onchain request; RELAYER mode is not implemented"
+                    );
+                }
+                let ts_ms = now_ms();
+                match &req {
+                    OnchainRequest::Merge {
+                        condition_id,
+                        qty_base_units,
+                    } => {
+                        log_onchain_event(
+                            &log_tx,
+                            ts_ms,
+                            "onchain.relayer_drop",
+                            json!({
+                                "action": "merge",
+                                "condition_id": condition_id,
+                                "qty_base_units": qty_base_units,
+                            }),
+                        );
+                    }
+                    OnchainRequest::Redeem { condition_id } => {
+                        log_onchain_event(
+                            &log_tx,
+                            ts_ms,
+                            "onchain.relayer_drop",
+                            json!({
+                                "action": "redeem",
+                                "condition_id": condition_id,
+                            }),
+                        );
+                    }
+                }
                 continue;
             }
             let Some(ctf) = ctf.as_ref() else {
@@ -115,6 +170,21 @@ pub fn spawn_onchain_worker(
                     condition_id,
                     qty_base_units,
                 } => {
+                    tracing::info!(
+                        target: "onchain_worker",
+                        condition_id = %condition_id,
+                        qty_base_units,
+                        "merge requested"
+                    );
+                    log_onchain_event(
+                        &log_tx,
+                        ts_ms,
+                        "onchain.merge_requested",
+                        json!({
+                            "condition_id": condition_id,
+                            "qty_base_units": qty_base_units,
+                        }),
+                    );
                     if qty_base_units == 0 {
                         continue;
                     }
@@ -153,8 +223,40 @@ pub fn spawn_onchain_worker(
                                 qty_base_units,
                                 tx_hash = %resp.transaction_hash,
                                 block_number = %resp.block_number,
-                                "merge_positions submitted"
+                                "merge submitted"
                             );
+                            log_onchain_event(
+                                &log_tx,
+                                ts_ms,
+                                "onchain.merge_submitted",
+                                json!({
+                                    "condition_id": condition_id,
+                                    "qty_base_units": qty_base_units,
+                                    "tx_hash": format!("{}", resp.transaction_hash),
+                                    "block_number": resp.block_number.to_string(),
+                                }),
+                            );
+                            if resp.block_number > 0 {
+                                tracing::info!(
+                                    target: "onchain_worker",
+                                    condition_id = %condition_id,
+                                    qty_base_units,
+                                    tx_hash = %resp.transaction_hash,
+                                    block_number = %resp.block_number,
+                                    "merge confirmed"
+                                );
+                                log_onchain_event(
+                                    &log_tx,
+                                    ts_ms,
+                                    "onchain.merge_confirmed",
+                                    json!({
+                                        "condition_id": condition_id,
+                                        "qty_base_units": qty_base_units,
+                                        "tx_hash": format!("{}", resp.transaction_hash),
+                                        "block_number": resp.block_number.to_string(),
+                                    }),
+                                );
+                            }
                             log_onchain_event(
                                 &log_tx,
                                 ts_ms,
@@ -195,6 +297,19 @@ pub fn spawn_onchain_worker(
                     }
                 }
                 OnchainRequest::Redeem { condition_id } => {
+                    tracing::info!(
+                        target: "onchain_worker",
+                        condition_id = %condition_id,
+                        "redeem requested"
+                    );
+                    log_onchain_event(
+                        &log_tx,
+                        ts_ms,
+                        "onchain.redeem_requested",
+                        json!({
+                            "condition_id": condition_id,
+                        }),
+                    );
                     match condition_resolved(
                         ctf_read,
                         &mut readiness_cache,
@@ -229,8 +344,37 @@ pub fn spawn_onchain_worker(
                                 condition_id = %condition_id,
                                 tx_hash = %resp.transaction_hash,
                                 block_number = %resp.block_number,
-                                "redeem_positions submitted"
+                                "redeem submitted"
                             );
+                            log_onchain_event(
+                                &log_tx,
+                                ts_ms,
+                                "onchain.redeem_submitted",
+                                json!({
+                                    "condition_id": condition_id,
+                                    "tx_hash": format!("{}", resp.transaction_hash),
+                                    "block_number": resp.block_number.to_string(),
+                                }),
+                            );
+                            if resp.block_number > 0 {
+                                tracing::info!(
+                                    target: "onchain_worker",
+                                    condition_id = %condition_id,
+                                    tx_hash = %resp.transaction_hash,
+                                    block_number = %resp.block_number,
+                                    "redeem confirmed"
+                                );
+                                log_onchain_event(
+                                    &log_tx,
+                                    ts_ms,
+                                    "onchain.redeem_confirmed",
+                                    json!({
+                                        "condition_id": condition_id,
+                                        "tx_hash": format!("{}", resp.transaction_hash),
+                                        "block_number": resp.block_number.to_string(),
+                                    }),
+                                );
+                            }
                             log_onchain_event(
                                 &log_tx,
                                 ts_ms,

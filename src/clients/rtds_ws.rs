@@ -16,6 +16,7 @@ const BINANCE_SYMBOL: &str = "btcusdt";
 const CHAINLINK_SYMBOL: &str = "btc/usd";
 const MAX_RAW_LOG_BYTES: usize = 8 * 1024;
 const REDACT_PLACEHOLDER: &str = "[REDACTED]";
+const CHAINLINK_WATCHDOG_POLL_MS: u64 = 250;
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -25,10 +26,11 @@ pub struct RTDSLoop {
     url: String,
     backoff_min: Duration,
     backoff_max: Duration,
+    chainlink_stale_ms: i64,
 }
 
 impl RTDSLoop {
-    pub fn new(url: String) -> Self {
+    pub fn new(url: String, chainlink_stale_ms: i64) -> Self {
         let url = if url.trim().is_empty() {
             DEFAULT_RTDS_URL.to_string()
         } else {
@@ -38,6 +40,7 @@ impl RTDSLoop {
             url,
             backoff_min: Duration::from_millis(500),
             backoff_max: Duration::from_secs(30),
+            chainlink_stale_ms,
         }
     }
 
@@ -91,7 +94,16 @@ impl RTDSLoop {
             .await
             .map_err(|e| BotError::Other(format!("rtds subscribe failed: {e}")))?;
 
-        read_loop(ws, tx_events, log_tx).await
+        tracing::info!(
+            target: "rtds_ws",
+            binance_topic = TOPIC_BINANCE,
+            binance_symbol = BINANCE_SYMBOL,
+            chainlink_topic = TOPIC_CHAINLINK,
+            chainlink_symbol = CHAINLINK_SYMBOL,
+            "subscribed to RTDS topics (binance + chainlink)"
+        );
+
+        read_loop(ws, tx_events, log_tx, self.chainlink_stale_ms).await
     }
 }
 
@@ -99,57 +111,106 @@ async fn read_loop(
     mut ws: WsStream,
     tx_events: &Sender<AppEvent>,
     log_tx: Option<Sender<LogEvent>>,
+    chainlink_stale_ms: i64,
 ) -> BotResult<()> {
-    while let Some(msg) = ws.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                let ts_ms = now_ms();
-                log_raw_frame(&log_tx, "ws.rtds.raw", ts_ms, &text);
-                if let Some(update) = parse_rtds_update(&text) {
-                    log_rtds_update(&log_tx, &update);
-                    if tx_events.send(AppEvent::RTDSUpdate(update)).await.is_err() {
-                        return Ok(());
-                    }
-                }
-            }
-            Ok(Message::Binary(bin)) => match String::from_utf8(bin.to_vec()) {
-                Ok(text) => {
-                    let ts_ms = now_ms();
-                    log_raw_frame(&log_tx, "ws.rtds.raw", ts_ms, &text);
-                    if let Some(update) = parse_rtds_update(&text) {
-                        log_rtds_update(&log_tx, &update);
-                        if tx_events.send(AppEvent::RTDSUpdate(update)).await.is_err() {
-                            return Ok(());
+    let connected_ms = now_ms();
+    let mut last_chainlink_ms: Option<i64> = None;
+    let mut chainlink_stale_logged = false;
+    let mut watchdog = tokio::time::interval(Duration::from_millis(CHAINLINK_WATCHDOG_POLL_MS));
+    watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            msg = ws.next() => {
+                let Some(msg) = msg else { break };
+                match msg {
+                    Ok(Message::Text(text)) => {
+                        let ts_ms = now_ms();
+                        log_raw_frame(&log_tx, "ws.rtds.raw", ts_ms, &text);
+                        if let Some(update) = parse_rtds_update(&text) {
+                            if update.source == RTDSSource::ChainlinkBtcUsd {
+                                last_chainlink_ms = Some(update.ts_ms);
+                                let age_ms = ts_ms.saturating_sub(update.ts_ms);
+                                if chainlink_stale_logged && age_ms <= chainlink_stale_ms {
+                                    tracing::info!(
+                                        target: "rtds_ws",
+                                        age_ms,
+                                        "Chainlink BTC/USD feed recovered"
+                                    );
+                                    chainlink_stale_logged = false;
+                                }
+                            }
+                            log_rtds_update(&log_tx, &update);
+                            if tx_events.send(AppEvent::RTDSUpdate(update)).await.is_err() {
+                                return Ok(());
+                            }
                         }
                     }
+                    Ok(Message::Binary(bin)) => match String::from_utf8(bin.to_vec()) {
+                        Ok(text) => {
+                            let ts_ms = now_ms();
+                            log_raw_frame(&log_tx, "ws.rtds.raw", ts_ms, &text);
+                            if let Some(update) = parse_rtds_update(&text) {
+                                if update.source == RTDSSource::ChainlinkBtcUsd {
+                                    last_chainlink_ms = Some(update.ts_ms);
+                                    let age_ms = ts_ms.saturating_sub(update.ts_ms);
+                                    if chainlink_stale_logged && age_ms <= chainlink_stale_ms {
+                                        tracing::info!(
+                                            target: "rtds_ws",
+                                            age_ms,
+                                            "Chainlink BTC/USD feed recovered"
+                                        );
+                                        chainlink_stale_logged = false;
+                                    }
+                                }
+                                log_rtds_update(&log_tx, &update);
+                                if tx_events.send(AppEvent::RTDSUpdate(update)).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                target: "rtds_ws",
+                                error = %err,
+                                "non-utf8 binary frame"
+                            );
+                        }
+                    },
+                    Ok(Message::Ping(payload)) => {
+                        let _ = ws.send(Message::Pong(payload)).await;
+                    }
+                    Ok(Message::Pong(_)) => {}
+                    Ok(Message::Close(frame)) => {
+                        tracing::warn!(target: "rtds_ws", ?frame, "server closed");
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        return Err(BotError::Other(format!("rtds websocket error: {err}")));
+                    }
+                    _ => {}
                 }
-                Err(err) => {
-                    tracing::debug!(
+            }
+            _ = watchdog.tick() => {
+                let now = now_ms();
+                let anchor_ms = last_chainlink_ms.unwrap_or(connected_ms);
+                let age_ms = now.saturating_sub(anchor_ms);
+                if age_ms > chainlink_stale_ms && !chainlink_stale_logged {
+                    tracing::error!(
                         target: "rtds_ws",
-                        error = %err,
-                        "non-utf8 binary frame"
+                        age_ms,
+                        threshold_ms = chainlink_stale_ms,
+                        "no Chainlink BTC/USD updates within threshold; quoting remains paused"
                     );
+                    chainlink_stale_logged = true;
                 }
-            },
-            Ok(Message::Ping(payload)) => {
-                let _ = ws.send(Message::Pong(payload)).await;
             }
-            Ok(Message::Pong(_)) => {}
-            Ok(Message::Close(frame)) => {
-                tracing::warn!(target: "rtds_ws", ?frame, "server closed");
-                return Ok(());
-            }
-            Err(err) => {
-                return Err(BotError::Other(format!("rtds websocket error: {err}")));
-            }
-            _ => {}
         }
     }
     Ok(())
 }
 
 fn build_subscribe_message() -> String {
-    let chainlink_filter = serde_json::json!({ "symbol": CHAINLINK_SYMBOL }).to_string();
     serde_json::json!({
         "action": "subscribe",
         "subscriptions": [
@@ -161,7 +222,7 @@ fn build_subscribe_message() -> String {
             {
                 "topic": TOPIC_CHAINLINK,
                 "type": "*",
-                "filters": chainlink_filter
+                "filters": { "symbol": CHAINLINK_SYMBOL }
             }
         ]
     })
@@ -439,5 +500,42 @@ mod tests {
         assert_eq!(update.source, RTDSSource::BinanceBtcUsdt);
         assert!((update.price - 67234.5).abs() < 1e-9);
         assert_eq!(update.ts_ms, 1753314088395);
+    }
+
+    #[test]
+    fn subscribe_message_uses_chainlink_filter_object() {
+        let msg = build_subscribe_message();
+        let value: Value = serde_json::from_str(&msg).expect("valid json");
+        let subs = value
+            .get("subscriptions")
+            .and_then(|v| v.as_array())
+            .expect("subscriptions array");
+
+        let mut saw_chainlink = false;
+        let mut saw_binance = false;
+        for sub in subs {
+            let topic = sub.get("topic").and_then(|v| v.as_str()).unwrap_or_default();
+            match topic {
+                TOPIC_CHAINLINK => {
+                    saw_chainlink = true;
+                    let filters = sub.get("filters").expect("chainlink filters");
+                    assert!(filters.is_object(), "chainlink filters must be object");
+                    let symbol = filters
+                        .get("symbol")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    assert_eq!(symbol, CHAINLINK_SYMBOL);
+                }
+                TOPIC_BINANCE => {
+                    saw_binance = true;
+                    let filters = sub.get("filters").and_then(|v| v.as_str());
+                    assert_eq!(filters, Some(BINANCE_SYMBOL));
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_chainlink, "missing chainlink subscription");
+        assert!(saw_binance, "missing binance subscription");
     }
 }

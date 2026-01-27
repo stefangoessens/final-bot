@@ -1,14 +1,17 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::future::BoxFuture;
 use serde_json::json;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{self, MissedTickBehavior};
 
 use crate::clients::clob_rest::ClobRestClient;
 use crate::config::{RewardsConfig, TradingConfig};
+use crate::error::BotResult;
 use crate::persistence::LogEvent;
 use crate::state::market_state::MarketState;
 use crate::state::state_manager::QuoteTick;
@@ -22,12 +25,19 @@ pub struct RewardsSnapshot {
 
 pub struct RewardEngine {
     cfg: RewardsConfig,
-    rest: ClobRestClient,
+    rest: Arc<dyn RewardRestClient>,
     tx_snapshot: watch::Sender<RewardsSnapshot>,
 }
 
 impl RewardEngine {
     pub fn new(cfg: RewardsConfig, rest: ClobRestClient) -> (Self, watch::Receiver<RewardsSnapshot>) {
+        Self::with_client(cfg, Arc::new(rest))
+    }
+
+    fn with_client(
+        cfg: RewardsConfig,
+        rest: Arc<dyn RewardRestClient>,
+    ) -> (Self, watch::Receiver<RewardsSnapshot>) {
         let (tx, rx) = watch::channel(RewardsSnapshot::default());
         (
             Self {
@@ -88,7 +98,7 @@ impl RewardEngine {
 
                     let now_ms = now_ms();
                     let ids: Vec<String> = union_order_ids.iter().cloned().collect();
-                    match self.rest.are_orders_scoring(&ids).await {
+                    match self.rest.are_orders_scoring(ids).await {
                         Ok(scoring) => {
                             let _ = self.tx_snapshot.send(RewardsSnapshot { now_ms, scoring: scoring.clone() });
                             log_scoring(&log_tx, now_ms, &scoring);
@@ -101,6 +111,28 @@ impl RewardEngine {
                 }
             }
         }
+    }
+}
+
+trait RewardRestClient: Send + Sync {
+    fn authenticated(&self) -> bool;
+    fn are_orders_scoring(
+        &self,
+        order_ids: Vec<String>,
+    ) -> BoxFuture<'static, BotResult<HashMap<String, bool>>>;
+}
+
+impl RewardRestClient for ClobRestClient {
+    fn authenticated(&self) -> bool {
+        self.authenticated()
+    }
+
+    fn are_orders_scoring(
+        &self,
+        order_ids: Vec<String>,
+    ) -> BoxFuture<'static, BotResult<HashMap<String, bool>>> {
+        let client = self.clone();
+        Box::pin(async move { client.are_orders_scoring(&order_ids).await })
     }
 }
 
@@ -234,10 +266,10 @@ fn effective_target_total(state: &MarketState, trading_cfg: &TradingConfig) -> f
 fn effective_caps(state: &MarketState, target_total: f64) -> (f64, f64) {
     let mut cap_up = state.alpha.cap_up;
     let mut cap_down = state.alpha.cap_down;
-    if !cap_up.is_finite() || cap_up <= 0.0 {
+    if !cap_up.is_finite() || cap_up < 0.0 {
         cap_up = 0.5 * target_total;
     }
-    if !cap_down.is_finite() || cap_down <= 0.0 {
+    if !cap_down.is_finite() || cap_down < 0.0 {
         cap_down = 0.5 * target_total;
     }
     (cap_up, cap_down)
@@ -316,8 +348,20 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use tokio::sync::mpsc;
+    use tokio::time::Duration;
+
+    use crate::clients::clob_rest::ClobRestClient;
+    use crate::config::{AlphaConfig, AppConfig, OracleConfig, TradingConfig};
+    use crate::execution::order_manager::OrderManager;
+    use crate::ops::OpsState;
     use crate::state::market_state::{MarketIdentity, MarketState};
     use crate::state::order_state::{LiveOrder, OrderStatus};
+    use crate::state::state_manager::{AppEvent, StateManager};
+    use crate::strategy::engine::ExecCommand;
     use crate::strategy::TimeInForce;
 
     fn base_state() -> MarketState {
@@ -446,5 +490,136 @@ mod tests {
 
         assert_eq!(summary.up_improved, false);
         assert_eq!(desired[0].price, 0.48);
+    }
+
+    #[derive(Clone)]
+    struct MockRewardsRest {
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl RewardRestClient for MockRewardsRest {
+        fn authenticated(&self) -> bool {
+            true
+        }
+
+        fn are_orders_scoring(
+            &self,
+            order_ids: Vec<String>,
+        ) -> BoxFuture<'static, BotResult<HashMap<String, bool>>> {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                calls.lock().expect("lock").push(order_ids.clone());
+                let mut scoring = HashMap::new();
+                for id in order_ids {
+                    scoring.insert(id, true);
+                }
+                Ok(scoring)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn reward_engine_checks_scoring_for_live_order_ids() {
+        let mut rewards_cfg = RewardsConfig::default();
+        rewards_cfg.enable_liquidity_rewards_chasing = true;
+        rewards_cfg.scoring_check_interval_s = 1;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mock_rest = Arc::new(MockRewardsRest { calls: calls.clone() });
+        let (reward_engine, _rx) = RewardEngine::with_client(rewards_cfg, mock_rest);
+
+        let (tx_events, rx_events) = mpsc::channel(64);
+        let (tx_quote, rx_quote) = mpsc::channel(64);
+        let (tx_exec, rx_exec) = mpsc::channel(8);
+
+        let ops = OpsState::new(&AppConfig::default());
+        let sm = StateManager::new(
+            AlphaConfig::default(),
+            OracleConfig::default(),
+            TradingConfig::default(),
+            ops.health,
+            ops.metrics,
+        );
+        tokio::spawn(sm.run(rx_events, tx_quote));
+        tokio::spawn(reward_engine.run(rx_quote, None));
+
+        let mut trading_cfg = TradingConfig::default();
+        trading_cfg.dry_run = true;
+        trading_cfg.min_update_interval_ms = 0;
+        let rest = ClobRestClient::new("http://localhost".to_string());
+        let (_tx_user_orders, rx_user_orders) = mpsc::channel(1);
+        let order_manager = OrderManager::new(trading_cfg, rest, rx_user_orders);
+        tokio::spawn(order_manager.run(rx_exec, tx_events.clone(), None));
+
+        let now_s = now_ms() / 1_000;
+        let slug = format!("btc-updown-15m-{now_s}");
+        let identity = MarketIdentity {
+            slug: slug.clone(),
+            interval_start_ts: now_s,
+            interval_end_ts: now_s + 900,
+            condition_id: "cond".to_string(),
+            token_up: "up".to_string(),
+            token_down: "down".to_string(),
+            active: true,
+            closed: false,
+            accepting_orders: true,
+            restricted: false,
+        };
+        tx_events
+            .send(AppEvent::MarketDiscovered(identity))
+            .await
+            .expect("market discovered");
+
+        let desired = vec![
+            DesiredOrder {
+                token_id: "up".to_string(),
+                level: 0,
+                price: 0.48,
+                size: 1.0,
+                post_only: true,
+                tif: TimeInForce::Gtc,
+            },
+            DesiredOrder {
+                token_id: "down".to_string(),
+                level: 0,
+                price: 0.48,
+                size: 1.0,
+                post_only: true,
+                tif: TimeInForce::Gtc,
+            },
+        ];
+        tx_exec
+            .send(ExecCommand { slug: slug.clone(), desired })
+            .await
+            .expect("exec command sent");
+
+        tokio::task::yield_now().await;
+        tx_events
+            .send(AppEvent::TimerTick { now_ms: now_ms() })
+            .await
+            .expect("timer tick");
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        let calls = calls.lock().expect("lock");
+        assert!(
+            !calls.is_empty(),
+            "reward engine did not call scoring endpoint"
+        );
+
+        let mut saw_up = false;
+        let mut saw_down = false;
+        for call in calls.iter() {
+            for id in call {
+                if id.starts_with("dry-up-0-") {
+                    saw_up = true;
+                }
+                if id.starts_with("dry-down-0-") {
+                    saw_down = true;
+                }
+            }
+        }
+        assert!(saw_up && saw_down, "missing expected dry-run order ids");
     }
 }

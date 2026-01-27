@@ -28,6 +28,12 @@ impl AppConfig {
         let default_inventory = InventoryConfig::default();
         let default_completion = CompletionConfig::default();
 
+        if self.alpha.market_ws_stale_ms == default_alpha.market_ws_stale_ms
+            && self.alpha.rtds_stale_ms != default_alpha.rtds_stale_ms
+        {
+            self.alpha.market_ws_stale_ms = self.alpha.rtds_stale_ms;
+        }
+
         if self.oracle.chainlink_stale_ms == default_oracle.chainlink_stale_ms
             && self.oracle.binance_stale_ms == default_oracle.binance_stale_ms
             && self.alpha.rtds_stale_ms != default_alpha.rtds_stale_ms
@@ -72,6 +78,11 @@ impl AppConfig {
         self.merge.validate()?;
         self.completion.validate()?;
         self.heartbeats.validate()?;
+        if !self.trading.dry_run && !self.heartbeats.enabled {
+            return Err(BotError::Config(
+                "heartbeats.enabled must be true when trading.dry_run=false".to_string(),
+            ));
+        }
         self.rewards.validate()?;
         self.infra.validate()?;
         self.keys.validate(self.trading.dry_run)?;
@@ -85,6 +96,7 @@ pub struct EndpointsConfig {
     pub clob_ws_market_url: String,
     pub clob_ws_user_url: String,
     pub gamma_base_url: String,
+    pub data_api_base_url: String,
     pub rtds_ws_url: String,
     pub polygon_rpc_url: String,
 }
@@ -96,6 +108,7 @@ impl Default for EndpointsConfig {
             clob_ws_market_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_string(),
             clob_ws_user_url: "wss://ws-subscriptions-clob.polymarket.com/ws/user".to_string(),
             gamma_base_url: "https://gamma-api.polymarket.com".to_string(),
+            data_api_base_url: "https://data-api.polymarket.com".to_string(),
             rtds_ws_url: "wss://ws-live-data.polymarket.com".to_string(),
             polygon_rpc_url: "https://polygon-rpc.com".to_string(),
         }
@@ -106,6 +119,8 @@ impl Default for EndpointsConfig {
 pub struct TradingConfig {
     /// When true, never posts/cancels orders; used for connectivity/integration tests.
     pub dry_run: bool,
+    /// When true, cancels all open orders on startup before trading.
+    pub startup_cancel_all: bool,
 
     pub target_total_base: f64,
     pub target_total_min: f64,
@@ -134,6 +149,7 @@ impl Default for TradingConfig {
     fn default() -> Self {
         Self {
             dry_run: true,
+            startup_cancel_all: true,
             target_total_base: 0.985,
             target_total_min: 0.97,
             target_total_max: 0.99,
@@ -270,6 +286,9 @@ pub struct AlphaConfig {
     /// Deprecated: use oracle.chainlink_stale_ms / oracle.binance_stale_ms.
     pub rtds_stale_ms: i64,
 
+    /// Market WS token staleness threshold.
+    pub market_ws_stale_ms: i64,
+
     /// Deprecated: use oracle.oracle_disagree_threshold_bps (converted to bps).
     pub rtds_divergence_threshold: f64,
 
@@ -291,6 +310,7 @@ impl Default for AlphaConfig {
             k_fast: 0.15,
             fast_move_threshold_bps: 10.0,
             rtds_stale_ms: 750,
+            market_ws_stale_ms: 750,
             rtds_divergence_threshold: 0.0015,
             divergence_hold_ms: 500,
         }
@@ -303,6 +323,12 @@ impl AlphaConfig {
             return Err(BotError::Config(format!(
                 "alpha.rtds_stale_ms must be >0, got {}",
                 self.rtds_stale_ms
+            )));
+        }
+        if self.market_ws_stale_ms <= 0 {
+            return Err(BotError::Config(format!(
+                "alpha.market_ws_stale_ms must be >0, got {}",
+                self.market_ws_stale_ms
             )));
         }
         Ok(())
@@ -383,6 +409,7 @@ pub struct MergeConfig {
     pub max_ops_per_minute: u64,
     pub pause_during_fast_move: bool,
     pub wallet_mode: MergeWalletMode,
+    pub readiness_poll_interval_s: u64,
 }
 
 impl Default for MergeConfig {
@@ -395,6 +422,7 @@ impl Default for MergeConfig {
             max_ops_per_minute: 6,
             pause_during_fast_move: true,
             wallet_mode: MergeWalletMode::Eoa,
+            readiness_poll_interval_s: 30,
         }
     }
 }
@@ -425,6 +453,17 @@ impl MergeConfig {
         if self.max_ops_per_minute == 0 {
             return Err(BotError::Config(
                 "merge.max_ops_per_minute must be >0".to_string(),
+            ));
+        }
+        if self.readiness_poll_interval_s == 0 {
+            return Err(BotError::Config(
+                "merge.readiness_poll_interval_s must be >0".to_string(),
+            ));
+        }
+        if self.enabled && self.wallet_mode == MergeWalletMode::Relayer {
+            return Err(BotError::Config(
+                "merge.wallet_mode=RELAYER is not implemented; use merge.wallet_mode=EOA or disable merges"
+                    .to_string(),
             ));
         }
         Ok(())
@@ -561,6 +600,7 @@ pub struct InfraConfig {
     pub health_port: u16,
     pub quote_tick_interval_ms: u64,
     pub market_discovery_interval_ms: u64,
+    pub market_discovery_grace_s: i64,
 }
 
 impl Default for InfraConfig {
@@ -572,6 +612,7 @@ impl Default for InfraConfig {
             health_port: 8080,
             quote_tick_interval_ms: 200,
             market_discovery_interval_ms: 1_000,
+            market_discovery_grace_s: 20 * 60,
         }
     }
 }
@@ -587,6 +628,12 @@ impl InfraConfig {
             return Err(BotError::Config(
                 "infra.market_discovery_interval_ms must be >0".to_string(),
             ));
+        }
+        if self.market_discovery_grace_s < 0 {
+            return Err(BotError::Config(format!(
+                "infra.market_discovery_grace_s must be >=0, got {}",
+                self.market_discovery_grace_s
+            )));
         }
         Ok(())
     }
@@ -621,6 +668,7 @@ pub struct KeysConfig {
     pub api_creds_source: ApiCredsSource,
 
     pub funder_address: Option<String>,
+    pub data_api_user: Option<String>,
 
     /// EOA private key (if wallet_mode=Eoa and private_key_source=Env)
     pub private_key: Option<String>,
@@ -733,5 +781,25 @@ mod tests {
         let err = cfg.validate().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("PMMB_KEYS__PRIVATE_KEY"), "{msg}");
+    }
+
+    #[test]
+    fn non_dry_run_requires_heartbeats() {
+        let mut cfg = AppConfig::default();
+        cfg.trading.dry_run = false;
+        cfg.heartbeats.enabled = false;
+        let err = cfg.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("heartbeats.enabled"), "{msg}");
+    }
+
+    #[test]
+    fn relayer_merge_mode_is_rejected_when_enabled() {
+        let mut cfg = AppConfig::default();
+        cfg.merge.enabled = true;
+        cfg.merge.wallet_mode = MergeWalletMode::Relayer;
+        let err = cfg.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("merge.wallet_mode"), "{msg}");
     }
 }

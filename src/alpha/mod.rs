@@ -66,7 +66,8 @@ pub fn update_alpha(
     let var_per_s = volatility::var_per_s(&market_state.alpha);
     let drift_per_s = volatility::drift_per_s(&market_state.alpha);
 
-    let market_ws_last_ms = latest_market_ws_ms(market_state);
+    let (up_stale, down_stale, market_ws_stale) =
+        market_ws_staleness(market_state, now_ms, alpha_cfg.market_ws_stale_ms);
 
     let regime_eval = toxicity::evaluate_regime(
         &mut market_state.alpha,
@@ -75,7 +76,7 @@ pub fn update_alpha(
         oracle_cfg,
         binance,
         chainlink,
-        market_ws_last_ms,
+        market_ws_stale,
         var_per_s,
     );
     let regime = regime_eval.regime;
@@ -95,8 +96,8 @@ pub fn update_alpha(
     let q_up = compute_q_up(market_state, now_ms, drift_per_s, var_per_s);
     let q_down = (1.0 - q_up).clamp(0.0, 1.0);
 
-    let cap_up = q_up * target_total;
-    let cap_down = q_down * target_total;
+    let cap_up = if up_stale { 0.0 } else { q_up * target_total };
+    let cap_down = if down_stale { 0.0 } else { q_down * target_total };
 
     let size_scalar = compute_size_scalar(
         &regime_eval,
@@ -178,15 +179,19 @@ fn spread(book: &TokenBookTop) -> Option<f64> {
     }
 }
 
-fn latest_market_ws_ms(market_state: &MarketState) -> Option<i64> {
-    let up_ms = market_state.up_book.last_update_ms;
-    let down_ms = market_state.down_book.last_update_ms;
-    match (up_ms > 0, down_ms > 0) {
-        (true, true) => Some(up_ms.max(down_ms)),
-        (true, false) => Some(up_ms),
-        (false, true) => Some(down_ms),
-        (false, false) => None,
-    }
+fn market_ws_staleness(
+    market_state: &MarketState,
+    now_ms: i64,
+    stale_ms: i64,
+) -> (bool, bool, bool) {
+    let up_stale = is_market_ws_stale(now_ms, stale_ms, market_state.up_book.last_update_ms);
+    let down_stale = is_market_ws_stale(now_ms, stale_ms, market_state.down_book.last_update_ms);
+    let all_stale = up_stale && down_stale;
+    (up_stale, down_stale, all_stale)
+}
+
+fn is_market_ws_stale(now_ms: i64, stale_ms: i64, last_update_ms: i64) -> bool {
+    last_update_ms > 0 && now_ms.saturating_sub(last_update_ms) > stale_ms
 }
 
 #[cfg(test)]
@@ -262,5 +267,40 @@ mod tests {
 
         let out = update_alpha(&mut market, now_ms, &alpha_cfg, &oracle_cfg, &trading_cfg);
         assert_eq!(out.regime, Regime::StaleBinance);
+    }
+
+    #[test]
+    fn one_token_stale_zeroes_only_that_cap() {
+        let identity = base_identity();
+        let mut market = MarketState::new(identity, 840_000);
+        let now_ms = 10_000;
+        market.up_book.last_update_ms = now_ms - 2_000;
+        market.down_book.last_update_ms = now_ms;
+        market.rtds_sanity = Some(RTDSPrice {
+            price: 100.0,
+            ts_ms: now_ms,
+        });
+        market.rtds_primary = Some(RTDSPrice {
+            price: 100.1,
+            ts_ms: now_ms,
+        });
+
+        let alpha_cfg = AlphaConfig {
+            market_ws_stale_ms: 1_000,
+            ..AlphaConfig::default()
+        };
+        let oracle_cfg = OracleConfig {
+            chainlink_stale_ms: 5_000,
+            binance_stale_ms: 5_000,
+            fast_move_window_ms: 1_000,
+            fast_move_threshold_bps: 10.0,
+            oracle_disagree_threshold_bps: 50.0,
+        };
+        let trading_cfg = TradingConfig::default();
+
+        let out = update_alpha(&mut market, now_ms, &alpha_cfg, &oracle_cfg, &trading_cfg);
+        assert_eq!(out.cap_up, 0.0);
+        assert!(out.cap_down > 0.0);
+        assert!(out.size_scalar > 0.0);
     }
 }

@@ -16,6 +16,12 @@ pub struct EventRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct EventSampleRule {
+    pub prefix: String,
+    pub rate: f64,
+}
+
+#[derive(Debug, Clone)]
 pub struct EventLogConfig {
     pub enabled: bool,
     pub log_dir: PathBuf,
@@ -25,6 +31,9 @@ pub struct EventLogConfig {
     pub flush_threshold_events: usize,
     pub flush_threshold_bytes: usize,
     pub rotation_max_bytes: u64,
+    pub max_total_bytes: u64,
+    pub default_sample_rate: f64,
+    pub sample_rates: Vec<EventSampleRule>,
 }
 
 impl Default for EventLogConfig {
@@ -38,6 +47,9 @@ impl Default for EventLogConfig {
             flush_threshold_events: 1_000,
             flush_threshold_bytes: 512 * 1024,
             rotation_max_bytes: 256 * 1024 * 1024,
+            max_total_bytes: 2 * 1024 * 1024 * 1024,
+            default_sample_rate: 1.0,
+            sample_rates: Vec::new(),
         }
     }
 }
@@ -144,6 +156,7 @@ impl EventLogger {
         };
         if logger.config.enabled {
             logger.maybe_rotate()?;
+            logger.prune_to_budget()?;
         }
         Ok(logger)
     }
@@ -179,10 +192,14 @@ impl EventLogger {
         if !self.config.enabled {
             return Ok(());
         }
+        let event = event.into();
+        if !self.should_sample(&event, ts_ms) {
+            return Ok(());
+        }
         let record = EventRecord {
             seq: self.next_seq(),
             ts_ms,
-            event: event.into(),
+            event,
             payload,
         };
         let line = serde_json::to_string(&record)
@@ -207,6 +224,7 @@ impl EventLogger {
             );
         }
         self.maybe_rotate()?;
+        self.prune_to_budget()?;
         Ok(())
     }
 
@@ -217,6 +235,34 @@ impl EventLogger {
     fn next_seq(&mut self) -> u64 {
         self.seq = self.seq.saturating_add(1);
         self.seq
+    }
+
+    fn should_sample(&self, event: &str, ts_ms: i64) -> bool {
+        let rate = clamp_sample_rate(self.sample_rate_for_event(event));
+        if rate >= 1.0 {
+            return true;
+        }
+        if rate <= 0.0 {
+            return false;
+        }
+        let hash = sample_hash(event, ts_ms);
+        let bucket = (hash as f64) / (u64::MAX as f64);
+        bucket < rate
+    }
+
+    fn sample_rate_for_event(&self, event: &str) -> f64 {
+        let mut best_rate = None;
+        let mut best_len = 0usize;
+        for rule in &self.config.sample_rates {
+            if event.starts_with(&rule.prefix) {
+                let len = rule.prefix.len();
+                if len >= best_len {
+                    best_rate = Some(rule.rate);
+                    best_len = len;
+                }
+            }
+        }
+        best_rate.unwrap_or(self.config.default_sample_rate)
     }
 
     fn push_line(&mut self, line: String) {
@@ -284,6 +330,34 @@ impl EventLogger {
         }
         Ok(())
     }
+
+    fn prune_to_budget(&mut self) -> io::Result<()> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+        let max_total_bytes = self.config.max_total_bytes;
+        if max_total_bytes == 0 {
+            return Ok(());
+        }
+        let (mut total_bytes, mut rotated) = collect_log_sizes(&self.log_path)?;
+        if total_bytes <= max_total_bytes {
+            return Ok(());
+        }
+        rotated.sort_by(|a, b| {
+            a.ts_ms
+                .cmp(&b.ts_ms)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        for entry in rotated {
+            if total_bytes <= max_total_bytes {
+                break;
+            }
+            if fs::remove_file(&entry.path).is_ok() {
+                total_bytes = total_bytes.saturating_sub(entry.size);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for EventLogger {
@@ -318,6 +392,105 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+fn clamp_sample_rate(rate: f64) -> f64 {
+    if !rate.is_finite() {
+        return 0.0;
+    }
+    rate.clamp(0.0, 1.0)
+}
+
+fn sample_hash(event: &str, ts_ms: i64) -> u64 {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut hash = FNV_OFFSET;
+    for byte in event.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    for byte in ts_ms.to_le_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+#[derive(Debug)]
+struct RotatedLogEntry {
+    path: PathBuf,
+    size: u64,
+    ts_ms: i64,
+}
+
+fn collect_log_sizes(log_path: &Path) -> io::Result<(u64, Vec<RotatedLogEntry>)> {
+    let Some(log_dir) = log_path.parent() else {
+        return Ok((0, Vec::new()));
+    };
+    let stem = log_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("events");
+    let ext = log_path.extension().and_then(|value| value.to_str());
+    let base_name = log_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let prefix = format!("{stem}.");
+    let suffix = ext.map(|ext| format!(".{ext}"));
+
+    let mut total_bytes = 0u64;
+    let mut rotated = Vec::new();
+    let entries = match fs::read_dir(log_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((0, Vec::new())),
+        Err(err) => return Err(err),
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let size = metadata.len();
+        if name == base_name {
+            total_bytes = total_bytes.saturating_add(size);
+            continue;
+        }
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        if let Some(suffix) = suffix.as_deref() {
+            if !name.ends_with(suffix) {
+                continue;
+            }
+        }
+        let ts_ms = parse_rotated_ts(&name, stem, ext).unwrap_or(0);
+        total_bytes = total_bytes.saturating_add(size);
+        rotated.push(RotatedLogEntry {
+            path,
+            size,
+            ts_ms,
+        });
+    }
+
+    Ok((total_bytes, rotated))
+}
+
+fn parse_rotated_ts(name: &str, stem: &str, ext: Option<&str>) -> Option<i64> {
+    let prefix = format!("{stem}.");
+    let mut middle = name.strip_prefix(&prefix)?;
+    if let Some(ext) = ext {
+        let suffix = format!(".{ext}");
+        middle = middle.strip_suffix(&suffix)?;
+    }
+    middle.parse::<i64>().ok()
 }
 
 fn default_rotation_hook(config: &EventLogConfig) -> Arc<dyn RotationHook> {
@@ -390,6 +563,11 @@ mod tests {
         matches
     }
 
+    fn write_bytes(path: &Path, size: usize) {
+        let data = vec![b'x'; size];
+        fs::write(path, data).expect("write bytes");
+    }
+
     #[test]
     fn size_rotation_hook_rotates_on_threshold() {
         let dir = temp_dir("event_log_rotate");
@@ -433,6 +611,55 @@ mod tests {
         let rotated = list_rotated(&dir, "events");
         assert!(rotated.is_empty());
         assert!(logger.current_path().exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prune_removes_oldest_rotated_files() {
+        let dir = temp_dir("event_log_prune");
+        let mut cfg = EventLogConfig::default();
+        cfg.log_dir = dir.clone();
+        cfg.file_prefix = "events".to_string();
+        cfg.rotation_max_bytes = 0;
+        cfg.max_total_bytes = 50;
+
+        let current = cfg.log_path();
+        let rotated_old = dir.join("events.100.jsonl");
+        let rotated_new = dir.join("events.200.jsonl");
+
+        write_bytes(&current, 10);
+        write_bytes(&rotated_old, 30);
+        write_bytes(&rotated_new, 30);
+
+        let _logger = EventLogger::new(cfg).expect("create logger");
+
+        assert!(!rotated_old.exists());
+        assert!(rotated_new.exists());
+        assert!(current.exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prune_keeps_current_file() {
+        let dir = temp_dir("event_log_prune_current");
+        let mut cfg = EventLogConfig::default();
+        cfg.log_dir = dir.clone();
+        cfg.file_prefix = "events".to_string();
+        cfg.rotation_max_bytes = 0;
+        cfg.max_total_bytes = 50;
+
+        let current = cfg.log_path();
+        let rotated_old = dir.join("events.100.jsonl");
+
+        write_bytes(&current, 100);
+        write_bytes(&rotated_old, 10);
+
+        let _logger = EventLogger::new(cfg).expect("create logger");
+
+        assert!(current.exists());
+        assert!(!rotated_old.exists());
 
         let _ = fs::remove_dir_all(dir);
     }

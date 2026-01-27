@@ -3,13 +3,13 @@
 use serde_json::json;
 use tokio::sync::{mpsc::{Receiver, Sender}, watch};
 
-use crate::config::{InventoryConfig, RewardsConfig, TradingConfig};
+use crate::config::{CompletionConfig, InventoryConfig, RewardsConfig, TradingConfig};
 use crate::persistence::LogEvent;
 use crate::state::market_state::MarketState;
 use crate::state::state_manager::QuoteTick;
 use crate::strategy::quote_engine::build_desired_orders;
 use crate::strategy::reward_engine::{apply_reward_hints, RewardApplySummary, RewardsSnapshot};
-use crate::strategy::risk::adjust_for_inventory;
+use crate::strategy::risk::{adjust_for_inventory, should_taker_complete};
 use crate::strategy::DesiredOrder;
 
 #[derive(Debug, Clone)]
@@ -19,9 +19,20 @@ pub struct ExecCommand {
 }
 
 #[derive(Debug, Clone)]
+pub struct CompletionCommand {
+    pub slug: String,
+    pub token_id: String,
+    pub shares: f64,
+    pub p_max: f64,
+    pub order_type: crate::config::CompletionOrderType,
+    pub now_ms: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct StrategyEngine {
     trading: TradingConfig,
     inventory: InventoryConfig,
+    completion: CompletionConfig,
     rewards: RewardsConfig,
     rewards_rx: Option<watch::Receiver<RewardsSnapshot>>,
 }
@@ -30,25 +41,34 @@ impl StrategyEngine {
     pub fn new(
         trading: TradingConfig,
         inventory: InventoryConfig,
+        completion: CompletionConfig,
         rewards: RewardsConfig,
         rewards_rx: Option<watch::Receiver<RewardsSnapshot>>,
     ) -> Self {
         Self {
             trading,
             inventory,
+            completion,
             rewards,
             rewards_rx,
         }
     }
 
-    pub async fn run(self, rx_quote: Receiver<QuoteTick>, tx_exec: Sender<ExecCommand>) {
-        self.run_with_logger(rx_quote, tx_exec, None).await
+    pub async fn run(
+        self,
+        rx_quote: Receiver<QuoteTick>,
+        tx_exec: Sender<ExecCommand>,
+        tx_completion: Sender<CompletionCommand>,
+    ) {
+        self.run_with_logger(rx_quote, tx_exec, tx_completion, None)
+            .await
     }
 
     pub async fn run_with_logger(
         self,
         mut rx_quote: Receiver<QuoteTick>,
         tx_exec: Sender<ExecCommand>,
+        tx_completion: Sender<CompletionCommand>,
         log_tx: Option<Sender<LogEvent>>,
     ) {
         while let Some(tick) = rx_quote.recv().await {
@@ -80,6 +100,49 @@ impl StrategyEngine {
 
             let mut desired = build_desired_orders(&state, &self.trading, now_ms);
             adjust_for_inventory(&mut desired, &state, &self.inventory, now_ms);
+
+            if let Some(taker_action) =
+                should_taker_complete(&state, &self.inventory, &self.completion, now_ms)
+            {
+                tracing::info!(
+                    target: "strategy_engine",
+                    slug = %slug,
+                    token_id = %taker_action.token_id,
+                    p_max = taker_action.p_max,
+                    shares = taker_action.shares,
+                    order_type = ?taker_action.order_type,
+                    "taker completion triggered"
+                );
+
+                if tx_exec
+                    .send(ExecCommand {
+                        slug: slug.clone(),
+                        desired: Vec::new(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+
+                if tx_completion
+                    .send(CompletionCommand {
+                        slug: slug.clone(),
+                        token_id: taker_action.token_id.clone(),
+                        shares: taker_action.shares,
+                        p_max: taker_action.p_max,
+                        order_type: taker_action.order_type,
+                        now_ms,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+
+                log_completion_command(&log_tx, &slug, now_ms, &taker_action);
+                continue;
+            }
 
             let reward_snapshot = self
                 .rewards_rx
@@ -202,6 +265,29 @@ fn log_reward_summary(
     });
 }
 
+fn log_completion_command(
+    log_tx: &Option<Sender<LogEvent>>,
+    slug: &str,
+    ts_ms: i64,
+    taker_action: &crate::strategy::risk::TakerAction,
+) {
+    let Some(tx) = log_tx else {
+        return;
+    };
+    let payload = json!({
+        "slug": slug,
+        "token_id": taker_action.token_id,
+        "shares": taker_action.shares,
+        "p_max": taker_action.p_max,
+        "order_type": format!("{:?}", taker_action.order_type),
+    });
+    let _ = tx.try_send(LogEvent {
+        ts_ms,
+        event: "strategy.completion".to_string(),
+        payload,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,14 +301,16 @@ mod tests {
     async fn emits_exec_command_on_quote_tick() {
         let (tx_quote, rx_quote) = mpsc::channel(1);
         let (tx_exec, mut rx_exec) = mpsc::channel(1);
+        let (tx_completion, _rx_completion) = mpsc::channel(1);
 
         let engine = StrategyEngine::new(
             TradingConfig::default(),
             InventoryConfig::default(),
+            CompletionConfig::default(),
             RewardsConfig::default(),
             None,
         );
-        let handle = tokio::spawn(engine.run(rx_quote, tx_exec));
+        let handle = tokio::spawn(engine.run(rx_quote, tx_exec, tx_completion));
 
         let identity = MarketIdentity {
             slug: "btc-15m-test".to_string(),
@@ -253,6 +341,105 @@ mod tests {
             .expect("exec command timeout");
         assert!(msg.is_some());
 
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn emits_completion_only_within_window_and_below_pmax() {
+        let (tx_quote, rx_quote) = mpsc::channel(1);
+        // Buffer exec commands so the strategy task never blocks in this test.
+        let (tx_exec, _rx_exec) = mpsc::channel(16);
+        let (tx_completion, mut rx_completion) = mpsc::channel(1);
+
+        let mut completion_cfg = CompletionConfig::default();
+        completion_cfg.enabled = true;
+
+        let engine = StrategyEngine::new(
+            TradingConfig::default(),
+            InventoryConfig::default(),
+            completion_cfg,
+            RewardsConfig::default(),
+            None,
+        );
+        let handle = tokio::spawn(engine.run(rx_quote, tx_exec, tx_completion));
+
+        let identity = MarketIdentity {
+            slug: "btc-15m-test".to_string(),
+            interval_start_ts: 1_700_000_000,
+            interval_end_ts: 1_700_000_900,
+            condition_id: "cond".to_string(),
+            token_up: "token_up".to_string(),
+            token_down: "token_down".to_string(),
+            active: true,
+            closed: false,
+            accepting_orders: true,
+            restricted: false,
+        };
+
+        let now_ms = 1_700_000_100_000;
+
+        let mut state_inside = MarketState::new(identity.clone(), now_ms + 30_000);
+        state_inside.inventory.up.shares = 1.0;
+        state_inside.inventory.up.notional_usdc = 0.2;
+        state_inside.inventory.down.shares = 0.0;
+        state_inside.down_book.best_ask = Some(0.1);
+
+        tx_quote
+            .send(QuoteTick {
+                slug: identity.slug.clone(),
+                now_ms,
+                state: state_inside,
+            })
+            .await
+            .expect("send quote tick");
+
+        let msg = timeout(Duration::from_millis(200), rx_completion.recv())
+            .await
+            .expect("completion command timeout");
+        let cmd = msg.expect("expected completion command");
+        assert_eq!(cmd.token_id, identity.token_down);
+        assert!(cmd.p_max >= 0.1);
+
+        let mut state_outside = MarketState::new(identity.clone(), now_ms + 60_000);
+        state_outside.inventory.up.shares = 1.0;
+        state_outside.inventory.up.notional_usdc = 0.2;
+        state_outside.inventory.down.shares = 0.0;
+        state_outside.down_book.best_ask = Some(0.1);
+
+        tx_quote
+            .send(QuoteTick {
+                slug: identity.slug.clone(),
+                now_ms,
+                state: state_outside,
+            })
+            .await
+            .expect("send quote tick outside window");
+
+        let suppressed = timeout(Duration::from_millis(100), rx_completion.recv()).await;
+        assert!(suppressed.is_err(), "expected no completion outside window");
+
+        let mut state_above = MarketState::new(identity, now_ms + 30_000);
+        state_above.inventory.up.shares = 1.0;
+        state_above.inventory.up.notional_usdc = 0.9;
+        state_above.inventory.down.shares = 0.0;
+        state_above.down_book.best_ask = Some(0.9);
+
+        tx_quote
+            .send(QuoteTick {
+                slug: "btc-15m-test".to_string(),
+                now_ms,
+                state: state_above,
+            })
+            .await
+            .expect("send quote tick above pmax");
+
+        let suppressed = timeout(Duration::from_millis(100), rx_completion.recv()).await;
+        assert!(
+            suppressed.is_err(),
+            "expected no completion when ask above p_max"
+        );
+
+        drop(tx_quote);
         let _ = handle.await;
     }
 }
