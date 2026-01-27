@@ -1,24 +1,94 @@
 use std::collections::HashMap;
 
+use futures_util::future::BoxFuture;
+use polymarket_client_sdk::clob::types::response::OpenOrderResponse;
 use serde_json::json;
 use tokio::sync::mpsc::Receiver;
 
-use crate::clients::clob_rest::{ClobRestClient, PostOrdersResult};
+use crate::clients::clob_rest::{
+    CancelResult, ClobRestClient, OrderId, OrderRequest, PostOrdersResult,
+};
 use crate::config::CompletionConfig;
+use crate::error::BotResult;
 use crate::persistence::LogEvent;
 use crate::strategy::engine::CompletionCommand;
 
 const COMPLETION_RATE_LIMIT_MS: i64 = 1_000;
 
-#[derive(Debug)]
+trait CompletionRestClient: Send + Sync {
+    fn get_active_orders_for_market(
+        &self,
+        condition_id: String,
+    ) -> BoxFuture<'static, BotResult<Vec<OpenOrderResponse>>>;
+    fn cancel_orders(&self, order_ids: Vec<OrderId>) -> BoxFuture<'static, BotResult<CancelResult>>;
+    fn build_completion_order(
+        &self,
+        token_id: String,
+        shares: f64,
+        p_max: f64,
+        order_type: crate::config::CompletionOrderType,
+        now_ms: i64,
+    ) -> BoxFuture<'static, BotResult<OrderRequest>>;
+    fn post_orders_result(
+        &self,
+        orders: Vec<OrderRequest>,
+    ) -> BoxFuture<'static, BotResult<PostOrdersResult>>;
+}
+
+impl CompletionRestClient for ClobRestClient {
+    fn get_active_orders_for_market(
+        &self,
+        condition_id: String,
+    ) -> BoxFuture<'static, BotResult<Vec<OpenOrderResponse>>> {
+        let client = self.clone();
+        Box::pin(async move { client.get_active_orders_for_market(&condition_id).await })
+    }
+
+    fn cancel_orders(&self, order_ids: Vec<OrderId>) -> BoxFuture<'static, BotResult<CancelResult>> {
+        let client = self.clone();
+        Box::pin(async move { client.cancel_orders(order_ids).await })
+    }
+
+    fn build_completion_order(
+        &self,
+        token_id: String,
+        shares: f64,
+        p_max: f64,
+        order_type: crate::config::CompletionOrderType,
+        now_ms: i64,
+    ) -> BoxFuture<'static, BotResult<OrderRequest>> {
+        let client = self.clone();
+        Box::pin(async move {
+            client
+                .build_completion_order(&token_id, shares, p_max, order_type, now_ms)
+                .await
+        })
+    }
+
+    fn post_orders_result(
+        &self,
+        orders: Vec<OrderRequest>,
+    ) -> BoxFuture<'static, BotResult<PostOrdersResult>> {
+        let client = self.clone();
+        Box::pin(async move { client.post_orders_result(orders).await })
+    }
+}
+
 pub struct CompletionExecutor {
     completion_cfg: CompletionConfig,
-    rest: ClobRestClient,
+    rest: std::sync::Arc<dyn CompletionRestClient>,
     rate_limiter: CompletionRateLimiter,
 }
 
 impl CompletionExecutor {
     pub fn new(completion_cfg: CompletionConfig, rest: ClobRestClient) -> Self {
+        Self::with_client(completion_cfg, std::sync::Arc::new(rest))
+    }
+
+    fn with_client(
+        completion_cfg: CompletionConfig,
+        rest: std::sync::Arc<dyn CompletionRestClient>,
+    ) -> Self {
         Self {
             completion_cfg,
             rest,
@@ -69,10 +139,21 @@ impl CompletionExecutor {
                 continue;
             }
 
+            if let Err(err) = self.cancel_sweep(&cmd).await {
+                tracing::warn!(
+                    target: "completion_executor",
+                    slug = %cmd.slug,
+                    condition_id = %cmd.condition_id,
+                    token_id = %cmd.token_id,
+                    error = %err,
+                    "pre-completion cancel sweep failed"
+                );
+            }
+
             let order = match self
                 .rest
                 .build_completion_order(
-                    &cmd.token_id,
+                    cmd.token_id.clone(),
                     cmd.shares,
                     cmd.p_max,
                     cmd.order_type,
@@ -144,6 +225,40 @@ impl CompletionExecutor {
             }
         }
     }
+
+    async fn cancel_sweep(&self, cmd: &CompletionCommand) -> BotResult<()> {
+        let active = self
+            .rest
+            .get_active_orders_for_market(cmd.condition_id.clone())
+            .await?;
+        let order_ids: Vec<OrderId> = active.into_iter().map(|order| order.id).collect();
+        if order_ids.is_empty() {
+            return Ok(());
+        }
+
+        let res = self.rest.cancel_orders(order_ids).await?;
+        if !res.failed.is_empty() {
+            tracing::warn!(
+                target: "completion_executor",
+                slug = %cmd.slug,
+                condition_id = %cmd.condition_id,
+                token_id = %cmd.token_id,
+                failed = res.failed.len(),
+                "cancel sweep had failures before completion"
+            );
+        } else {
+            tracing::info!(
+                target: "completion_executor",
+                slug = %cmd.slug,
+                condition_id = %cmd.condition_id,
+                token_id = %cmd.token_id,
+                canceled = res.canceled.len(),
+                "cancel sweep completed before completion"
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -209,6 +324,15 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use polymarket_client_sdk::auth::ApiKey;
+    use polymarket_client_sdk::clob::types::{Order, OrderType as SdkOrderType, SignedOrder};
+    use polymarket_client_sdk::types::{Signature, U256};
+    use tokio::sync::mpsc;
+    use tokio::time::{timeout, Duration};
+
+    use crate::config::CompletionOrderType;
 
     #[test]
     fn rate_limit_suppresses_within_window_per_slug() {
@@ -225,5 +349,266 @@ mod tests {
             "slug-a",
             base + COMPLETION_RATE_LIMIT_MS as i64
         ));
+    }
+
+    #[derive(Clone)]
+    struct MockRest {
+        active: Arc<Mutex<Result<Vec<OpenOrderResponse>, String>>>,
+        cancel_result: Arc<Mutex<Result<CancelResult, String>>>,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        seen_condition_id: Arc<Mutex<Option<String>>>,
+        seen_cancel_ids: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MockRest {
+        fn with_active(active: Result<Vec<OpenOrderResponse>, String>) -> Self {
+            Self {
+                active: Arc::new(Mutex::new(active)),
+                cancel_result: Arc::new(Mutex::new(Ok(CancelResult::default()))),
+                calls: Arc::new(Mutex::new(Vec::new())),
+                seen_condition_id: Arc::new(Mutex::new(None)),
+                seen_cancel_ids: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn set_cancel_result(&self, res: Result<CancelResult, String>) {
+            *self.cancel_result.lock().expect("lock cancel_result") = res;
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().expect("lock calls").clone()
+        }
+    }
+
+    impl CompletionRestClient for MockRest {
+        fn get_active_orders_for_market(
+            &self,
+            condition_id: String,
+        ) -> BoxFuture<'static, BotResult<Vec<OpenOrderResponse>>> {
+            let active = self.active.clone();
+            let calls = self.calls.clone();
+            let seen_condition_id = self.seen_condition_id.clone();
+            Box::pin(async move {
+                calls
+                    .lock()
+                    .expect("lock calls")
+                    .push("get_active_orders_for_market");
+                *seen_condition_id.lock().expect("lock seen_condition_id") = Some(condition_id);
+                match active.lock().expect("lock active").clone() {
+                    Ok(active) => Ok(active),
+                    Err(err) => Err(crate::error::BotError::Other(err)),
+                }
+            })
+        }
+
+        fn cancel_orders(
+            &self,
+            order_ids: Vec<OrderId>,
+        ) -> BoxFuture<'static, BotResult<CancelResult>> {
+            let calls = self.calls.clone();
+            let seen_cancel_ids = self.seen_cancel_ids.clone();
+            let cancel_result = self.cancel_result.clone();
+            Box::pin(async move {
+                calls.lock().expect("lock calls").push("cancel_orders");
+                *seen_cancel_ids.lock().expect("lock seen_cancel_ids") = order_ids;
+                match cancel_result.lock().expect("lock cancel_result").clone() {
+                    Ok(res) => Ok(res),
+                    Err(err) => Err(crate::error::BotError::Other(err)),
+                }
+            })
+        }
+
+        fn build_completion_order(
+            &self,
+            _token_id: String,
+            _shares: f64,
+            _p_max: f64,
+            _order_type: CompletionOrderType,
+            _now_ms: i64,
+        ) -> BoxFuture<'static, BotResult<OrderRequest>> {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                calls
+                    .lock()
+                    .expect("lock calls")
+                    .push("build_completion_order");
+                Ok(SignedOrder::builder()
+                    .order(Order::default())
+                    .signature(Signature::new(U256::ZERO, U256::ZERO, false))
+                    .order_type(SdkOrderType::FOK)
+                    .owner(ApiKey::nil())
+                    .post_only(false)
+                    .build())
+            })
+        }
+
+        fn post_orders_result(
+            &self,
+            _orders: Vec<OrderRequest>,
+        ) -> BoxFuture<'static, BotResult<PostOrdersResult>> {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                calls
+                    .lock()
+                    .expect("lock calls")
+                    .push("post_orders_result");
+                Ok(PostOrdersResult::default())
+            })
+        }
+    }
+
+    fn open_order(id: &str) -> OpenOrderResponse {
+        serde_json::from_value(json!({
+            "id": id,
+            "status": "LIVE",
+            "owner": "00000000-0000-0000-0000-000000000000",
+            "maker_address": "0x0000000000000000000000000000000000000000",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "asset_id": "1",
+            "side": "BUY",
+            "original_size": "1",
+            "size_matched": "0",
+            "price": "0.5",
+            "associate_trades": [],
+            "outcome": "Yes",
+            "created_at": 0,
+            "expiration": "0",
+            "order_type": "GTC",
+        }))
+        .expect("deserialize OpenOrderResponse")
+    }
+
+    #[tokio::test]
+    async fn completion_cancels_active_orders_before_posting() {
+        let rest = Arc::new(MockRest::with_active(Ok(vec![
+            open_order("o1"),
+            open_order("o2"),
+        ])));
+
+        let completion_cfg = CompletionConfig::default();
+        let executor = CompletionExecutor::with_client(completion_cfg, rest.clone());
+
+        let (tx, rx) = mpsc::channel(1);
+        let handle = tokio::spawn(executor.run(rx, None, false));
+
+        tx.send(CompletionCommand {
+            slug: "btc-15m-test".to_string(),
+            condition_id: "cond".to_string(),
+            token_id: "token".to_string(),
+            shares: 1.0,
+            p_max: 0.5,
+            order_type: CompletionOrderType::Fok,
+            now_ms: 1,
+        })
+        .await
+        .expect("send completion command");
+        drop(tx);
+
+        timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("executor join timeout")
+            .expect("executor task failed");
+
+        assert_eq!(
+            rest.calls(),
+            vec![
+                "get_active_orders_for_market",
+                "cancel_orders",
+                "build_completion_order",
+                "post_orders_result"
+            ]
+        );
+        assert_eq!(
+            rest.seen_condition_id
+                .lock()
+                .expect("lock seen_condition_id")
+                .as_deref(),
+            Some("cond")
+        );
+        assert_eq!(
+            &*rest
+                .seen_cancel_ids
+                .lock()
+                .expect("lock seen_cancel_ids"),
+            &vec!["o1".to_string(), "o2".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_proceeds_when_cancel_sweep_fails() {
+        let rest = Arc::new(MockRest::with_active(Ok(vec![open_order("o1")])));
+        rest.set_cancel_result(Err("cancel failed".to_string()));
+
+        let completion_cfg = CompletionConfig::default();
+        let executor = CompletionExecutor::with_client(completion_cfg, rest.clone());
+
+        let (tx, rx) = mpsc::channel(1);
+        let handle = tokio::spawn(executor.run(rx, None, false));
+
+        tx.send(CompletionCommand {
+            slug: "btc-15m-test".to_string(),
+            condition_id: "cond".to_string(),
+            token_id: "token".to_string(),
+            shares: 1.0,
+            p_max: 0.5,
+            order_type: CompletionOrderType::Fok,
+            now_ms: 1,
+        })
+        .await
+        .expect("send completion command");
+        drop(tx);
+
+        timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("executor join timeout")
+            .expect("executor task failed");
+
+        assert_eq!(
+            rest.calls(),
+            vec![
+                "get_active_orders_for_market",
+                "cancel_orders",
+                "build_completion_order",
+                "post_orders_result"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_skips_cancel_when_no_active_orders() {
+        let rest = Arc::new(MockRest::with_active(Ok(Vec::new())));
+
+        let completion_cfg = CompletionConfig::default();
+        let executor = CompletionExecutor::with_client(completion_cfg, rest.clone());
+
+        let (tx, rx) = mpsc::channel(1);
+        let handle = tokio::spawn(executor.run(rx, None, false));
+
+        tx.send(CompletionCommand {
+            slug: "btc-15m-test".to_string(),
+            condition_id: "cond".to_string(),
+            token_id: "token".to_string(),
+            shares: 1.0,
+            p_max: 0.5,
+            order_type: CompletionOrderType::Fok,
+            now_ms: 1,
+        })
+        .await
+        .expect("send completion command");
+        drop(tx);
+
+        timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("executor join timeout")
+            .expect("executor task failed");
+
+        assert_eq!(
+            rest.calls(),
+            vec![
+                "get_active_orders_for_market",
+                "build_completion_order",
+                "post_orders_result"
+            ]
+        );
     }
 }

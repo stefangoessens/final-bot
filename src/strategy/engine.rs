@@ -21,6 +21,7 @@ pub struct ExecCommand {
 #[derive(Debug, Clone)]
 pub struct CompletionCommand {
     pub slug: String,
+    pub condition_id: String,
     pub token_id: String,
     pub shares: f64,
     pub p_max: f64,
@@ -128,6 +129,7 @@ impl StrategyEngine {
                 if tx_completion
                     .send(CompletionCommand {
                         slug: slug.clone(),
+                        condition_id: state.identity.condition_id.clone(),
                         token_id: taker_action.token_id.clone(),
                         shares: taker_action.shares,
                         p_max: taker_action.p_max,
@@ -397,6 +399,7 @@ mod tests {
             .await
             .expect("completion command timeout");
         let cmd = msg.expect("expected completion command");
+        assert_eq!(cmd.condition_id, identity.condition_id);
         assert_eq!(cmd.token_id, identity.token_down);
         assert!(cmd.p_max >= 0.1);
 
