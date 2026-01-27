@@ -338,6 +338,27 @@ pub fn resolve_data_api_user(cfg: &AppConfig) -> Option<String> {
             return Some(funder.trim().to_string());
         }
     }
+    if cfg.keys.wallet_mode == crate::config::WalletMode::ProxySafe {
+        if let Some(private_key) = cfg.keys.private_key.as_deref() {
+            if !private_key.trim().is_empty() {
+                let pk = private_key
+                    .trim()
+                    .strip_prefix("0x")
+                    .unwrap_or(private_key.trim());
+                if let Ok(signer) = pk.parse::<alloy_signer_local::PrivateKeySigner>() {
+                    if let Some(proxy) =
+                        polymarket_client_sdk::derive_proxy_wallet(
+                            signer.address(),
+                            polymarket_client_sdk::POLYGON,
+                        )
+                    {
+                        return Some(proxy.to_string());
+                    }
+                    return Some(signer.address().to_string());
+                }
+            }
+        }
+    }
     if let Some(private_key) = cfg.keys.private_key.as_deref() {
         if !private_key.trim().is_empty() {
             let pk = private_key.trim().strip_prefix("0x").unwrap_or(private_key.trim());

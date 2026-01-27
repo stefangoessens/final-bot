@@ -56,6 +56,7 @@ pub struct UserOrderUpdate {
 }
 
 impl UserWsLoop {
+    #[allow(dead_code)]
     pub fn from_config(
         cfg: &AppConfig,
         markets: Vec<String>,

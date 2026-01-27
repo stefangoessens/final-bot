@@ -69,6 +69,103 @@ impl AppConfig {
         }
     }
 
+    /// Backwards-compatible env var aliases for migrating from older bots.
+    ///
+    /// These are only used to fill missing values; explicit `PMMB_...` config always wins.
+    fn apply_legacy_env_overrides(&mut self) {
+        fn env_trimmed(key: &str) -> Option<String> {
+            let value = std::env::var(key).ok()?;
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+
+        fn env_bool(key: &str) -> Option<bool> {
+            let value = env_trimmed(key)?;
+            match value.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "y" | "on" => Some(true),
+                "0" | "false" | "no" | "n" | "off" => Some(false),
+                _ => None,
+            }
+        }
+
+        let legacy_private_key = env_trimmed("BOT_PRIVATE_KEY");
+        if self
+            .keys
+            .private_key
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            if let Some(pk) = legacy_private_key {
+                self.keys.private_key = Some(pk);
+            }
+        }
+
+        let legacy_funder = env_trimmed("CLOB_ADDRESS");
+        if self
+            .keys
+            .funder_address
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            if let Some(addr) = legacy_funder.clone() {
+                self.keys.funder_address = Some(addr);
+            }
+        }
+
+        if std::env::var("PMMB_KEYS__WALLET_MODE").is_err()
+            && self.keys.wallet_mode == WalletMode::Eoa
+            && legacy_funder.is_some()
+        {
+            self.keys.wallet_mode = WalletMode::ProxySafe;
+        }
+
+        if self
+            .keys
+            .clob_api_key
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            self.keys.clob_api_key = env_trimmed("CLOB_API_KEY");
+        }
+        if self
+            .keys
+            .clob_api_secret
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            self.keys.clob_api_secret = env_trimmed("CLOB_API_SECRET");
+        }
+        if self
+            .keys
+            .clob_api_passphrase
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            self.keys.clob_api_passphrase = env_trimmed("CLOB_API_PASSPHRASE");
+        }
+
+        if std::env::var("PMMB_KEYS__API_CREDS_SOURCE").is_err()
+            && self.keys.api_creds_source == ApiCredsSource::Explicit
+            && env_bool("CLOB_AUTO_DERIVE_ENABLED") == Some(true)
+        {
+            self.keys.api_creds_source = ApiCredsSource::Derive;
+        }
+    }
+
     pub fn validate(&self) -> BotResult<()> {
         self.trading.validate()?;
         self.inventory.validate()?;
@@ -678,24 +775,34 @@ impl InfraConfig {
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum WalletMode {
     #[default]
+    #[serde(alias = "Eoa", alias = "eoa")]
     Eoa,
+    #[serde(alias = "ProxySafe", alias = "proxy_safe")]
     ProxySafe,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PrivateKeySource {
     #[default]
+    #[serde(alias = "Env", alias = "env")]
     Env,
+    #[serde(alias = "SecretsManager", alias = "secrets_manager")]
     SecretsManager,
+    #[serde(alias = "Kms", alias = "kms")]
     Kms,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ApiCredsSource {
+    #[serde(alias = "derive")]
     Derive,
     #[default]
+    #[serde(alias = "explicit")]
     Explicit,
 }
 
@@ -740,6 +847,7 @@ impl KeysConfig {
         }
 
         match self.api_creds_source {
+            ApiCredsSource::Derive => {}
             ApiCredsSource::Explicit => {
                 if self.clob_api_key.as_deref().unwrap_or_default().is_empty() {
                     return Err(BotError::Config(
@@ -767,12 +875,14 @@ impl KeysConfig {
                     ));
                 }
             }
-            ApiCredsSource::Derive => {
-                return Err(BotError::Config(format!(
-                    "keys.api_creds_source={:?} is not implemented",
-                    self.api_creds_source
-                )));
-            }
+        }
+
+        let funder = self.funder_address.as_deref().unwrap_or_default().trim();
+        if self.wallet_mode == WalletMode::Eoa && !funder.is_empty() {
+            return Err(BotError::Config(
+                "keys.funder_address must be empty when keys.wallet_mode=EOA; use PMMB_KEYS__WALLET_MODE=PROXY_SAFE"
+                    .to_string(),
+            ));
         }
 
         Ok(())
@@ -811,6 +921,7 @@ fn load_config_from(figment: Figment) -> BotResult<AppConfig> {
         .extract()
         .map_err(|e| BotError::Config(e.to_string()))?;
     cfg.apply_deprecated_overrides();
+    cfg.apply_legacy_env_overrides();
     cfg.validate()?;
     Ok(cfg)
 }
@@ -872,15 +983,12 @@ mod tests {
     }
 
     #[test]
-    fn derive_api_creds_source_is_rejected_when_not_dry_run() {
+    fn derive_api_creds_source_is_allowed_when_not_dry_run() {
         let mut cfg = AppConfig::default();
         cfg.trading.dry_run = false;
         cfg.keys.private_key = Some("not-empty".to_string());
         cfg.keys.api_creds_source = ApiCredsSource::Derive;
 
-        let err = cfg.validate().unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("keys.api_creds_source"), "{msg}");
-        assert!(msg.contains("not implemented"), "{msg}");
+        cfg.validate().unwrap();
     }
 }

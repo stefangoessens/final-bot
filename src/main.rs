@@ -346,8 +346,19 @@ async fn main() -> BotResult<()> {
     }
 
     if !cfg.trading.dry_run {
-        let user_ws =
-            clients::clob_ws_user::UserWsLoop::from_config(&cfg, Vec::new(), Some(tx_user_orders))?;
+        let creds = rest.api_creds().ok_or_else(|| {
+            crate::error::BotError::Other(
+                "user ws requires authenticated rest client api creds".to_string(),
+            )
+        })?;
+        let user_ws = clients::clob_ws_user::UserWsLoop::new(
+            cfg.endpoints.clob_ws_user_url.clone(),
+            creds.api_key,
+            creds.api_secret,
+            creds.api_passphrase,
+            Vec::new(),
+            Some(tx_user_orders),
+        );
         let tx_log_user = tx_log.clone();
         tokio::spawn({
             let tx_events = tx_events.clone();

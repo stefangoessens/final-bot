@@ -81,3 +81,6 @@ Task status:
 - [ ] W10.3 Alpha knob: optional blend with market-implied q
 - [x] W10.4 Execution: enforce max_orders_per_min (post limiter)
 - [x] W10.5 Completion: pre-completion cancel sweep (REST active-orders cancel)
+
+## Ops (ad hoc)
+- [x] O1 AWS env template: derive API creds + proxy-safe wallet

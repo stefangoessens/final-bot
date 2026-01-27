@@ -8,7 +8,7 @@ use std::{collections::HashMap, future::Future};
 use alloy_signer_local::PrivateKeySigner;
 use futures_util::future::BoxFuture;
 use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::auth::{Credentials, Normal, Signer, Uuid};
+use polymarket_client_sdk::auth::{Credentials, ExposeSecret as _, Normal, Signer, Uuid};
 use polymarket_client_sdk::clob::types::request::OrdersRequest;
 use polymarket_client_sdk::clob::types::response::{
     FeeRateResponse, OpenOrderResponse, Page, PostOrderResponse,
@@ -18,9 +18,9 @@ use polymarket_client_sdk::clob::types::{
 };
 use polymarket_client_sdk::clob::{Client as SdkClient, Config as SdkConfig};
 use polymarket_client_sdk::types::{Address, Decimal, B256, U256};
-use polymarket_client_sdk::POLYGON;
+use polymarket_client_sdk::{derive_proxy_wallet, POLYGON};
 
-use crate::config::{AppConfig, CompletionOrderType, HeartbeatsConfig, WalletMode};
+use crate::config::{ApiCredsSource, AppConfig, CompletionOrderType, HeartbeatsConfig, WalletMode};
 use crate::error::{BotError, BotResult};
 use crate::strategy::DesiredOrder;
 
@@ -63,9 +63,17 @@ pub struct ClobRestClient {
     inner: Option<Arc<SdkHandle>>,
 }
 
+#[derive(Clone)]
+pub struct ClobApiCreds {
+    pub api_key: String,
+    pub api_secret: String,
+    pub api_passphrase: String,
+}
+
 struct SdkHandle {
     client: SdkAuthedClient,
     signer: PrivateKeySigner,
+    api_creds: ClobApiCreds,
     fee_rate_cache: FeeRateCache,
     fee_rate_http: reqwest::Client,
 }
@@ -158,29 +166,6 @@ impl ClobRestClient {
             .map_err(|e| BotError::Other(format!("invalid private key: {e}")))?
             .with_chain_id(Some(POLYGON));
 
-        let api_key = cfg.keys.clob_api_key.as_deref().unwrap_or_default().trim();
-        let api_secret = cfg
-            .keys
-            .clob_api_secret
-            .as_deref()
-            .unwrap_or_default()
-            .to_string();
-        let api_passphrase = cfg
-            .keys
-            .clob_api_passphrase
-            .as_deref()
-            .unwrap_or_default()
-            .to_string();
-        if api_key.is_empty() {
-            return Err(BotError::Config(
-                "missing required key: PMMB_KEYS__CLOB_API_KEY".to_string(),
-            ));
-        }
-
-        let api_key_uuid = Uuid::from_str(api_key)
-            .map_err(|e| BotError::Config(format!("invalid CLOB API key uuid: {e}")))?;
-        let creds = Credentials::new(api_key_uuid, api_secret, api_passphrase);
-
         let mut config = SdkConfig::default();
         if cfg.heartbeats.enabled {
             config = SdkConfig::builder()
@@ -192,17 +177,106 @@ impl ClobRestClient {
             .map_err(|e| BotError::Other(format!("sdk client init failed: {e}")))?;
 
         let signature_type = map_wallet_mode(cfg.keys.wallet_mode);
+        let creds = match cfg.keys.api_creds_source {
+            ApiCredsSource::Explicit => {
+                let api_key = cfg.keys.clob_api_key.as_deref().unwrap_or_default().trim();
+                let api_secret = cfg.keys.clob_api_secret.as_deref().unwrap_or_default().trim();
+                let api_passphrase = cfg
+                    .keys
+                    .clob_api_passphrase
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim();
+
+                if api_key.is_empty() {
+                    return Err(BotError::Config(
+                        "missing required key: PMMB_KEYS__CLOB_API_KEY".to_string(),
+                    ));
+                }
+                if api_secret.is_empty() {
+                    return Err(BotError::Config(
+                        "missing required key: PMMB_KEYS__CLOB_API_SECRET".to_string(),
+                    ));
+                }
+                if api_passphrase.is_empty() {
+                    return Err(BotError::Config(
+                        "missing required key: PMMB_KEYS__CLOB_API_PASSPHRASE".to_string(),
+                    ));
+                }
+
+                let api_key_uuid = Uuid::from_str(api_key)
+                    .map_err(|e| BotError::Config(format!("invalid CLOB API key uuid: {e}")))?;
+                Credentials::new(api_key_uuid, api_secret.to_string(), api_passphrase.to_string())
+            }
+            ApiCredsSource::Derive => {
+                tracing::info!(
+                    target: "clob_rest",
+                    wallet_mode = ?cfg.keys.wallet_mode,
+                    "deriving CLOB API credentials via /auth/*"
+                );
+                client
+                    .create_or_derive_api_key(&signer, None)
+                    .await
+                    .map_err(|e| BotError::Other(format!("sdk derive api key failed: {e}")))?
+            }
+        };
+
+        let api_creds = ClobApiCreds {
+            api_key: creds.key().to_string(),
+            api_secret: creds.secret().expose_secret().to_string(),
+            api_passphrase: creds.passphrase().expose_secret().to_string(),
+        };
+
         let mut auth = client
             .authentication_builder(&signer)
             .credentials(creds)
             .signature_type(signature_type);
 
-        if let Some(funder) = cfg.keys.funder_address.as_deref().map(str::trim) {
-            if !funder.is_empty() {
-                let addr = Address::from_str(funder)
-                    .map_err(|e| BotError::Config(format!("invalid funder_address: {e}")))?;
+        let mut funder = cfg.keys.funder_address.as_deref().map(str::trim).unwrap_or("");
+        let mut derived = None;
+        if cfg.keys.wallet_mode == WalletMode::ProxySafe && funder.is_empty() {
+            derived = derive_proxy_wallet(signer.address(), POLYGON);
+            if let Some(addr) = derived {
+                funder = ""; // keep empty; set via auth.funder below
+                tracing::info!(
+                    target: "clob_rest",
+                    funder_address = %addr,
+                    "derived proxy wallet address via CREATE2"
+                );
                 auth = auth.funder(addr);
+            } else {
+                return Err(BotError::Config(
+                    "wallet_mode=PROXY_SAFE but proxy wallet derivation failed; set keys.funder_address explicitly"
+                        .to_string(),
+                ));
             }
+        }
+
+        if !funder.is_empty() {
+            let addr = Address::from_str(funder)
+                .map_err(|e| BotError::Config(format!("invalid funder_address: {e}")))?;
+            if cfg.keys.wallet_mode == WalletMode::ProxySafe {
+                if let Some(derived_addr) = derived {
+                    if derived_addr != addr {
+                        tracing::warn!(
+                            target: "clob_rest",
+                            configured = %addr,
+                            derived = %derived_addr,
+                            "funder_address does not match derived proxy wallet"
+                        );
+                    }
+                } else if let Some(derived_addr) = derive_proxy_wallet(signer.address(), POLYGON) {
+                    if derived_addr != addr {
+                        tracing::warn!(
+                            target: "clob_rest",
+                            configured = %addr,
+                            derived = %derived_addr,
+                            "funder_address does not match derived proxy wallet"
+                        );
+                    }
+                }
+            }
+            auth = auth.funder(addr);
         }
 
         let client = auth
@@ -214,6 +288,7 @@ impl ClobRestClient {
             inner: Some(Arc::new(SdkHandle {
                 client,
                 signer,
+                api_creds,
                 fee_rate_cache: FeeRateCache::new(DEFAULT_FEE_RATE_TTL_MS),
                 fee_rate_http: reqwest::Client::new(),
             })),
@@ -222,6 +297,10 @@ impl ClobRestClient {
 
     pub fn authenticated(&self) -> bool {
         self.inner.is_some()
+    }
+
+    pub fn api_creds(&self) -> Option<ClobApiCreds> {
+        self.inner.as_ref().map(|inner| inner.api_creds.clone())
     }
 
     pub async fn are_orders_scoring(
@@ -647,7 +726,7 @@ pub async fn run_heartbeat_supervisor(
 fn map_wallet_mode(mode: WalletMode) -> SignatureType {
     match mode {
         WalletMode::Eoa => SignatureType::Eoa,
-        WalletMode::ProxySafe => SignatureType::GnosisSafe,
+        WalletMode::ProxySafe => SignatureType::Proxy,
     }
 }
 
@@ -963,6 +1042,11 @@ mod tests {
             inner: Some(Arc::new(SdkHandle {
                 client,
                 signer,
+                api_creds: ClobApiCreds {
+                    api_key: "key".to_string(),
+                    api_secret: "secret".to_string(),
+                    api_passphrase: "pass".to_string(),
+                },
                 fee_rate_cache,
                 fee_rate_http: reqwest::Client::new(),
             })),
