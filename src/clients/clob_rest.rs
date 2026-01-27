@@ -14,7 +14,7 @@ use polymarket_client_sdk::clob::types::response::{
     FeeRateResponse, OpenOrderResponse, Page, PostOrderResponse,
 };
 use polymarket_client_sdk::clob::types::{
-    Amount, OrderType as SdkOrderType, Side, SignatureType, SignedOrder,
+    OrderType as SdkOrderType, Side, SignatureType, SignedOrder,
 };
 use polymarket_client_sdk::clob::{Client as SdkClient, Config as SdkConfig};
 use polymarket_client_sdk::types::{Address, Decimal, B256, U256};
@@ -315,20 +315,18 @@ impl ClobRestClient {
 
         inner.client.set_fee_rate_bps(token_id, fee_rate_bps as u32);
 
-        // NOTE: `polymarket-client-sdk` supports BUY market orders with `amount` specified in
-        // either shares or USDC. We use shares so the completion targets an exact share delta,
-        // while `p_max` acts as an explicit price cap (FAK/FOK).
+        // NOTE: Completion is modeled as a marketable limit order (FAK/FOK) with an explicit
+        // cap price `p_max`. This avoids any ambiguity around "market order" amount units and
+        // targets an exact share delta.
         let signable = inner
             .client
-            .market_order()
+            .limit_order()
             .token_id(token_id)
-            .amount(
-                Amount::shares(shares)
-                    .map_err(|e| BotError::Other(format!("invalid shares: {e}")))?,
-            )
+            .price(p_max)
+            .size(shares)
             .side(Side::Buy)
             .order_type(map_completion_order_type(order_type))
-            .price(p_max)
+            .post_only(false)
             .build()
             .await
             .map_err(|e| BotError::Other(format!("build completion order failed: {e}")))?;
@@ -930,7 +928,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completion_order_buy_amount_can_be_shares_in_sdk() {
+    async fn completion_order_is_marketable_limit_order_in_sdk() {
         use polymarket_client_sdk::clob::types::TickSize;
 
         let token_id = U256::from(123u64);
@@ -978,7 +976,7 @@ mod tests {
         assert_eq!(signed.order.tokenId, token_id);
         assert_eq!(signed.order.side, Side::Buy as u8);
         assert_eq!(signed.order_type, SdkOrderType::FAK);
-        assert_eq!(signed.post_only, None);
+        assert_eq!(signed.post_only, Some(false));
         assert_eq!(signed.order.feeRateBps, U256::from(12u64));
         assert_eq!(signed.order.takerAmount, U256::from(10_000_000u64));
         assert_eq!(signed.order.makerAmount, U256::from(3_500_000u64));
