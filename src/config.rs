@@ -370,7 +370,9 @@ pub struct OracleConfig {
 impl Default for OracleConfig {
     fn default() -> Self {
         Self {
-            chainlink_stale_ms: 1_500,
+            // RTDS Chainlink updates can be bursty; keep this comfortably above the typical cadence
+            // to avoid flapping pause/resume on healthy feeds.
+            chainlink_stale_ms: 5_000,
             binance_stale_ms: 1_500,
             fast_move_window_ms: 1_000,
             fast_move_threshold_bps: 10.0,
