@@ -19,6 +19,9 @@ const BACKOFF_MIN_MS: u64 = 500;
 const BACKOFF_MAX_MS: u64 = 20_000;
 const BACKOFF_MULTIPLIER: f64 = 1.7;
 const MAX_RAW_LOG_BYTES: usize = 8 * 1024;
+// Log 1 out of N inbound raw WS frames (before redaction) to reduce CPU.
+// Set to 1 to disable sampling and log every frame.
+const RAW_LOG_SAMPLE_EVERY: u64 = 16;
 const REDACT_PLACEHOLDER: &str = "[REDACTED]";
 
 static ORDER_UPDATE_DROPPED: AtomicUsize = AtomicUsize::new(0);
@@ -194,6 +197,7 @@ impl UserWsLoop {
         write.send(Message::Text(subscribe.into())).await?;
 
         let mut next_ping = Instant::now() + Duration::from_millis(PING_INTERVAL_MS);
+        let mut raw_frame_counter: u64 = 0;
 
         loop {
             tokio::select! {
@@ -207,7 +211,13 @@ impl UserWsLoop {
                     match msg {
                         Message::Text(text) => {
                             let ts_ms = now_ms();
-                            log_raw_frame(&log_tx, "ws.user.raw", ts_ms, &text);
+                            if log_tx.is_some()
+                                && (RAW_LOG_SAMPLE_EVERY <= 1
+                                    || raw_frame_counter.is_multiple_of(RAW_LOG_SAMPLE_EVERY))
+                            {
+                                log_raw_frame(&log_tx, "ws.user.raw", ts_ms, &text);
+                            }
+                            raw_frame_counter = raw_frame_counter.wrapping_add(1);
                             if text.eq_ignore_ascii_case("ping") {
                                 write.send(Message::Text("PONG".to_string().into())).await?;
                             } else {

@@ -17,6 +17,9 @@ const BINANCE_SYMBOL: &str = "btcusdt";
 const CHAINLINK_SYMBOL: &str = "btc/usd";
 const MAX_RAW_LOG_BYTES: usize = 8 * 1024;
 const REDACT_PLACEHOLDER: &str = "[REDACTED]";
+// Log 1 out of N inbound raw WS frames (before redaction) to reduce CPU.
+// Set to 1 to disable sampling and log every frame.
+const RAW_LOG_SAMPLE_EVERY: u64 = 16;
 const CHAINLINK_WATCHDOG_POLL_MS: u64 = 250;
 const PING_INTERVAL_MS: u64 = 10_000;
 
@@ -122,6 +125,7 @@ async fn read_loop(
     let mut watchdog = tokio::time::interval(Duration::from_millis(CHAINLINK_WATCHDOG_POLL_MS));
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut next_ping = Instant::now() + Duration::from_millis(PING_INTERVAL_MS);
+    let mut raw_frame_counter: u64 = 0;
 
     loop {
         tokio::select! {
@@ -133,7 +137,13 @@ async fn read_loop(
                             continue;
                         }
                         let ts_ms = now_ms();
-                        log_raw_frame(&log_tx, "ws.rtds.raw", ts_ms, &text);
+                        if log_tx.is_some()
+                            && (RAW_LOG_SAMPLE_EVERY <= 1
+                                || raw_frame_counter.is_multiple_of(RAW_LOG_SAMPLE_EVERY))
+                        {
+                            log_raw_frame(&log_tx, "ws.rtds.raw", ts_ms, &text);
+                        }
+                        raw_frame_counter = raw_frame_counter.wrapping_add(1);
                         if let Some(update) = parse_rtds_update(&text) {
                             if update.source == RTDSSource::ChainlinkBtcUsd {
                                 last_chainlink_ms = Some(update.ts_ms);
@@ -156,7 +166,13 @@ async fn read_loop(
                     Ok(Message::Binary(bin)) => match String::from_utf8(bin.to_vec()) {
                         Ok(text) => {
                             let ts_ms = now_ms();
-                            log_raw_frame(&log_tx, "ws.rtds.raw", ts_ms, &text);
+                            if log_tx.is_some()
+                                && (RAW_LOG_SAMPLE_EVERY <= 1
+                                    || raw_frame_counter.is_multiple_of(RAW_LOG_SAMPLE_EVERY))
+                            {
+                                log_raw_frame(&log_tx, "ws.rtds.raw", ts_ms, &text);
+                            }
+                            raw_frame_counter = raw_frame_counter.wrapping_add(1);
                             if let Some(update) = parse_rtds_update(&text) {
                                 if update.source == RTDSSource::ChainlinkBtcUsd {
                                     last_chainlink_ms = Some(update.ts_ms);

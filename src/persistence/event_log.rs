@@ -116,7 +116,7 @@ impl RotationHook for SizeRotationHook {
 pub struct EventLogger {
     config: EventLogConfig,
     rotation_hook: Arc<dyn RotationHook>,
-    buffer: VecDeque<String>,
+    buffer: VecDeque<Vec<u8>>,
     buffer_bytes: usize,
     dropped_events: u64,
     written_bytes: u64,
@@ -202,7 +202,8 @@ impl EventLogger {
             event,
             payload,
         };
-        let line = serde_json::to_string(&record)
+        let mut line = Vec::new();
+        serde_json::to_writer(&mut line, &record)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         self.push_line(line);
         if self.should_flush() {
@@ -265,7 +266,7 @@ impl EventLogger {
         best_rate.unwrap_or(self.config.default_sample_rate)
     }
 
-    fn push_line(&mut self, line: String) {
+    fn push_line(&mut self, line: Vec<u8>) {
         let line_bytes = line.len() + 1;
         if line_bytes > self.config.buffer_max_bytes {
             self.dropped_events = self.dropped_events.saturating_add(1);
@@ -302,7 +303,7 @@ impl EventLogger {
             .open(&self.log_path)?;
         let mut writer = BufWriter::new(file);
         while let Some(line) = self.buffer.pop_front() {
-            writer.write_all(line.as_bytes())?;
+            writer.write_all(&line)?;
             writer.write_all(b"\n")?;
             self.written_bytes = self
                 .written_bytes
