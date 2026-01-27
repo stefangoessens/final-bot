@@ -39,6 +39,7 @@ require_cmd() {
 }
 
 require_cmd aws
+require_cmd python3
 
 aws_acct() {
   aws sts get-caller-identity --query 'Account' --output text
@@ -144,13 +145,22 @@ wait_for_ssm() {
 send_cmd() {
   local instance_id="$1"
   local commands="$2"
+  local params
+  params=$(
+    python3 - "$commands" <<'PY'
+import json
+import sys
+
+print(json.dumps({"commands": [sys.argv[1]]}))
+PY
+  )
   local cmd_id
   cmd_id=$(
     aws ssm send-command \
       --region "$AWS_REGION" \
       --instance-ids "$instance_id" \
       --document-name AWS-RunShellScript \
-      --parameters "commands=$commands" \
+      --parameters "$params" \
       --query 'Command.CommandId' \
       --output text
   )
@@ -344,4 +354,3 @@ case "$cmd" in
   -h|--help|"") usage ;;
   *) echo "unknown command: $cmd" >&2; usage; exit 1 ;;
 esac
-
