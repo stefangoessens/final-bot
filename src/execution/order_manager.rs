@@ -500,6 +500,19 @@ impl OrderManager {
             }
 
             if let Some(applied) = apply_user_order_update(cache, &update, slug) {
+                if let Some(fill) = applied.fill.as_ref() {
+                    tracing::debug!(
+                        target: "order_manager",
+                        slug = %slug,
+                        order_id = %update.order_id,
+                        token_id = %fill.token_id,
+                        price = fill.price,
+                        shares = fill.shares,
+                        ts_ms = fill.ts_ms,
+                        action = "user_fill_delta",
+                        "fill delta derived from user order update"
+                    );
+                }
                 emit_order_update(tx_events, applied.order_update);
                 return;
             }
