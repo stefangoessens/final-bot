@@ -228,6 +228,9 @@ pub struct TradingConfig {
     /// Hard per-market USDC exposure cap (inventory cost + open order notional).
     pub max_usdc_exposure_per_market: f64,
 
+    /// Do not quote below this price. If either outcome is trading below this floor, quoting pauses.
+    pub min_quote_price: f64,
+
     pub ladder_levels: usize,
     pub ladder_step_ticks: u64,
     pub size_decay: f64,
@@ -259,6 +262,7 @@ impl Default for TradingConfig {
             target_total_max: 0.99,
             cutoff_seconds: 60,
             max_usdc_exposure_per_market: 10.0,
+            min_quote_price: 0.20,
             ladder_levels: 2,
             ladder_step_ticks: 1,
             size_decay: 0.6,
@@ -278,6 +282,12 @@ impl Default for TradingConfig {
 
 impl TradingConfig {
     pub fn validate(&self) -> BotResult<()> {
+        if !(0.20..=1.0).contains(&self.min_quote_price) {
+            return Err(BotError::Config(format!(
+                "trading.min_quote_price must be in [0.20,1], got {}",
+                self.min_quote_price
+            )));
+        }
         if !(0.0..=1.0).contains(&self.target_total_base) {
             return Err(BotError::Config(format!(
                 "trading.target_total_base must be in [0,1], got {}",
@@ -948,6 +958,27 @@ mod tests {
             load_config_from(Figment::from(Serialized::defaults(AppConfig::default()))).unwrap();
         assert!(cfg.trading.ladder_levels >= 2);
         assert!(cfg.trading.cutoff_seconds > 0);
+    }
+
+    #[test]
+    fn min_quote_price_floor_is_enforced() {
+        let cfg = TradingConfig {
+            min_quote_price: 0.19,
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("trading.min_quote_price"), "{msg}");
+        assert!(msg.contains("[0.20,1]"), "{msg}");
+    }
+
+    #[test]
+    fn min_quote_price_floor_is_allowed() {
+        let cfg = TradingConfig {
+            min_quote_price: 0.20,
+            ..Default::default()
+        };
+        cfg.validate().unwrap();
     }
 
     #[test]

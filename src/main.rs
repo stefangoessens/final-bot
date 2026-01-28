@@ -351,31 +351,6 @@ async fn main() -> BotResult<()> {
                 "user ws requires authenticated rest client api creds".to_string(),
             )
         })?;
-        let private_key = cfg.keys.private_key.as_deref().unwrap_or_default().trim();
-        let pk = private_key.strip_prefix("0x").unwrap_or(private_key);
-        let signer: alloy_signer_local::PrivateKeySigner = pk
-            .parse::<alloy_signer_local::PrivateKeySigner>()
-            .map_err(|e| crate::error::BotError::Other(format!("invalid private key: {e}")))?;
-
-        let mut maker_addresses = vec![signer.address().to_string().to_ascii_lowercase()];
-        if cfg.keys.wallet_mode == crate::config::WalletMode::ProxySafe {
-            if let Some(funder) = cfg
-                .keys
-                .funder_address
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                maker_addresses.push(funder.to_ascii_lowercase());
-            }
-            if let Some(proxy) =
-                polymarket_client_sdk::derive_proxy_wallet(signer.address(), polymarket_client_sdk::POLYGON)
-            {
-                maker_addresses.push(proxy.to_string().to_ascii_lowercase());
-            }
-        }
-        maker_addresses.sort();
-        maker_addresses.dedup();
 
         let user_ws = clients::clob_ws_user::UserWsLoop::new(
             cfg.endpoints.clob_ws_user_url.clone(),
@@ -384,7 +359,6 @@ async fn main() -> BotResult<()> {
             creds.api_passphrase,
             Vec::new(),
             Some(tx_user_orders),
-            maker_addresses,
         );
         let tx_log_user = tx_log.clone();
         tokio::spawn({

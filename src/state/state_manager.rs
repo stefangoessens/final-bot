@@ -36,9 +36,16 @@ pub struct TickSizeSeed {
 #[derive(Debug, Clone)]
 pub struct FillEvent {
     pub token_id: String,
+    pub side: OrderSide,
     pub price: f64,
     pub shares: f64,
     pub ts_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderSide {
+    Buy,
+    Sell,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +140,7 @@ pub enum AppEvent {
 
 pub struct StateManager {
     markets: HashMap<String, MarketState>, // key: slug
+    last_fill_quote_tick_ms: HashMap<String, i64>, // key: slug
     last_user_ws_msg_ms: Option<i64>,
     last_geoblock: Option<GeoblockStatus>,
     alpha_cfg: AlphaConfig,
@@ -143,6 +151,8 @@ pub struct StateManager {
 }
 
 impl StateManager {
+    const FILL_QUOTE_TICK_MIN_GAP_MS: i64 = 25;
+
     pub fn new(
         alpha_cfg: AlphaConfig,
         oracle_cfg: OracleConfig,
@@ -152,6 +162,7 @@ impl StateManager {
     ) -> Self {
         Self {
             markets: HashMap::new(),
+            last_fill_quote_tick_ms: HashMap::new(),
             last_user_ws_msg_ms: None,
             last_geoblock: None,
             alpha_cfg,
@@ -169,6 +180,11 @@ impl StateManager {
 
     pub async fn run(mut self, mut rx: Receiver<AppEvent>, tx_quote: Sender<QuoteTick>) {
         while let Some(event) = rx.recv().await {
+            let fill_token_id = match &event {
+                AppEvent::UserWsUpdate(UserWsUpdate::Fill(fill)) => Some(fill.token_id.clone()),
+                _ => None,
+            };
+
             let (now_ms, is_timer) = match &event {
                 AppEvent::TimerTick { now_ms } => (*now_ms, true),
                 AppEvent::MarketWsUpdate(u) => (u.ts_ms, false),
@@ -214,8 +230,71 @@ impl StateManager {
                         }
                     }
                 }
+            } else if let Some(token_id) = fill_token_id {
+                if let Some(slug) = self.market_slug_for_token_id(&token_id) {
+                    self.maybe_emit_fill_quote_tick(slug, now_ms, &tx_quote);
+                }
             }
         }
+    }
+
+    fn maybe_emit_fill_quote_tick(
+        &mut self,
+        slug: String,
+        now_ms: i64,
+        tx_quote: &Sender<QuoteTick>,
+    ) {
+        if let Some(last_ms) = self.last_fill_quote_tick_ms.get(&slug).copied() {
+            if now_ms.saturating_sub(last_ms) < Self::FILL_QUOTE_TICK_MIN_GAP_MS {
+                tracing::debug!(
+                    target: "state_manager",
+                    slug = %slug,
+                    now_ms,
+                    last_ms,
+                    min_gap_ms = Self::FILL_QUOTE_TICK_MIN_GAP_MS,
+                    "fill-triggered quote tick throttled"
+                );
+                return;
+            }
+        }
+
+        let Some(state) = self.markets.get(&slug) else {
+            return;
+        };
+
+        let tick = QuoteTick {
+            slug: slug.clone(),
+            now_ms,
+            state: state.clone(),
+        };
+
+        match tx_quote.try_send(tick) {
+            Ok(()) => {
+                self.last_fill_quote_tick_ms.insert(slug, now_ms);
+            }
+            Err(TrySendError::Full(_)) => {
+                tracing::debug!(
+                    target: "state_manager",
+                    slug = %slug,
+                    "quote tick channel full; dropping fill-triggered tick"
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                tracing::warn!(
+                    target: "state_manager",
+                    "quote tick channel closed; dropping fill-triggered tick"
+                );
+            }
+        }
+    }
+
+    fn market_slug_for_token_id(&self, token_id: &str) -> Option<String> {
+        for (slug, state) in &self.markets {
+            if state.token_side(token_id).is_some() {
+                return Some(slug.clone());
+            }
+        }
+        None
     }
 
     fn apply_event(&mut self, event: AppEvent, now_ms: i64) {
@@ -242,6 +321,8 @@ impl StateManager {
                 self.health.set_tracked_markets(slugs.len());
                 let keep: std::collections::HashSet<String> = slugs.into_iter().collect();
                 self.markets.retain(|slug, _| keep.contains(slug));
+                self.last_fill_quote_tick_ms
+                    .retain(|slug, _| keep.contains(slug));
             }
             AppEvent::MarketWsUpdate(update) => {
                 self.health.mark_market_ws(update.ts_ms);
@@ -457,9 +538,12 @@ impl StateManager {
                 Some(s) => s,
                 None => continue,
             };
-            state
-                .inventory
-                .apply_buy_fill(side, fill.price, fill.shares, fill.ts_ms);
+            match fill.side {
+                OrderSide::Buy => state
+                    .inventory
+                    .apply_buy_fill(side, fill.price, fill.shares, fill.ts_ms),
+                OrderSide::Sell => state.inventory.apply_sell_fill(side, fill.shares, fill.ts_ms),
+            }
             self.metrics.inc_fills();
             return;
         }
@@ -683,6 +767,8 @@ mod tests {
     use super::*;
     use crate::config::{AlphaConfig, AppConfig, OracleConfig, TradingConfig};
     use crate::ops::OpsState;
+    use tokio::sync::mpsc;
+    use tokio::time::{timeout, Duration};
 
     fn make_identity() -> MarketIdentity {
         MarketIdentity {
@@ -714,11 +800,21 @@ mod tests {
         }
     }
 
+    fn make_identity_named(slug: &str, condition_id: &str, token_up: &str, token_down: &str) -> MarketIdentity {
+        MarketIdentity {
+            slug: slug.to_string(),
+            condition_id: condition_id.to_string(),
+            token_up: token_up.to_string(),
+            token_down: token_down.to_string(),
+            ..make_identity()
+        }
+    }
+
     #[test]
-    fn applying_fill_updates_cost_basis() {
-        let ops = OpsState::new(&AppConfig::default());
-        let mut sm = StateManager::new(
-            AlphaConfig::default(),
+	    fn applying_fill_updates_cost_basis() {
+	        let ops = OpsState::new(&AppConfig::default());
+	        let mut sm = StateManager::new(
+	            AlphaConfig::default(),
             OracleConfig::default(),
             TradingConfig::default(),
             ops.health,
@@ -729,6 +825,7 @@ mod tests {
         sm.apply_event(
             AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
                 token_id: "up".to_string(),
+                side: OrderSide::Buy,
                 price: 0.49,
                 shares: 10.0,
                 ts_ms: 1_000,
@@ -739,9 +836,211 @@ mod tests {
         let state = sm.market_state("btc-updown-15m-0").unwrap();
         assert_eq!(state.inventory.up.shares, 10.0);
         assert_eq!(state.inventory.up.notional_usdc, 4.9);
-        let avg = state.inventory.up.avg_cost().unwrap();
-        assert!((avg - 0.49).abs() < 1e-12, "avg_cost={avg}");
-        assert_eq!(state.inventory.unpaired_shares(), 10.0);
+	        let avg = state.inventory.up.avg_cost().unwrap();
+	        assert!((avg - 0.49).abs() < 1e-12, "avg_cost={avg}");
+	        assert_eq!(state.inventory.unpaired_shares(), 10.0);
+	    }
+
+	    #[test]
+	    fn applying_sell_fill_reduces_cost_basis_pro_rata() {
+	        let ops = OpsState::new(&AppConfig::default());
+	        let mut sm = StateManager::new(
+	            AlphaConfig::default(),
+	            OracleConfig::default(),
+	            TradingConfig::default(),
+	            ops.health,
+	            ops.metrics,
+	        );
+	        sm.apply_event(AppEvent::MarketDiscovered(make_identity()), 0);
+	
+	        sm.apply_event(
+	            AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
+	                token_id: "up".to_string(),
+	                side: OrderSide::Buy,
+	                price: 0.4,
+	                shares: 10.0,
+	                ts_ms: 1_000,
+	            })),
+	            1_000,
+	        );
+	        sm.apply_event(
+	            AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
+	                token_id: "up".to_string(),
+	                side: OrderSide::Sell,
+	                price: 0.6,
+	                shares: 4.0,
+	                ts_ms: 2_000,
+	            })),
+	            2_000,
+	        );
+	
+	        let state = sm.market_state("btc-updown-15m-0").unwrap();
+	        assert_eq!(state.inventory.up.shares, 6.0);
+	        assert!((state.inventory.up.notional_usdc - 2.4).abs() < 1e-12);
+	        let avg = state.inventory.up.avg_cost().unwrap();
+	        assert!((avg - 0.4).abs() < 1e-12, "avg_cost={avg}");
+	        assert_eq!(state.inventory.last_trade_ms, 2_000);
+	    }
+	
+	    #[tokio::test]
+    async fn fill_emits_quote_tick_only_for_affected_market() {
+        let ops = OpsState::new(&AppConfig::default());
+        let sm = StateManager::new(
+            AlphaConfig::default(),
+            OracleConfig::default(),
+            TradingConfig::default(),
+            ops.health,
+            ops.metrics,
+        );
+
+        let (tx_events, rx_events) = mpsc::channel(8);
+        let (tx_quote, mut rx_quote) = mpsc::channel(8);
+        let handle = tokio::spawn(sm.run(rx_events, tx_quote));
+
+        let t0 = now_ms();
+        tx_events
+            .send(AppEvent::MarketDiscovered(make_identity_named(
+                "btc-updown-15m-0",
+                "cond-0",
+                "up-0",
+                "down-0",
+            )))
+            .await
+            .expect("send market discovered");
+        tx_events
+            .send(AppEvent::MarketDiscovered(make_identity_named(
+                "btc-updown-15m-1",
+                "cond-1",
+                "up-1",
+                "down-1",
+            )))
+            .await
+            .expect("send market discovered");
+
+        tx_events
+            .send(AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
+                token_id: "up-1".to_string(),
+                side: OrderSide::Buy,
+                price: 0.49,
+                shares: 3.0,
+                ts_ms: t0 + 10,
+            })))
+            .await
+            .expect("send fill");
+
+        let tick = timeout(Duration::from_millis(200), rx_quote.recv())
+            .await
+            .expect("quote tick timeout")
+            .expect("quote tick");
+        assert_eq!(tick.slug, "btc-updown-15m-1");
+        assert_eq!(tick.state.inventory.up.shares, 3.0);
+
+        // Ensure no quote tick for the other market was emitted by this fill.
+        let no_second_tick = timeout(Duration::from_millis(50), rx_quote.recv()).await;
+        assert!(
+            no_second_tick.is_err(),
+            "unexpected extra quote tick: {no_second_tick:?}"
+        );
+
+        drop(tx_events);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn fill_tick_drop_does_not_throttle_future_fill_ticks() {
+        let ops = OpsState::new(&AppConfig::default());
+        let sm = StateManager::new(
+            AlphaConfig::default(),
+            OracleConfig::default(),
+            TradingConfig::default(),
+            ops.health,
+            ops.metrics,
+        );
+
+        let (tx_events, rx_events) = mpsc::channel(8);
+        // Capacity 1 so we can intentionally fill it.
+        let (tx_quote, mut rx_quote) = mpsc::channel(1);
+        let handle = tokio::spawn(sm.run(rx_events, tx_quote));
+
+        let t0 = now_ms();
+        tx_events
+            .send(AppEvent::MarketDiscovered(make_identity_named(
+                "btc-updown-15m-0",
+                "cond-0",
+                "up-0",
+                "down-0",
+            )))
+            .await
+            .expect("send market discovered");
+
+        // Fill the quote channel via a timer tick.
+        tx_events
+            .send(AppEvent::TimerTick { now_ms: t0 + 1 })
+            .await
+            .expect("send timer tick");
+        let _ = timeout(Duration::from_millis(200), rx_quote.recv())
+            .await
+            .expect("expected timer tick quote")
+            .expect("channel open");
+
+        // Put it back to full.
+        tx_events
+            .send(AppEvent::TimerTick { now_ms: t0 + 2 })
+            .await
+            .expect("send timer tick");
+        let timer_tick = timeout(Duration::from_millis(200), rx_quote.recv())
+            .await
+            .expect("expected timer tick quote")
+            .expect("channel open");
+        assert_eq!(timer_tick.slug, "btc-updown-15m-0");
+
+        // Now the channel is empty again; refill it manually so the next fill-triggered tick drops.
+        // (We can't access tx_quote directly here, so do another timer tick and *don't* recv it.)
+        tx_events
+            .send(AppEvent::TimerTick { now_ms: t0 + 3 })
+            .await
+            .expect("send timer tick");
+
+        // Fill event should attempt to emit a fill-triggered tick, but the channel is full so it drops.
+        tx_events
+            .send(AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
+                token_id: "up-0".to_string(),
+                side: OrderSide::Buy,
+                price: 0.49,
+                shares: 1.0,
+                ts_ms: t0 + 10,
+            })))
+            .await
+            .expect("send fill");
+
+        // Drain the timer tick we left in the channel.
+        let _ = timeout(Duration::from_millis(200), rx_quote.recv())
+            .await
+            .expect("expected timer tick quote")
+            .expect("channel open");
+
+        // Send another fill within the 25ms throttle window. This should still emit a fill tick
+        // because the previous attempt dropped and should not have updated the throttle timestamp.
+        tx_events
+            .send(AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
+                token_id: "up-0".to_string(),
+                side: OrderSide::Buy,
+                price: 0.49,
+                shares: 1.0,
+                ts_ms: t0 + 11,
+            })))
+            .await
+            .expect("send fill");
+
+        let tick = timeout(Duration::from_millis(200), rx_quote.recv())
+            .await
+            .expect("quote tick timeout")
+            .expect("quote tick");
+        assert_eq!(tick.slug, "btc-updown-15m-0");
+        assert_eq!(tick.state.inventory.up.shares, 2.0);
+
+        drop(tx_events);
+        let _ = handle.await;
     }
 
     #[test]
@@ -815,6 +1114,7 @@ mod tests {
         sm.apply_event(
             AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
                 token_id: "up".to_string(),
+                side: OrderSide::Buy,
                 price: 0.4,
                 shares: 10.0,
                 ts_ms: 1_000,
@@ -824,6 +1124,7 @@ mod tests {
         sm.apply_event(
             AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
                 token_id: "down".to_string(),
+                side: OrderSide::Buy,
                 price: 0.6,
                 shares: 10.0,
                 ts_ms: 1_000,
@@ -862,6 +1163,7 @@ mod tests {
         sm.apply_event(
             AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
                 token_id: "up".to_string(),
+                side: OrderSide::Buy,
                 price: 0.45,
                 shares: 4.0,
                 ts_ms: 1_000,
@@ -1048,6 +1350,7 @@ mod tests {
         sm.apply_event(
             AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
                 token_id: "up".to_string(),
+                side: OrderSide::Buy,
                 price: 0.5,
                 shares: 2.0,
                 ts_ms: 1_000,
@@ -1057,6 +1360,7 @@ mod tests {
         sm.apply_event(
             AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
                 token_id: "down".to_string(),
+                side: OrderSide::Buy,
                 price: 0.25,
                 shares: 4.0,
                 ts_ms: 1_000,
@@ -1132,6 +1436,7 @@ mod tests {
         sm.apply_event(
             AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
                 token_id: "up".to_string(),
+                side: OrderSide::Buy,
                 price: 0.6,
                 shares: 2.0,
                 ts_ms: 9_050,

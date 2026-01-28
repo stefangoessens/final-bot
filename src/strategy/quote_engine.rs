@@ -20,6 +20,13 @@ pub fn build_desired_orders(
         return Vec::new();
     }
 
+    let min_quote_price = cfg.min_quote_price.max(0.0);
+    if observed_market_price(&state.up_book).is_some_and(|p| p < min_quote_price)
+        || observed_market_price(&state.down_book).is_some_and(|p| p < min_quote_price)
+    {
+        return Vec::new();
+    }
+
     let mut target_total = state.alpha.target_total;
     if !target_total.is_finite() || target_total <= 0.0 {
         target_total = cfg
@@ -77,6 +84,22 @@ pub fn build_desired_orders(
         cfg,
     );
 
+    if state.inventory.unpaired_shares() <= 1e-9 {
+        let mut has_up = false;
+        let mut has_down = false;
+        for order in &desired {
+            if order.token_id == state.identity.token_up {
+                has_up = true;
+            }
+            if order.token_id == state.identity.token_down {
+                has_down = true;
+            }
+        }
+        if has_up ^ has_down {
+            return Vec::new();
+        }
+    }
+
     desired
 }
 
@@ -108,6 +131,9 @@ fn build_ladder(
         let price = floor_to_tick(raw_price.max(0.0), tick);
         if price <= 0.0 {
             continue;
+        }
+        if price < cfg.min_quote_price {
+            break;
         }
 
         out.push(DesiredOrder {
@@ -149,6 +175,15 @@ fn top_price(book: &TokenBookTop, cap: f64, cfg: &TradingConfig) -> f64 {
 
     let capped = comp.min(cap).min(0.99);
     floor_to_tick(capped.max(0.0), tick)
+}
+
+fn observed_market_price(book: &TokenBookTop) -> Option<f64> {
+    match (book.best_bid, book.best_ask) {
+        (Some(bid), Some(ask)) => Some(bid.min(ask)),
+        (Some(bid), None) => Some(bid),
+        (None, Some(ask)) => Some(ask),
+        (None, None) => None,
+    }
 }
 
 fn enforce_combined_cap(
@@ -196,7 +231,20 @@ fn floor_to_tick(price: f64, tick: f64) -> f64 {
     if tick <= 0.0 || !price.is_finite() {
         return 0.0;
     }
-    (price / tick).floor() * tick
+    // Guard against floating-point error at tick boundaries (e.g. 0.21 - 0.01 = 0.199999...).
+    let eps = (tick.abs() * 1e-6).max(1e-12);
+    let steps = ((price + eps) / tick).floor();
+    if !steps.is_finite() {
+        return 0.0;
+    }
+    let mut rounded = steps * tick;
+    if rounded > price + eps {
+        rounded = (steps - 1.0) * tick;
+    }
+    if !rounded.is_finite() || rounded < 0.0 {
+        return 0.0;
+    }
+    rounded
 }
 
 #[cfg(test)]
@@ -340,5 +388,105 @@ mod tests {
                 ask
             );
         }
+    }
+
+    #[test]
+    fn quote_floor_gates_if_any_outcome_under_floor() {
+        let cfg = TradingConfig::default();
+
+        let mut state = base_state();
+        state.up_book.best_bid = Some(0.19);
+        state.up_book.best_ask = Some(0.21);
+        state.down_book.best_bid = Some(0.50);
+        state.down_book.best_ask = Some(0.51);
+        state.alpha.target_total = 0.99;
+        state.alpha.cap_up = 0.99;
+        state.alpha.cap_down = 0.99;
+        state.alpha.size_scalar = 1.0;
+
+        let desired = build_desired_orders(&state, &cfg, 1000);
+        assert!(
+            desired.is_empty(),
+            "expected quoting to pause when Up is under floor"
+        );
+
+        let mut state = base_state();
+        state.up_book.best_bid = Some(0.50);
+        state.up_book.best_ask = Some(0.51);
+        state.down_book.best_bid = None;
+        state.down_book.best_ask = Some(0.19);
+        state.alpha.target_total = 0.99;
+        state.alpha.cap_up = 0.99;
+        state.alpha.cap_down = 0.99;
+        state.alpha.size_scalar = 1.0;
+
+        let desired = build_desired_orders(&state, &cfg, 1000);
+        assert!(
+            desired.is_empty(),
+            "expected quoting to pause when Down is under floor"
+        );
+    }
+
+    #[test]
+    fn quote_floor_never_outputs_orders_below_floor() {
+        let mut cfg = TradingConfig::default();
+        cfg.ladder_levels = 5;
+
+        let mut state = base_state();
+        state.up_book.best_bid = Some(0.22);
+        state.up_book.best_ask = Some(0.24);
+        state.down_book.best_bid = Some(0.22);
+        state.down_book.best_ask = Some(0.24);
+        state.alpha.target_total = 0.99;
+        state.alpha.cap_up = 0.99;
+        state.alpha.cap_down = 0.99;
+        state.alpha.size_scalar = 1.0;
+
+        let desired = build_desired_orders(&state, &cfg, 1000);
+        assert!(!desired.is_empty(), "expected some desired orders");
+        for order in desired {
+            assert!(
+                order.price >= cfg.min_quote_price,
+                "produced price below floor: price={} floor={}",
+                order.price,
+                cfg.min_quote_price
+            );
+        }
+    }
+
+    #[test]
+    fn floor_to_tick_does_not_floor_one_tick_too_low_at_boundary() {
+        let p = 0.21 - 0.01;
+        let rounded = floor_to_tick(p, 0.01);
+        assert!((rounded - 0.20).abs() < 1e-12, "rounded={rounded}");
+
+        let p = 0.201 - 0.001;
+        let rounded = floor_to_tick(p, 0.001);
+        assert!((rounded - 0.20).abs() < 1e-12, "rounded={rounded}");
+
+        let p = 0.2001 - 0.0001;
+        let rounded = floor_to_tick(p, 0.0001);
+        assert!((rounded - 0.20).abs() < 1e-12, "rounded={rounded}");
+    }
+
+    #[test]
+    fn balanced_inventory_suppresses_one_sided_quotes() {
+        let cfg = TradingConfig::default();
+
+        let mut state = base_state();
+        state.up_book.best_bid = Some(0.50);
+        state.up_book.best_ask = Some(0.51);
+        state.down_book.best_bid = Some(0.50);
+        state.down_book.best_ask = Some(0.51);
+        state.alpha.target_total = 0.99;
+        state.alpha.cap_up = 0.0;
+        state.alpha.cap_down = 0.99;
+        state.alpha.size_scalar = 1.0;
+
+        let desired = build_desired_orders(&state, &cfg, 1000);
+        assert!(
+            desired.is_empty(),
+            "expected quoting to pause when balanced but only one side would quote"
+        );
     }
 }

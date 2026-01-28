@@ -10,8 +10,11 @@ use crate::state::state_manager::QuoteTick;
 use crate::strategy::fee;
 use crate::strategy::quote_engine::build_desired_orders;
 use crate::strategy::reward_engine::{apply_reward_hints, RewardApplySummary, RewardsSnapshot};
-use crate::strategy::risk::{adjust_for_inventory, should_taker_complete};
+use crate::strategy::risk::{adjust_for_inventory, apply_skew_repair_pricing, should_taker_complete};
 use crate::strategy::DesiredOrder;
+use polymarket_client_sdk::clob::types::Side;
+
+const UNPAIRED_EPS: f64 = 1e-6;
 
 #[derive(Debug, Clone)]
 pub struct ExecCommand {
@@ -24,6 +27,7 @@ pub struct CompletionCommand {
     pub slug: String,
     pub condition_id: String,
     pub token_id: String,
+    pub side: Side,
     pub shares: f64,
     pub p_max: f64,
     pub order_type: crate::config::CompletionOrderType,
@@ -102,6 +106,14 @@ impl StrategyEngine {
 
             let mut desired = build_desired_orders(&state, &self.trading, now_ms);
             adjust_for_inventory(&mut desired, &state, &self.inventory, now_ms);
+            apply_skew_repair_pricing(
+                &mut desired,
+                &state,
+                &self.trading,
+                &self.inventory,
+                &self.completion,
+                now_ms,
+            );
 
             let cap_usdc = self.trading.max_usdc_exposure_per_market;
             let inv_cost_usdc =
@@ -112,37 +124,21 @@ impl StrategyEngine {
                 f64::INFINITY
             };
 
-            if remaining_budget_usdc <= 0.0 {
-                tracing::warn!(
-                    target: "strategy_engine",
-                    slug = %slug,
-                    cap_usdc = cap_usdc,
-                    inventory_cost_usdc = inv_cost_usdc,
-                    "market USDC budget exhausted; sending empty desired orders"
-                );
-                if tx_exec
-                    .send(ExecCommand {
-                        slug,
-                        desired: Vec::new(),
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                continue;
-            }
-
             if let Some(taker_action) =
-                should_taker_complete(&state, &self.inventory, &self.completion, now_ms)
+                should_taker_complete(&state, &self.inventory, &self.completion, &self.trading, now_ms)
             {
-                let completion_cost = taker_action.shares * taker_action.p_max
-                    + fee::taker_fee_usdc(taker_action.shares, taker_action.p_max);
+                let completion_cost = if matches!(taker_action.side, Side::Sell) {
+                    0.0
+                } else {
+                    taker_action.shares * taker_action.p_max
+                        + fee::taker_fee_usdc(taker_action.shares, taker_action.p_max)
+                };
                 if completion_cost > remaining_budget_usdc + 1e-12 {
                     tracing::warn!(
                         target: "strategy_engine",
                         slug = %slug,
                         token_id = %taker_action.token_id,
+                        side = ?taker_action.side,
                         completion_cost_usdc = completion_cost,
                         remaining_budget_usdc,
                         "taker completion suppressed by market USDC budget"
@@ -152,6 +148,7 @@ impl StrategyEngine {
                     target: "strategy_engine",
                     slug = %slug,
                     token_id = %taker_action.token_id,
+                    side = ?taker_action.side,
                     p_max = taker_action.p_max,
                     shares = taker_action.shares,
                     order_type = ?taker_action.order_type,
@@ -174,6 +171,7 @@ impl StrategyEngine {
                         slug: slug.clone(),
                         condition_id: state.identity.condition_id.clone(),
                         token_id: taker_action.token_id.clone(),
+                        side: taker_action.side,
                         shares: taker_action.shares,
                         p_max: taker_action.p_max,
                         order_type: taker_action.order_type,
@@ -190,6 +188,27 @@ impl StrategyEngine {
                 }
             }
 
+            if remaining_budget_usdc <= 0.0 {
+                tracing::warn!(
+                    target: "strategy_engine",
+                    slug = %slug,
+                    cap_usdc = cap_usdc,
+                    inventory_cost_usdc = inv_cost_usdc,
+                    "market USDC budget exhausted; sending empty desired orders"
+                );
+                if tx_exec
+                    .send(ExecCommand {
+                        slug,
+                        desired: Vec::new(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+
             let reward_snapshot = self
                 .rewards_rx
                 .as_ref()
@@ -203,12 +222,21 @@ impl StrategyEngine {
             );
 
             let budget_pruned = enforce_market_budget(&mut desired, &state, &self.trading);
+            let safety_pruned = enforce_final_safety(&mut desired, &state, &self.trading);
 
             log_desired_summary(&slug, &state, &desired);
             log_desired_orders(&log_tx, &slug, now_ms, &desired);
             log_reward_summary(&log_tx, &slug, now_ms, &reward_summary);
             if budget_pruned {
                 log_budget_prune(&log_tx, &slug, now_ms, &state, &desired, &self.trading);
+            }
+            if safety_pruned {
+                tracing::warn!(
+                    target: "strategy_engine",
+                    slug = %slug,
+                    desired_count = desired.len(),
+                    "desired orders pruned by final safety constraints"
+                );
             }
 
             if tx_exec
@@ -278,6 +306,47 @@ fn enforce_market_budget(
     }
 
     pruned
+}
+
+fn enforce_final_safety(desired: &mut Vec<DesiredOrder>, state: &MarketState, cfg: &TradingConfig) -> bool {
+    if desired.is_empty() {
+        return false;
+    }
+
+    let before = desired.len();
+
+    let up_token = state.identity.token_up.as_str();
+    let down_token = state.identity.token_down.as_str();
+    desired.retain(|o| {
+        (o.token_id == up_token || o.token_id == down_token)
+            && o.price.is_finite()
+            && o.size.is_finite()
+            && o.size > 0.0
+            && o.price >= cfg.min_quote_price
+    });
+    if desired.is_empty() {
+        return before != 0;
+    }
+
+    let up_shares = state.inventory.up.shares;
+    let down_shares = state.inventory.down.shares;
+    let unpaired = (up_shares - down_shares).abs();
+    if unpaired <= UNPAIRED_EPS {
+        let has_up = desired.iter().any(|o| o.token_id == state.identity.token_up);
+        let has_down = desired.iter().any(|o| o.token_id == state.identity.token_down);
+        if has_up ^ has_down {
+            desired.clear();
+        }
+    } else {
+        let excess = if up_shares > down_shares {
+            state.identity.token_up.as_str()
+        } else {
+            state.identity.token_down.as_str()
+        };
+        desired.retain(|o| o.token_id != excess);
+    }
+
+    desired.len() != before
 }
 
 fn log_desired_summary(slug: &str, state: &MarketState, desired: &[DesiredOrder]) {
@@ -415,6 +484,7 @@ fn log_completion_command(
     let payload = json!({
         "slug": slug,
         "token_id": taker_action.token_id,
+        "side": format!("{:?}", taker_action.side),
         "shares": taker_action.shares,
         "p_max": taker_action.p_max,
         "order_type": format!("{:?}", taker_action.order_type),
@@ -434,6 +504,7 @@ mod tests {
 
     use crate::state::market_state::MarketIdentity;
     use crate::state::market_state::MarketState;
+    use crate::strategy::TimeInForce;
 
     #[tokio::test]
     async fn emits_exec_command_on_quote_tick() {
@@ -483,7 +554,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emits_completion_only_within_window_and_below_pmax() {
+    async fn emits_completion_within_window_or_when_severe() {
         let (tx_quote, rx_quote) = mpsc::channel(1);
         // Buffer exec commands so the strategy task never blocks in this test.
         let (tx_exec, _rx_exec) = mpsc::channel(16);
@@ -491,6 +562,7 @@ mod tests {
 
         let mut completion_cfg = CompletionConfig::default();
         completion_cfg.enabled = true;
+        completion_cfg.max_loss_usdc = 0.0;
 
         let engine = StrategyEngine::new(
             TradingConfig::default(),
@@ -520,7 +592,7 @@ mod tests {
         state_inside.inventory.up.shares = 1.0;
         state_inside.inventory.up.notional_usdc = 0.2;
         state_inside.inventory.down.shares = 0.0;
-        state_inside.down_book.best_ask = Some(0.1);
+        state_inside.down_book.best_ask = Some(0.25);
 
         tx_quote
             .send(QuoteTick {
@@ -537,13 +609,14 @@ mod tests {
         let cmd = msg.expect("expected completion command");
         assert_eq!(cmd.condition_id, identity.condition_id);
         assert_eq!(cmd.token_id, identity.token_down);
-        assert!(cmd.p_max >= 0.1);
+        assert_eq!(cmd.side, Side::Buy);
+        assert!(cmd.p_max >= 0.25);
 
         let mut state_outside = MarketState::new(identity.clone(), now_ms + 60_000);
-        state_outside.inventory.up.shares = 1.0;
-        state_outside.inventory.up.notional_usdc = 0.2;
+        state_outside.inventory.up.shares = 0.25;
+        state_outside.inventory.up.notional_usdc = 0.05;
         state_outside.inventory.down.shares = 0.0;
-        state_outside.down_book.best_ask = Some(0.1);
+        state_outside.down_book.best_ask = Some(0.25);
 
         tx_quote
             .send(QuoteTick {
@@ -557,9 +630,29 @@ mod tests {
         let suppressed = timeout(Duration::from_millis(100), rx_completion.recv()).await;
         assert!(suppressed.is_err(), "expected no completion outside window");
 
+        let mut state_severe = MarketState::new(identity.clone(), now_ms + 60_000);
+        state_severe.inventory.up.shares = 1.0;
+        state_severe.inventory.up.notional_usdc = 0.2;
+        state_severe.inventory.down.shares = 0.0;
+        state_severe.down_book.best_ask = Some(0.25);
+
+        tx_quote
+            .send(QuoteTick {
+                slug: identity.slug.clone(),
+                now_ms,
+                state: state_severe,
+            })
+            .await
+            .expect("send quote tick severe outside window");
+
+        let msg = timeout(Duration::from_millis(200), rx_completion.recv())
+            .await
+            .expect("completion command timeout");
+        assert!(msg.is_some(), "expected completion when severe outside window");
+
         let mut state_above = MarketState::new(identity, now_ms + 30_000);
         state_above.inventory.up.shares = 1.0;
-        state_above.inventory.up.notional_usdc = 0.9;
+        state_above.inventory.up.notional_usdc = 0.6;
         state_above.inventory.down.shares = 0.0;
         state_above.down_book.best_ask = Some(0.9);
 
@@ -580,5 +673,195 @@ mod tests {
 
         drop(tx_quote);
         let _ = handle.await;
+    }
+
+    fn make_state_for_safety() -> MarketState {
+        let identity = MarketIdentity {
+            slug: "btc-15m-safety".to_string(),
+            interval_start_ts: 0,
+            interval_end_ts: 0,
+            condition_id: "cond".to_string(),
+            token_up: "UP".to_string(),
+            token_down: "DOWN".to_string(),
+            active: true,
+            closed: false,
+            accepting_orders: true,
+            restricted: false,
+        };
+        MarketState::new(identity, 10_000_000)
+    }
+
+    #[test]
+    fn final_safety_clears_one_sided_when_paired() {
+        let state = make_state_for_safety();
+        let cfg = TradingConfig::default();
+        let mut desired = vec![DesiredOrder {
+            token_id: state.identity.token_up.clone(),
+            level: 0,
+            price: 0.25,
+            size: 1.0,
+            post_only: true,
+            tif: TimeInForce::Gtc,
+        }];
+
+        let pruned = enforce_final_safety(&mut desired, &state, &cfg);
+        assert!(pruned, "expected safety prune to trigger");
+        assert!(desired.is_empty(), "expected one-sided desired to be cleared");
+    }
+
+    #[test]
+    fn final_safety_enforces_missing_side_only_when_unpaired() {
+        let mut state = make_state_for_safety();
+        state.inventory.up.shares = 1.0;
+        state.inventory.up.notional_usdc = 0.2;
+        state.inventory.down.shares = 0.0;
+
+        let cfg = TradingConfig::default();
+        let mut desired = vec![
+            DesiredOrder {
+                token_id: state.identity.token_up.clone(),
+                level: 0,
+                price: 0.25,
+                size: 1.0,
+                post_only: true,
+                tif: TimeInForce::Gtc,
+            },
+            DesiredOrder {
+                token_id: state.identity.token_down.clone(),
+                level: 0,
+                price: 0.25,
+                size: 1.0,
+                post_only: true,
+                tif: TimeInForce::Gtc,
+            },
+        ];
+
+        let pruned = enforce_final_safety(&mut desired, &state, &cfg);
+        assert!(pruned, "expected safety prune to trigger");
+        assert!(
+            desired.iter().all(|o| o.token_id == state.identity.token_down),
+            "expected only missing-side orders to remain"
+        );
+    }
+
+    #[test]
+    fn final_safety_removes_sub_floor_orders() {
+        let state = make_state_for_safety();
+        let cfg = TradingConfig::default(); // min_quote_price=0.20
+
+        let mut desired = vec![
+            DesiredOrder {
+                token_id: state.identity.token_up.clone(),
+                level: 0,
+                price: cfg.min_quote_price - 0.01,
+                size: 1.0,
+                post_only: true,
+                tif: TimeInForce::Gtc,
+            },
+            DesiredOrder {
+                token_id: state.identity.token_down.clone(),
+                level: 0,
+                price: cfg.min_quote_price + 0.05,
+                size: 1.0,
+                post_only: true,
+                tif: TimeInForce::Gtc,
+            },
+        ];
+
+        let pruned = enforce_final_safety(&mut desired, &state, &cfg);
+        assert!(pruned, "expected safety prune to trigger");
+        assert!(
+            desired.is_empty(),
+            "expected paired inventory + sub-floor removal to clear one-sided desired"
+        );
+    }
+
+    #[test]
+    fn market_budget_prune_can_create_one_sided_and_final_safety_clears() {
+        let state = make_state_for_safety();
+        let mut cfg = TradingConfig::default();
+        cfg.max_usdc_exposure_per_market = 0.60;
+
+        let mut desired = vec![
+            DesiredOrder {
+                token_id: state.identity.token_up.clone(),
+                level: 0,
+                price: 0.49,
+                size: 1.0,
+                post_only: true,
+                tif: TimeInForce::Gtc,
+            },
+            DesiredOrder {
+                token_id: state.identity.token_down.clone(),
+                level: 0,
+                price: 0.49,
+                size: 1.0,
+                post_only: true,
+                tif: TimeInForce::Gtc,
+            },
+        ];
+
+        let budget_pruned = enforce_market_budget(&mut desired, &state, &cfg);
+        assert!(budget_pruned, "expected market budget prune to trigger");
+        assert_eq!(desired.len(), 1, "expected budget prune to leave one order");
+
+        let safety_pruned = enforce_final_safety(&mut desired, &state, &cfg);
+        assert!(safety_pruned, "expected final safety prune to trigger");
+        assert!(desired.is_empty(), "expected one-sided desired to be cleared");
+    }
+
+    #[test]
+    fn alpha_cap_below_floor_results_in_no_quotes_when_unpaired() {
+        let now_ms = 1_000;
+        let mut state = make_state_for_safety();
+        // Unpaired: excess=UP, missing=DOWN.
+        state.inventory.up.shares = 1.0;
+        state.inventory.up.notional_usdc = 0.3;
+        state.inventory.down.shares = 0.0;
+
+        state.up_book.best_bid = Some(0.50);
+        state.up_book.best_ask = Some(0.51);
+        state.up_book.tick_size = 0.01;
+        state.down_book.best_bid = Some(0.50);
+        state.down_book.best_ask = Some(0.51);
+        state.down_book.tick_size = 0.01;
+
+        let trading = TradingConfig::default(); // min_quote_price=0.20
+        state.alpha.target_total = 0.99;
+        state.alpha.cap_up = 0.99;
+        // Missing side cap below floor => cannot quote missing side.
+        state.alpha.cap_down = 0.19;
+        state.alpha.size_scalar = 1.0;
+
+        let mut desired = crate::strategy::quote_engine::build_desired_orders(&state, &trading, now_ms);
+        assert!(
+            desired.iter().any(|o| o.token_id == state.identity.token_up),
+            "expected quote_engine to produce excess-side orders before pairing enforcement"
+        );
+        assert!(
+            !desired.iter().any(|o| o.token_id == state.identity.token_down),
+            "expected quote_engine to produce no missing-side orders when cap below floor"
+        );
+
+        crate::strategy::risk::adjust_for_inventory(
+            &mut desired,
+            &state,
+            &InventoryConfig::default(),
+            now_ms,
+        );
+        crate::strategy::risk::apply_skew_repair_pricing(
+            &mut desired,
+            &state,
+            &trading,
+            &InventoryConfig::default(),
+            &CompletionConfig::default(),
+            now_ms,
+        );
+        enforce_final_safety(&mut desired, &state, &trading);
+
+        assert!(
+            desired.is_empty(),
+            "expected no maker quotes when unpaired and missing-side cap is below floor"
+        );
     }
 }

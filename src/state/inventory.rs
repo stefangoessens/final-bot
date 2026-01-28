@@ -21,6 +21,28 @@ impl InventorySide {
         self.notional_usdc += price * shares;
     }
 
+    pub fn apply_sell_fill(&mut self, shares: f64) {
+        if !shares.is_finite() || shares <= 0.0 {
+            return;
+        }
+        if !self.shares.is_finite() || self.shares <= 0.0 {
+            return;
+        }
+
+        let qty = shares.min(self.shares).max(0.0);
+        if qty <= 0.0 {
+            return;
+        }
+
+        let avg_cost = self.notional_usdc / self.shares;
+        self.shares = (self.shares - qty).max(0.0);
+        self.notional_usdc = (self.notional_usdc - avg_cost * qty).max(0.0);
+        if self.shares <= 0.0 {
+            self.shares = 0.0;
+            self.notional_usdc = 0.0;
+        }
+    }
+
     pub fn apply_merge(&mut self, shares: f64) {
         if shares <= 0.0 || self.shares <= 0.0 {
             return;
@@ -60,6 +82,14 @@ impl InventoryState {
         match side {
             TokenSide::Up => self.up.apply_buy_fill(price, shares),
             TokenSide::Down => self.down.apply_buy_fill(price, shares),
+        }
+        self.last_trade_ms = ts_ms;
+    }
+
+    pub fn apply_sell_fill(&mut self, side: TokenSide, shares: f64, ts_ms: i64) {
+        match side {
+            TokenSide::Up => self.up.apply_sell_fill(shares),
+            TokenSide::Down => self.down.apply_sell_fill(shares),
         }
         self.last_trade_ms = ts_ms;
     }

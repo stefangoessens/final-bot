@@ -926,6 +926,7 @@ fn apply_user_order_update(
         let fill = if delta > 0.0 && price.is_finite() && price > 0.0 {
             Some(FillEvent {
                 token_id: live.token_id.clone(),
+                side: crate::state::state_manager::OrderSide::Buy,
                 price,
                 shares: delta,
                 ts_ms: update.ts_ms,
@@ -2007,6 +2008,7 @@ mod tests {
         let update = UserOrderUpdate {
             order_id: "order-1".to_string(),
             token_id: "token".to_string(),
+            side: None,
             price: Some(0.50),
             original_size: Some(10.0),
             size_matched: Some(5.0),
@@ -2342,6 +2344,7 @@ mod tests {
         let update = UserOrderUpdate {
             order_id: "order-1".to_string(),
             token_id: "token".to_string(),
+            side: None,
             price: Some(0.50),
             original_size: Some(10.0),
             size_matched: Some(10.0),
@@ -2381,6 +2384,7 @@ mod tests {
             UserOrderUpdate {
                 order_id: "order-unknown".to_string(),
                 token_id: "token-tracked".to_string(),
+                side: None,
                 price: None,
                 original_size: None,
                 size_matched: None,
@@ -2421,6 +2425,7 @@ mod tests {
             UserOrderUpdate {
                 order_id: "order-unknown".to_string(),
                 token_id: "token-untracked".to_string(),
+                side: None,
                 price: None,
                 original_size: None,
                 size_matched: None,
@@ -2510,6 +2515,7 @@ mod tests {
         let update = UserOrderUpdate {
             order_id: "order-old".to_string(),
             token_id: "token-a".to_string(),
+            side: None,
             price: None,
             original_size: None,
             size_matched: None,
@@ -2549,6 +2555,7 @@ mod tests {
         let update = UserOrderUpdate {
             order_id: "order-new".to_string(),
             token_id: "token-b".to_string(),
+            side: None,
             price: Some(0.47),
             original_size: Some(6.0),
             size_matched: Some(2.0),
@@ -2644,6 +2651,7 @@ mod tests {
         let update = UserOrderUpdate {
             order_id: "order-1".to_string(),
             token_id: "token".to_string(),
+            side: None,
             price: None,
             original_size: None,
             size_matched: None,

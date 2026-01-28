@@ -82,6 +82,16 @@ Task status:
 - [x] W10.4 Execution: enforce max_orders_per_min (post limiter)
 - [x] W10.5 Completion: pre-completion cancel sweep (REST active-orders cancel)
 - [x] W10.6 Risk: hard per-market USDC exposure cap (inventory + open orders)
+- [x] W10.7 Risk: fill-triggered QuoteTick (fast cancel/repair)
+- [x] W10.8 Strategy: 20c quote floor (pause if either outcome < floor)
+- [x] W10.9 Strategy: strict pairing + skew-repair pricing + early completion
+- [x] W10.10 Strategy: engine safety-net filter (post-rewards/budget)
+- [x] W10.11 Config: hard-enforce 20c quote floor invariant
+- [x] W10.12 QuoteEngine: remove epsilon from hard-floor checks + tick-size edge tests
+- [x] W10.13 StateManager: fill-trigger QuoteTick throttle only on successful send (+ optional retry)
+- [x] W10.14 Risk/Engine tests: unpaired with missing/empty book edge cases
+- [x] W10.15 Quote/Risk tests: alpha cap below floor interaction coverage
+- [x] W10.16 Ops: review bundle script + include correct files for reviewers
 
 ## Ops (ad hoc)
 - [x] O1 AWS env template: derive API creds + proxy-safe wallet

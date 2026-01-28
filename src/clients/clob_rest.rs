@@ -378,6 +378,7 @@ impl ClobRestClient {
     pub async fn build_completion_order(
         &self,
         token_id: &str,
+        side: Side,
         shares: f64,
         p_max: f64,
         order_type: CompletionOrderType,
@@ -395,15 +396,15 @@ impl ClobRestClient {
         inner.client.set_fee_rate_bps(token_id, fee_rate_bps as u32);
 
         // NOTE: Completion is modeled as a marketable limit order (FAK/FOK) with an explicit
-        // cap price `p_max`. This avoids any ambiguity around "market order" amount units and
-        // targets an exact share delta.
+        // limit price `p_max` (cap for buys / floor for sells). This avoids any ambiguity around
+        // "market order" amount units and targets an exact share delta.
         let signable = inner
             .client
             .limit_order()
             .token_id(token_id)
             .price(p_max)
             .size(shares)
-            .side(Side::Buy)
+            .side(side)
             .order_type(map_completion_order_type(order_type))
             .post_only(false)
             .build()
@@ -1117,7 +1118,7 @@ mod tests {
         };
 
         let signed = rest
-            .build_completion_order("123", 10.0, 0.35, CompletionOrderType::Fak, now_ms())
+            .build_completion_order("123", Side::Buy, 10.0, 0.35, CompletionOrderType::Fak, now_ms())
             .await
             .expect("build completion order");
 
@@ -1128,5 +1129,18 @@ mod tests {
         assert_eq!(signed.order.feeRateBps, U256::from(12u64));
         assert_eq!(signed.order.takerAmount, U256::from(10_000_000u64));
         assert_eq!(signed.order.makerAmount, U256::from(3_500_000u64));
+
+        let signed_sell = rest
+            .build_completion_order("123", Side::Sell, 10.0, 0.35, CompletionOrderType::Fak, now_ms())
+            .await
+            .expect("build completion sell order");
+
+        assert_eq!(signed_sell.order.tokenId, token_id);
+        assert_eq!(signed_sell.order.side, Side::Sell as u8);
+        assert_eq!(signed_sell.order_type, SdkOrderType::FAK);
+        assert_eq!(signed_sell.post_only, Some(false));
+        assert_eq!(signed_sell.order.feeRateBps, U256::from(12u64));
+        assert_eq!(signed_sell.order.makerAmount, U256::from(10_000_000u64));
+        assert_eq!(signed_sell.order.takerAmount, U256::from(3_500_000u64));
     }
 }

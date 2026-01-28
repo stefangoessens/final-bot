@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use futures_util::future::BoxFuture;
 use polymarket_client_sdk::clob::types::response::OpenOrderResponse;
+use polymarket_client_sdk::clob::types::Side;
 use serde_json::json;
 use tokio::sync::mpsc::Receiver;
 
@@ -24,6 +25,7 @@ trait CompletionRestClient: Send + Sync {
     fn build_completion_order(
         &self,
         token_id: String,
+        side: Side,
         shares: f64,
         p_max: f64,
         order_type: crate::config::CompletionOrderType,
@@ -52,6 +54,7 @@ impl CompletionRestClient for ClobRestClient {
     fn build_completion_order(
         &self,
         token_id: String,
+        side: Side,
         shares: f64,
         p_max: f64,
         order_type: crate::config::CompletionOrderType,
@@ -60,7 +63,7 @@ impl CompletionRestClient for ClobRestClient {
         let client = self.clone();
         Box::pin(async move {
             client
-                .build_completion_order(&token_id, shares, p_max, order_type, now_ms)
+                .build_completion_order(&token_id, side, shares, p_max, order_type, now_ms)
                 .await
         })
     }
@@ -118,6 +121,7 @@ impl CompletionExecutor {
                     target: "completion_executor",
                     slug = %cmd.slug,
                     token_id = %cmd.token_id,
+                    side = ?cmd.side,
                     p_max = cmd.p_max,
                     shares = cmd.shares,
                     order_type = ?cmd.order_type,
@@ -131,6 +135,7 @@ impl CompletionExecutor {
                     target: "completion_executor",
                     slug = %cmd.slug,
                     token_id = %cmd.token_id,
+                    side = ?cmd.side,
                     p_max = cmd.p_max,
                     shares = cmd.shares,
                     order_type = ?cmd.order_type,
@@ -154,6 +159,7 @@ impl CompletionExecutor {
                 .rest
                 .build_completion_order(
                     cmd.token_id.clone(),
+                    cmd.side,
                     cmd.shares,
                     cmd.p_max,
                     cmd.order_type,
@@ -203,6 +209,7 @@ impl CompletionExecutor {
                     target: "completion_executor",
                     slug = %cmd.slug,
                     token_id = %cmd.token_id,
+                    side = ?cmd.side,
                     p_max = cmd.p_max,
                     shares = cmd.shares,
                     order_type = ?cmd.order_type,
@@ -216,6 +223,7 @@ impl CompletionExecutor {
                     target: "completion_executor",
                     slug = %cmd.slug,
                     token_id = %cmd.token_id,
+                    side = ?cmd.side,
                     p_max = cmd.p_max,
                     shares = cmd.shares,
                     order_type = ?cmd.order_type,
@@ -300,6 +308,7 @@ fn log_completion_result(
     let payload = json!({
         "slug": cmd.slug,
         "token_id": cmd.token_id,
+        "side": format!("{:?}", cmd.side),
         "shares": cmd.shares,
         "p_max": cmd.p_max,
         "order_type": format!("{:?}", cmd.order_type),
@@ -333,6 +342,7 @@ mod tests {
     use tokio::time::{timeout, Duration};
 
     use crate::config::CompletionOrderType;
+    use polymarket_client_sdk::clob::types::Side;
 
     #[test]
     fn rate_limit_suppresses_within_window_per_slug() {
@@ -421,6 +431,7 @@ mod tests {
         fn build_completion_order(
             &self,
             _token_id: String,
+            _side: Side,
             _shares: f64,
             _p_max: f64,
             _order_type: CompletionOrderType,
@@ -495,6 +506,7 @@ mod tests {
             slug: "btc-15m-test".to_string(),
             condition_id: "cond".to_string(),
             token_id: "token".to_string(),
+            side: Side::Buy,
             shares: 1.0,
             p_max: 0.5,
             order_type: CompletionOrderType::Fok,
@@ -549,6 +561,7 @@ mod tests {
             slug: "btc-15m-test".to_string(),
             condition_id: "cond".to_string(),
             token_id: "token".to_string(),
+            side: Side::Buy,
             shares: 1.0,
             p_max: 0.5,
             order_type: CompletionOrderType::Fok,
@@ -588,6 +601,7 @@ mod tests {
             slug: "btc-15m-test".to_string(),
             condition_id: "cond".to_string(),
             token_id: "token".to_string(),
+            side: Side::Buy,
             shares: 1.0,
             p_max: 0.5,
             order_type: CompletionOrderType::Fok,
