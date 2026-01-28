@@ -14,7 +14,7 @@ use crate::error::{BotError, BotResult};
 use crate::execution::batch;
 use crate::persistence::LogEvent;
 use crate::state::order_state::{LiveOrder, OrderStatus};
-use crate::state::state_manager::{AppEvent, OrderUpdate};
+use crate::state::state_manager::{AppEvent, FillEvent, OrderUpdate, UserWsUpdate};
 use crate::strategy::engine::ExecCommand;
 use crate::strategy::DesiredOrder;
 use crate::time::BTC_15M_INTERVAL_S;
@@ -499,8 +499,11 @@ impl OrderManager {
                 tracked_slug = Some(slug.clone());
             }
 
-            if let Some(order_update) = apply_user_order_update(cache, &update, slug) {
-                emit_order_update(tx_events, order_update);
+            if let Some(applied) = apply_user_order_update(cache, &update, slug) {
+                if let Some(fill) = applied.fill {
+                    emit_fill_update(tx_events, fill);
+                }
+                emit_order_update(tx_events, applied.order_update);
                 return;
             }
         }
@@ -621,6 +624,12 @@ impl OrderManager {
             }
         });
     }
+}
+
+#[derive(Debug)]
+struct AppliedUserOrderUpdate {
+    order_update: OrderUpdate,
+    fill: Option<FillEvent>,
 }
 
 async fn execute_cancels(
@@ -755,7 +764,11 @@ async fn execute_posts(
         log_post_result(log_tx, slug, &outcome, now_ms);
 
         for (post, result) in post_batch.into_iter().zip(outcome.results.iter()) {
-            if let Some(order_id) = result.order_id.as_ref() {
+            if result.error.is_none() && result.order_id.is_some() {
+                let order_id = result
+                    .order_id
+                    .as_ref()
+                    .expect("checked order_id.is_some");
                 let live = LiveOrder {
                     order_id: order_id.clone(),
                     token_id: post.token_id.clone(),
@@ -793,6 +806,7 @@ async fn execute_posts(
                     level = post.level,
                     price = post.price,
                     size = post.size,
+                    order_id = result.order_id.as_deref().unwrap_or(""),
                     error = result.error.as_deref().unwrap_or("unknown"),
                     action = "post_failed",
                     "order post failed"
@@ -812,10 +826,11 @@ fn apply_user_order_update(
     cache: &mut MarketOrderCache,
     update: &UserOrderUpdate,
     slug: &str,
-) -> Option<OrderUpdate> {
+) -> Option<AppliedUserOrderUpdate> {
     let key = cache.key_for_order_id(&update.order_id)?;
 
     if let Some(mut live) = cache.remove_live_by_key(&key) {
+        let old_matched = (live.size - live.remaining).max(0.0);
         if matches!(update.update_type, UserOrderUpdateType::Cancellation) {
             tracing::info!(
                 target: "order_manager",
@@ -826,12 +841,15 @@ fn apply_user_order_update(
                 action = "user_cancel",
                 "order canceled via user update"
             );
-            return Some(OrderUpdate::Remove {
-                slug: slug.to_string(),
-                token_id: live.token_id.clone(),
-                level: live.level,
-                order_id: live.order_id.clone(),
-                ts_ms: update.ts_ms,
+            return Some(AppliedUserOrderUpdate {
+                order_update: OrderUpdate::Remove {
+                    slug: slug.to_string(),
+                    token_id: live.token_id.clone(),
+                    level: live.level,
+                    order_id: live.order_id.clone(),
+                    ts_ms: update.ts_ms,
+                },
+                fill: None,
             });
         }
         if matches!(update.update_type, UserOrderUpdateType::Rejection) {
@@ -844,12 +862,15 @@ fn apply_user_order_update(
                 action = "user_reject",
                 "order rejected via user update"
             );
-            return Some(OrderUpdate::Remove {
-                slug: slug.to_string(),
-                token_id: live.token_id.clone(),
-                level: live.level,
-                order_id: live.order_id.clone(),
-                ts_ms: update.ts_ms,
+            return Some(AppliedUserOrderUpdate {
+                order_update: OrderUpdate::Remove {
+                    slug: slug.to_string(),
+                    token_id: live.token_id.clone(),
+                    level: live.level,
+                    order_id: live.order_id.clone(),
+                    ts_ms: update.ts_ms,
+                },
+                fill: None,
             });
         }
 
@@ -891,6 +912,18 @@ fn apply_user_order_update(
             OrderStatus::Open
         };
 
+        let delta = (matched - old_matched).max(0.0);
+        let fill = if delta > 0.0 && price.is_finite() && price > 0.0 {
+            Some(FillEvent {
+                token_id: live.token_id.clone(),
+                price,
+                shares: delta,
+                ts_ms: update.ts_ms,
+            })
+        } else {
+            None
+        };
+
         if remaining <= 0.0 {
             tracing::info!(
                 target: "order_manager",
@@ -902,12 +935,15 @@ fn apply_user_order_update(
                 action = "user_filled",
                 "order fully filled via user update"
             );
-            return Some(OrderUpdate::Remove {
-                slug: slug.to_string(),
-                token_id: live.token_id.clone(),
-                level: live.level,
-                order_id: live.order_id.clone(),
-                ts_ms: update.ts_ms,
+            return Some(AppliedUserOrderUpdate {
+                order_update: OrderUpdate::Remove {
+                    slug: slug.to_string(),
+                    token_id: live.token_id.clone(),
+                    level: live.level,
+                    order_id: live.order_id.clone(),
+                    ts_ms: update.ts_ms,
+                },
+                fill,
             });
         }
 
@@ -923,9 +959,12 @@ fn apply_user_order_update(
             "order updated via user update"
         );
         cache.insert_live(live.clone());
-        return Some(OrderUpdate::Upsert {
-            slug: slug.to_string(),
-            order: live,
+        return Some(AppliedUserOrderUpdate {
+            order_update: OrderUpdate::Upsert {
+                slug: slug.to_string(),
+                order: live,
+            },
+            fill,
         });
     }
 
@@ -989,6 +1028,28 @@ fn emit_order_update(tx_events: Option<&Sender<AppEvent>>, update: OrderUpdate) 
                 tracing::warn!(
                     target: "order_manager",
                     "state manager channel closed; dropping order update"
+                );
+            }
+        }
+    }
+}
+
+fn emit_fill_update(tx_events: Option<&Sender<AppEvent>>, fill: FillEvent) {
+    let Some(tx) = tx_events else {
+        return;
+    };
+    if let Err(err) = tx.try_send(AppEvent::UserWsUpdate(UserWsUpdate::Fill(fill))) {
+        match err {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                tracing::debug!(
+                    target: "order_manager",
+                    "state manager channel full; dropping fill update"
+                );
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                tracing::warn!(
+                    target: "order_manager",
+                    "state manager channel closed; dropping fill update"
                 );
             }
         }
@@ -1965,7 +2026,13 @@ mod tests {
             update_type: UserOrderUpdateType::Update,
         };
 
-        assert!(apply_user_order_update(&mut cache, &update, &future_slug()).is_some());
+        let applied =
+            apply_user_order_update(&mut cache, &update, &future_slug()).expect("applied");
+        let fill = applied.fill.expect("expected fill delta");
+        assert_eq!(fill.token_id, "token");
+        assert!((fill.price - 0.50).abs() < 1e-12);
+        assert!((fill.shares - 5.0).abs() < 1e-12);
+        assert_eq!(fill.ts_ms, 1_000);
 
         let desired = vec![DesiredOrder {
             token_id: "token".to_string(),
@@ -2549,6 +2616,27 @@ mod tests {
         assert!(cache.key_for_order_id("order-accept").is_some());
         assert_eq!(cache.live.len(), 1);
         assert_cache_consistent(&cache);
+    }
+
+    #[tokio::test]
+    async fn reject_with_order_id_does_not_enter_cache() {
+        let mock = MockRestClient::new();
+        mock.push_post_outcome(vec![PostResult {
+            order_id: Some("order-reject".to_string()),
+            error: Some("rejected".to_string()),
+        }]);
+
+        let slug = future_slug();
+        let mut cache = MarketOrderCache::default();
+        let posts = vec![make_desired("token-a", 0, 0.41, 3.0)];
+
+        let outcome = execute_posts(&mock, &slug, &mut cache, posts, now_ms(), None, None)
+            .await
+            .expect("post ok");
+        assert_eq!(outcome.results.len(), 1);
+
+        assert!(cache.key_for_order_id("order-reject").is_none());
+        assert!(cache.live.is_empty());
     }
 
     #[test]

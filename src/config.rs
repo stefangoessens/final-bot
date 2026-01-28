@@ -225,6 +225,8 @@ pub struct TradingConfig {
     pub target_total_max: f64,
 
     pub cutoff_seconds: i64,
+    /// Hard per-market USDC exposure cap (inventory cost + open order notional).
+    pub max_usdc_exposure_per_market: f64,
 
     pub ladder_levels: usize,
     pub ladder_step_ticks: u64,
@@ -256,6 +258,7 @@ impl Default for TradingConfig {
             target_total_min: 0.97,
             target_total_max: 0.99,
             cutoff_seconds: 60,
+            max_usdc_exposure_per_market: 10.0,
             ladder_levels: 2,
             ladder_step_ticks: 1,
             size_decay: 0.6,
@@ -303,6 +306,14 @@ impl TradingConfig {
             return Err(BotError::Config(format!(
                 "trading.ladder_levels must be >=2, got {}",
                 self.ladder_levels
+            )));
+        }
+        if !self.max_usdc_exposure_per_market.is_finite()
+            || self.max_usdc_exposure_per_market <= 0.0
+        {
+            return Err(BotError::Config(format!(
+                "trading.max_usdc_exposure_per_market must be >0, got {}",
+                self.max_usdc_exposure_per_market
             )));
         }
         if self.min_order_size_shares <= 0.0 {

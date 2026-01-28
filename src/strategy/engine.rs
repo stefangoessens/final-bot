@@ -7,6 +7,7 @@ use crate::config::{CompletionConfig, InventoryConfig, RewardsConfig, TradingCon
 use crate::persistence::LogEvent;
 use crate::state::market_state::MarketState;
 use crate::state::state_manager::QuoteTick;
+use crate::strategy::fee;
 use crate::strategy::quote_engine::build_desired_orders;
 use crate::strategy::reward_engine::{apply_reward_hints, RewardApplySummary, RewardsSnapshot};
 use crate::strategy::risk::{adjust_for_inventory, should_taker_complete};
@@ -102,9 +103,51 @@ impl StrategyEngine {
             let mut desired = build_desired_orders(&state, &self.trading, now_ms);
             adjust_for_inventory(&mut desired, &state, &self.inventory, now_ms);
 
+            let cap_usdc = self.trading.max_usdc_exposure_per_market;
+            let inv_cost_usdc =
+                (state.inventory.up.notional_usdc + state.inventory.down.notional_usdc).max(0.0);
+            let remaining_budget_usdc = if cap_usdc.is_finite() && cap_usdc > 0.0 {
+                (cap_usdc - inv_cost_usdc).max(0.0)
+            } else {
+                f64::INFINITY
+            };
+
+            if remaining_budget_usdc <= 0.0 {
+                tracing::warn!(
+                    target: "strategy_engine",
+                    slug = %slug,
+                    cap_usdc = cap_usdc,
+                    inventory_cost_usdc = inv_cost_usdc,
+                    "market USDC budget exhausted; sending empty desired orders"
+                );
+                if tx_exec
+                    .send(ExecCommand {
+                        slug,
+                        desired: Vec::new(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+
             if let Some(taker_action) =
                 should_taker_complete(&state, &self.inventory, &self.completion, now_ms)
             {
+                let completion_cost = taker_action.shares * taker_action.p_max
+                    + fee::taker_fee_usdc(taker_action.shares, taker_action.p_max);
+                if completion_cost > remaining_budget_usdc + 1e-12 {
+                    tracing::warn!(
+                        target: "strategy_engine",
+                        slug = %slug,
+                        token_id = %taker_action.token_id,
+                        completion_cost_usdc = completion_cost,
+                        remaining_budget_usdc,
+                        "taker completion suppressed by market USDC budget"
+                    );
+                } else {
                 tracing::info!(
                     target: "strategy_engine",
                     slug = %slug,
@@ -144,6 +187,7 @@ impl StrategyEngine {
 
                 log_completion_command(&log_tx, &slug, now_ms, &taker_action);
                 continue;
+                }
             }
 
             let reward_snapshot = self
@@ -158,9 +202,14 @@ impl StrategyEngine {
                 reward_snapshot.as_ref(),
             );
 
+            let budget_pruned = enforce_market_budget(&mut desired, &state, &self.trading);
+
             log_desired_summary(&slug, &state, &desired);
             log_desired_orders(&log_tx, &slug, now_ms, &desired);
             log_reward_summary(&log_tx, &slug, now_ms, &reward_summary);
+            if budget_pruned {
+                log_budget_prune(&log_tx, &slug, now_ms, &state, &desired, &self.trading);
+            }
 
             if tx_exec
                 .send(ExecCommand {
@@ -174,6 +223,61 @@ impl StrategyEngine {
             }
         }
     }
+}
+
+fn enforce_market_budget(
+    desired: &mut Vec<DesiredOrder>,
+    state: &MarketState,
+    cfg: &TradingConfig,
+) -> bool {
+    let cap = cfg.max_usdc_exposure_per_market;
+    if !cap.is_finite() || cap <= 0.0 {
+        return false;
+    }
+
+    let inv_cost = (state.inventory.up.notional_usdc + state.inventory.down.notional_usdc).max(0.0);
+    if inv_cost >= cap - 1e-12 {
+        if !desired.is_empty() {
+            desired.clear();
+            return true;
+        }
+        return false;
+    }
+
+    let budget_open = (cap - inv_cost).max(0.0);
+    let mut total_open: f64 = desired
+        .iter()
+        .map(|o| o.price.max(0.0) * o.size.max(0.0))
+        .sum();
+
+    if total_open <= budget_open + 1e-12 {
+        return false;
+    }
+
+    // Prune the least important orders until within budget:
+    // 1) deepest level first (highest `level`)
+    // 2) within same level, largest notional first (price*size)
+    let mut pruned = false;
+    while total_open > budget_open + 1e-12 && !desired.is_empty() {
+        let mut worst_idx = 0usize;
+        let mut worst_key: (usize, f64) = (0, 0.0);
+        for (idx, order) in desired.iter().enumerate() {
+            let notional = order.price.max(0.0) * order.size.max(0.0);
+            let key = (order.level, notional);
+            if key > worst_key {
+                worst_key = key;
+                worst_idx = idx;
+            }
+        }
+        desired.swap_remove(worst_idx);
+        pruned = true;
+        total_open = desired
+            .iter()
+            .map(|o| o.price.max(0.0) * o.size.max(0.0))
+            .sum();
+    }
+
+    pruned
 }
 
 fn log_desired_summary(slug: &str, state: &MarketState, desired: &[DesiredOrder]) {
@@ -192,6 +296,38 @@ fn log_desired_summary(slug: &str, state: &MarketState, desired: &[DesiredOrder]
         down_size = ?top_down.map(|o| o.size),
         "desired orders"
     );
+}
+
+fn log_budget_prune(
+    log_tx: &Option<Sender<LogEvent>>,
+    slug: &str,
+    ts_ms: i64,
+    state: &MarketState,
+    desired: &[DesiredOrder],
+    cfg: &TradingConfig,
+) {
+    let Some(tx) = log_tx else {
+        return;
+    };
+
+    let inv_cost = (state.inventory.up.notional_usdc + state.inventory.down.notional_usdc).max(0.0);
+    let open_cost: f64 = desired
+        .iter()
+        .map(|o| o.price.max(0.0) * o.size.max(0.0))
+        .sum();
+
+    let payload = json!({
+        "slug": slug,
+        "cap_usdc": cfg.max_usdc_exposure_per_market,
+        "inventory_cost_usdc": inv_cost,
+        "desired_open_cost_usdc": open_cost,
+        "desired_count": desired.len(),
+    });
+    let _ = tx.try_send(LogEvent {
+        ts_ms,
+        event: "risk.market_budget_prune".to_string(),
+        payload,
+    });
 }
 
 fn top_level_order<'a>(desired: &'a [DesiredOrder], token_id: &str) -> Option<&'a DesiredOrder> {

@@ -93,7 +93,17 @@ pub fn update_alpha(
         regime_eval.fast_move,
     );
 
-    let q_up = compute_q_up(market_state, now_ms, drift_per_s, var_per_s);
+    // Guard against degenerate probabilities early in an interval when the EWMA has not yet
+    // accumulated enough samples (var_per_s ~ 0). FULL_SPEC 6.5 expects a min_var floor for q_up.
+    // Use `alpha_cfg.var_ref` as a conservative minimum variance scale *for probability only*.
+    let var_floor = alpha_cfg.var_ref.max(0.0);
+    let var_for_prob = if var_per_s.is_finite() {
+        var_per_s.max(var_floor)
+    } else {
+        var_floor
+    };
+
+    let q_up = compute_q_up(market_state, now_ms, drift_per_s, var_for_prob);
     let q_down = (1.0 - q_up).clamp(0.0, 1.0);
 
     let cap_up = if up_stale { 0.0 } else { q_up * target_total };

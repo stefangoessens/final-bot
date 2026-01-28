@@ -307,6 +307,17 @@ impl StateManager {
                         &self.trading_cfg,
                     );
 
+                    let (inventory_usdc, open_order_usdc, exposure_usdc) =
+                        market_exposure_usdc(state);
+                    let exposure_cap = self.trading_cfg.max_usdc_exposure_per_market;
+                    let exposure_over_cap = exposure_usdc > exposure_cap;
+                    self.metrics
+                        .set_market_exposure_usdc(&state.identity.slug, exposure_usdc);
+                    self.metrics
+                        .set_market_exposure_cap_usdc(&state.identity.slug, exposure_cap);
+                    self.metrics
+                        .set_market_exposure_over_cap(&state.identity.slug, exposure_over_cap);
+
                     let tradable = state.identity.active
                         && state.identity.accepting_orders
                         && !state.identity.closed;
@@ -325,6 +336,8 @@ impl StateManager {
                             "market_not_tradable: {}",
                             state.identity.slug
                         ));
+                    } else if exposure_over_cap {
+                        block_reason = Some("exposure_cap".to_string());
                     }
 
                     let alpha_ok = now_ms < state.cutoff_ts_ms && out.size_scalar > 0.0;
@@ -335,6 +348,18 @@ impl StateManager {
                         enabled_markets += 1;
                     } else if first_block_reason.is_none() {
                         first_block_reason = block_reason;
+                    }
+
+                    if exposure_over_cap {
+                        tracing::warn!(
+                            target: "risk",
+                            slug = %state.identity.slug,
+                            exposure_usdc,
+                            exposure_cap,
+                            inventory_usdc,
+                            open_order_usdc,
+                            "market exposure over cap; quoting disabled"
+                        );
                     }
 
                     tracing::debug!(
@@ -626,6 +651,23 @@ impl StateManager {
             && report.feeds.rtds_binance.status == "healthy";
         self.metrics.set_rtds_connected(rtds_connected);
     }
+}
+
+fn market_exposure_usdc(state: &MarketState) -> (f64, f64, f64) {
+    let inventory_usdc = (state.inventory.up.notional_usdc + state.inventory.down.notional_usdc)
+        .max(0.0);
+    let mut open_order_usdc = 0.0;
+    for order in state.orders.live.values() {
+        if !order.price.is_finite() || !order.remaining.is_finite() {
+            continue;
+        }
+        if order.remaining <= 0.0 {
+            continue;
+        }
+        open_order_usdc += order.price * order.remaining;
+    }
+    let total = inventory_usdc + open_order_usdc;
+    (inventory_usdc, open_order_usdc, total)
 }
 
 fn now_ms() -> i64 {
@@ -989,6 +1031,120 @@ mod tests {
         let state = sm.market_state("btc-updown-15m-0").unwrap();
         assert_eq!(state.alpha.size_scalar, 0.0);
         assert!(!state.quoting_enabled);
+    }
+
+    #[test]
+    fn market_exposure_includes_inventory_and_open_orders() {
+        let ops = OpsState::new(&AppConfig::default());
+        let mut sm = StateManager::new(
+            AlphaConfig::default(),
+            OracleConfig::default(),
+            TradingConfig::default(),
+            ops.health,
+            ops.metrics,
+        );
+        sm.apply_event(AppEvent::MarketDiscovered(make_identity()), 0);
+
+        sm.apply_event(
+            AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
+                token_id: "up".to_string(),
+                price: 0.5,
+                shares: 2.0,
+                ts_ms: 1_000,
+            })),
+            1_000,
+        );
+        sm.apply_event(
+            AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
+                token_id: "down".to_string(),
+                price: 0.25,
+                shares: 4.0,
+                ts_ms: 1_000,
+            })),
+            1_000,
+        );
+        sm.apply_event(
+            AppEvent::OrderUpdate(OrderUpdate::Upsert {
+                slug: "btc-updown-15m-0".to_string(),
+                order: LiveOrder {
+                    order_id: "order-1".to_string(),
+                    token_id: "up".to_string(),
+                    level: 0,
+                    price: 0.4,
+                    size: 5.0,
+                    remaining: 5.0,
+                    status: crate::state::order_state::OrderStatus::Open,
+                    last_update_ms: 1_100,
+                },
+            }),
+            1_100,
+        );
+
+        let state = sm.market_state("btc-updown-15m-0").unwrap();
+        let (inventory_usdc, open_order_usdc, total_usdc) = market_exposure_usdc(state);
+        assert!((inventory_usdc - 2.0).abs() < 1e-12, "inventory={inventory_usdc}");
+        assert!((open_order_usdc - 2.0).abs() < 1e-12, "open={open_order_usdc}");
+        assert!((total_usdc - 4.0).abs() < 1e-12, "total={total_usdc}");
+    }
+
+    #[test]
+    fn quoting_disabled_when_exposure_over_cap() {
+        let mut cfg = AppConfig::default();
+        cfg.trading.max_usdc_exposure_per_market = 1.0;
+        let ops = OpsState::new(&cfg);
+        let mut sm = StateManager::new(
+            AlphaConfig::default(),
+            OracleConfig::default(),
+            cfg.trading.clone(),
+            ops.health.clone(),
+            ops.metrics,
+        );
+        sm.apply_event(AppEvent::MarketDiscovered(make_identity()), 0);
+
+        sm.apply_event(
+            AppEvent::MarketWsUpdate(MarketWsUpdate {
+                token_id: "up".to_string(),
+                best_bid: Some(0.49),
+                best_ask: Some(0.51),
+                tick_size: Some(0.001),
+                ts_ms: 9_000,
+            }),
+            9_000,
+        );
+        sm.apply_event(
+            AppEvent::MarketWsUpdate(MarketWsUpdate {
+                token_id: "down".to_string(),
+                best_bid: Some(0.49),
+                best_ask: Some(0.51),
+                tick_size: Some(0.001),
+                ts_ms: 9_000,
+            }),
+            9_000,
+        );
+        sm.apply_event(
+            AppEvent::RTDSUpdate(RTDSUpdate {
+                source: RTDSSource::ChainlinkBtcUsd,
+                price: 40_000.0,
+                ts_ms: 9_000,
+            }),
+            9_000,
+        );
+        sm.apply_event(
+            AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
+                token_id: "up".to_string(),
+                price: 0.6,
+                shares: 2.0,
+                ts_ms: 9_050,
+            })),
+            9_050,
+        );
+
+        sm.apply_event(AppEvent::TimerTick { now_ms: 9_100 }, 9_100);
+
+        let state = sm.market_state("btc-updown-15m-0").unwrap();
+        assert!(!state.quoting_enabled);
+        let report = sm.health.report(9_100);
+        assert_eq!(report.quoting_block_reason, Some("exposure_cap".to_string()));
     }
 
     #[test]

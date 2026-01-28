@@ -23,6 +23,9 @@ pub struct Metrics {
     pub order_rejects_total: IntCounter,
     pub fills_total: IntCounter,
     pub unpaired_shares: GaugeVec,
+    pub market_exposure_usdc: GaugeVec,
+    pub market_exposure_cap_usdc: GaugeVec,
+    pub market_exposure_over_cap: GaugeVec,
     pub pnl_realized_usdc: Gauge,
     pub fee_paid_usdc: Counter,
     pub rebate_estimated_usdc: Counter,
@@ -70,6 +73,36 @@ impl Metrics {
             )
             .unwrap(),
         );
+        let market_exposure_usdc = register(
+            &registry,
+            GaugeVec::new(
+                prometheus::Opts::new(
+                    "market_exposure_usdc",
+                    "USDC exposure per market (inventory + open orders)",
+                ),
+                &["market_slug"],
+            )
+            .unwrap(),
+        );
+        let market_exposure_cap_usdc = register(
+            &registry,
+            GaugeVec::new(
+                prometheus::Opts::new("market_exposure_cap_usdc", "USDC exposure cap per market"),
+                &["market_slug"],
+            )
+            .unwrap(),
+        );
+        let market_exposure_over_cap = register(
+            &registry,
+            GaugeVec::new(
+                prometheus::Opts::new(
+                    "market_exposure_over_cap",
+                    "1 if market exposure exceeds cap else 0",
+                ),
+                &["market_slug"],
+            )
+            .unwrap(),
+        );
 
         let pnl_realized_usdc = register(
             &registry,
@@ -92,6 +125,9 @@ impl Metrics {
             order_rejects_total,
             fills_total,
             unpaired_shares,
+            market_exposure_usdc,
+            market_exposure_cap_usdc,
+            market_exposure_over_cap,
             pnl_realized_usdc,
             fee_paid_usdc,
             rebate_estimated_usdc,
@@ -152,6 +188,27 @@ impl Metrics {
         self.unpaired_shares
             .with_label_values(&[market_slug])
             .set(shares);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_market_exposure_usdc(&self, market_slug: &str, exposure: f64) {
+        self.market_exposure_usdc
+            .with_label_values(&[market_slug])
+            .set(exposure);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_market_exposure_cap_usdc(&self, market_slug: &str, cap: f64) {
+        self.market_exposure_cap_usdc
+            .with_label_values(&[market_slug])
+            .set(cap);
+    }
+
+    #[allow(dead_code)]
+    pub fn set_market_exposure_over_cap(&self, market_slug: &str, over_cap: bool) {
+        self.market_exposure_over_cap
+            .with_label_values(&[market_slug])
+            .set(if over_cap { 1.0 } else { 0.0 });
     }
 
     #[allow(dead_code)]

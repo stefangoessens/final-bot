@@ -10,3 +10,4 @@ logs/
 
 # OS / tooling
 Thumbs.db
+.env

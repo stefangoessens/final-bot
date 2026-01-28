@@ -279,13 +279,6 @@ impl UserWsLoop {
                     ts_ms = fill.ts_ms,
                     "fill"
                 );
-                if tx_events
-                    .send(AppEvent::UserWsUpdate(UserWsUpdate::Fill(fill)))
-                    .await
-                    .is_err()
-                {
-                    return Err(BotError::Other("event channel closed".to_string()));
-                }
             }
             Ok(None) => {
                 let order_update = match parse_order_event(text) {
