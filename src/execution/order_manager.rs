@@ -14,7 +14,7 @@ use crate::error::{BotError, BotResult};
 use crate::execution::batch;
 use crate::persistence::LogEvent;
 use crate::state::order_state::{LiveOrder, OrderStatus};
-use crate::state::state_manager::{AppEvent, FillEvent, OrderUpdate, UserWsUpdate};
+use crate::state::state_manager::{AppEvent, FillEvent, OrderUpdate};
 use crate::strategy::engine::ExecCommand;
 use crate::strategy::DesiredOrder;
 use crate::time::BTC_15M_INTERVAL_S;
@@ -500,9 +500,6 @@ impl OrderManager {
             }
 
             if let Some(applied) = apply_user_order_update(cache, &update, slug) {
-                if let Some(fill) = applied.fill {
-                    emit_fill_update(tx_events, fill);
-                }
                 emit_order_update(tx_events, applied.order_update);
                 return;
             }
@@ -1028,28 +1025,6 @@ fn emit_order_update(tx_events: Option<&Sender<AppEvent>>, update: OrderUpdate) 
                 tracing::warn!(
                     target: "order_manager",
                     "state manager channel closed; dropping order update"
-                );
-            }
-        }
-    }
-}
-
-fn emit_fill_update(tx_events: Option<&Sender<AppEvent>>, fill: FillEvent) {
-    let Some(tx) = tx_events else {
-        return;
-    };
-    if let Err(err) = tx.try_send(AppEvent::UserWsUpdate(UserWsUpdate::Fill(fill))) {
-        match err {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                tracing::debug!(
-                    target: "order_manager",
-                    "state manager channel full; dropping fill update"
-                );
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                tracing::warn!(
-                    target: "order_manager",
-                    "state manager channel closed; dropping fill update"
                 );
             }
         }

@@ -279,6 +279,16 @@ impl UserWsLoop {
                     ts_ms = fill.ts_ms,
                     "fill"
                 );
+                if let Err(err) = tx_events
+                    .send(AppEvent::UserWsUpdate(UserWsUpdate::Fill(fill)))
+                    .await
+                {
+                    tracing::warn!(
+                        target: "clob_ws_user",
+                        error = %err,
+                        "state manager channel closed; dropping fill update"
+                    );
+                }
             }
             Ok(None) => {
                 let order_update = match parse_order_event(text) {
@@ -980,5 +990,57 @@ mod tests {
         .await
         .expect("handle_text should not block")
         .expect("handle_text ok");
+    }
+
+    #[tokio::test]
+    async fn handle_text_forwards_trade_fills_to_state_manager() {
+        let loop_ = UserWsLoop::new(
+            "ws://127.0.0.1".to_string(),
+            "api_key".to_string(),
+            "api_secret".to_string(),
+            "api_passphrase".to_string(),
+            Vec::new(),
+            None,
+        );
+
+        let (tx_events, mut rx_events) = tokio::sync::mpsc::channel::<AppEvent>(8);
+
+        let raw = r#"{
+            "asset_id": "token",
+            "event_type": "trade",
+            "price": "0.57",
+            "size": "10",
+            "timestamp": "1672290701"
+        }"#;
+
+        loop_
+            .handle_text(raw, &tx_events, None, None)
+            .await
+            .expect("handle_text ok");
+
+        let first = timeout(Duration::from_millis(50), rx_events.recv())
+            .await
+            .expect("fill event should arrive")
+            .expect("channel open");
+        match first {
+            AppEvent::UserWsUpdate(UserWsUpdate::Fill(fill)) => {
+                assert_eq!(fill.token_id, "token");
+                assert!((fill.price - 0.57).abs() < 1e-12);
+                assert!((fill.shares - 10.0).abs() < 1e-12);
+                assert_eq!(fill.ts_ms, 1_672_290_701_000);
+            }
+            other => panic!("expected Fill update, got {other:?}"),
+        }
+
+        let second = timeout(Duration::from_millis(50), rx_events.recv())
+            .await
+            .expect("heartbeat event should arrive")
+            .expect("channel open");
+        match second {
+            AppEvent::UserWsUpdate(UserWsUpdate::Heartbeat { ts_ms }) => {
+                assert_eq!(ts_ms, 1_672_290_701_000);
+            }
+            other => panic!("expected Heartbeat update, got {other:?}"),
+        }
     }
 }

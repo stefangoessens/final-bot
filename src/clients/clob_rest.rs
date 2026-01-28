@@ -14,7 +14,7 @@ use polymarket_client_sdk::clob::types::response::{
     FeeRateResponse, OpenOrderResponse, Page, PostOrderResponse,
 };
 use polymarket_client_sdk::clob::types::{
-    OrderType as SdkOrderType, Side, SignatureType, SignedOrder,
+    OrderStatusType, OrderType as SdkOrderType, Side, SignatureType, SignedOrder,
 };
 use polymarket_client_sdk::clob::{Client as SdkClient, Config as SdkConfig};
 use polymarket_client_sdk::types::{Address, Decimal, B256, U256};
@@ -559,54 +559,96 @@ fn post_orders_result_from_responses(
     let response_len = responses.len();
     for (idx, resp) in responses.into_iter().enumerate() {
         let token_id = token_ids.get(idx).cloned().unwrap_or(None);
-        let mut error = None;
+        let order_id_trimmed = resp.order_id.trim();
+        let has_order_id = !order_id_trimmed.is_empty();
+        let normalized_error = resp
+            .error_msg
+            .as_deref()
+            .map(str::trim)
+            .filter(|msg| !msg.is_empty())
+            .map(|msg| msg.to_string());
 
-        if !resp.success {
-            error = Some(resp.error_msg.unwrap_or_else(|| "unknown error".into()));
-        } else if let Some(err) = resp.error_msg {
-            error = Some(err);
-        } else if resp.order_id.trim().is_empty() {
-            error = Some("missing order_id".to_string());
+        // Some API responses include `success=false` with an empty error message but still return an
+        // `order_id` and `status=LIVE`/`UNMATCHED`. Treat these as accepted to avoid hidden live
+        // orders causing exposure/cap drift. This matches observed live behavior on AWS.
+        let inconsistent_but_live = !resp.success
+            && normalized_error.is_none()
+            && has_order_id
+            && matches!(
+                resp.status,
+                OrderStatusType::Live | OrderStatusType::Unmatched | OrderStatusType::Matched
+            );
+
+        if inconsistent_but_live {
+            tracing::warn!(
+                target: "clob_rest",
+                idx,
+                token_id = ?token_id,
+                order_id = %resp.order_id,
+                status = ?resp.status,
+                success = resp.success,
+                action = "post_order_accept_inconsistent",
+                "post_orders returned success=false but no error; treating as accepted"
+            );
+            result.accepted.push(PostOrderAccepted {
+                idx,
+                order_id: resp.order_id,
+                token_id,
+            });
+            continue;
         }
 
-        match error {
-            Some(err) => {
-                let order_id = if resp.order_id.trim().is_empty() {
-                    None
-                } else {
-                    Some(resp.order_id)
-                };
-                tracing::warn!(
-                    target: "clob_rest",
-                    idx,
-                    token_id = ?token_id,
-                    order_id = order_id.as_deref().unwrap_or(""),
-                    error = %err,
-                    action = "post_order_reject",
-                    "order rejected"
-                );
-                result.rejected.push(PostOrderRejected {
-                    idx,
-                    error: err,
-                    order_id,
-                    token_id,
-                });
-            }
-            None => {
-                tracing::info!(
-                    target: "clob_rest",
-                    idx,
-                    token_id = ?token_id,
-                    order_id = %resp.order_id,
-                    action = "post_order_accept",
-                    "order accepted"
-                );
-                result.accepted.push(PostOrderAccepted {
-                    idx,
-                    order_id: resp.order_id,
-                    token_id,
-                });
-            }
+        let error = if !resp.success {
+            Some(
+                normalized_error.unwrap_or_else(|| format!("unknown error (success=false status={:?})", resp.status)),
+            )
+        } else if let Some(err) = normalized_error {
+            Some(err)
+        } else if !has_order_id {
+            Some("missing order_id".to_string())
+        } else {
+            None
+        };
+
+        if let Some(err) = error {
+            let order_id = if has_order_id {
+                Some(resp.order_id)
+            } else {
+                None
+            };
+            tracing::warn!(
+                target: "clob_rest",
+                idx,
+                token_id = ?token_id,
+                order_id = order_id.as_deref().unwrap_or(""),
+                status = ?resp.status,
+                success = resp.success,
+                error = %err,
+                action = "post_order_reject",
+                "order rejected"
+            );
+            result.rejected.push(PostOrderRejected {
+                idx,
+                error: err,
+                order_id,
+                token_id,
+            });
+        } else {
+            tracing::info!(
+                target: "clob_rest",
+                idx,
+                token_id = ?token_id,
+                order_id = %resp.order_id,
+                status = ?resp.status,
+                success = resp.success,
+                action = "post_order_accept",
+                "order accepted"
+            );
+            result.accepted.push(PostOrderAccepted {
+                idx,
+                order_id: resp.order_id,
+                token_id,
+            });
         }
     }
 
@@ -1004,6 +1046,28 @@ mod tests {
 
         assert_eq!(result.rejected[0].idx, 1);
         assert_eq!(result.rejected[0].error, "insufficient balance");
+    }
+
+    #[test]
+    fn post_orders_result_accepts_inconsistent_success_false_with_order_id() {
+        let responses = vec![serde_json::from_value(serde_json::json!({
+            "errorMsg": "",
+            "makingAmount": "0",
+            "takingAmount": "0",
+            "orderID": "order-1",
+            "status": "LIVE",
+            "success": false,
+            "transactionHashes": [],
+            "tradeIds": [],
+        }))
+        .expect("deserialize PostOrderResponse")];
+
+        let token_ids = vec![Some("100".to_string())];
+        let result = post_orders_result_from_responses(responses, &token_ids);
+
+        assert_eq!(result.accepted.len(), 1);
+        assert_eq!(result.rejected.len(), 0);
+        assert_eq!(result.accepted[0].order_id, "order-1");
     }
 
     #[tokio::test]
