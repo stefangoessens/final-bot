@@ -41,6 +41,11 @@ pub struct UserWsLoop {
     api_secret: String,
     api_passphrase: String,
     markets: Vec<String>,
+    /// Lowercased maker addresses that we treat as "our" orders for attributing fills.
+    ///
+    /// Trade messages can include aggregated sizes across multiple maker orders. We only
+    /// attribute fills for maker_orders whose maker_address matches one of these.
+    maker_addresses: Vec<String>,
     user_order_tx: Option<Sender<UserOrderUpdate>>,
 }
 
@@ -61,6 +66,7 @@ impl UserWsLoop {
         cfg: &AppConfig,
         markets: Vec<String>,
         user_order_tx: Option<Sender<UserOrderUpdate>>,
+        maker_addresses: Vec<String>,
     ) -> BotResult<Self> {
         let api_key = cfg
             .keys
@@ -104,6 +110,7 @@ impl UserWsLoop {
             api_passphrase,
             markets,
             user_order_tx,
+            maker_addresses,
         ))
     }
 
@@ -114,13 +121,22 @@ impl UserWsLoop {
         api_passphrase: String,
         markets: Vec<String>,
         user_order_tx: Option<Sender<UserOrderUpdate>>,
+        maker_addresses: Vec<String>,
     ) -> Self {
+        let mut maker_addresses: Vec<String> = maker_addresses
+            .into_iter()
+            .map(|addr| addr.trim().to_ascii_lowercase())
+            .filter(|addr| !addr.is_empty())
+            .collect();
+        maker_addresses.sort();
+        maker_addresses.dedup();
         Self {
             url,
             api_key,
             api_secret,
             api_passphrase,
             markets,
+            maker_addresses,
             user_order_tx,
         }
     }
@@ -267,30 +283,32 @@ impl UserWsLoop {
     ) -> BotResult<()> {
         let mut heartbeat_ts = None;
 
-        match parse_fill_event(text) {
-            Ok(Some(fill)) => {
-                heartbeat_ts = Some(fill.ts_ms);
-                log_fill_event(log_tx, &fill);
-                tracing::info!(
-                    target: "clob_ws_user",
-                    token_id = %fill.token_id,
-                    price = fill.price,
-                    shares = fill.shares,
-                    ts_ms = fill.ts_ms,
-                    "fill"
-                );
-                if let Err(err) = tx_events
-                    .send(AppEvent::UserWsUpdate(UserWsUpdate::Fill(fill)))
-                    .await
-                {
-                    tracing::warn!(
+        match parse_trade_fills(text, &self.maker_addresses) {
+            Ok(fills) if !fills.is_empty() => {
+                for fill in fills {
+                    heartbeat_ts = Some(fill.ts_ms);
+                    log_fill_event(log_tx, &fill);
+                    tracing::info!(
                         target: "clob_ws_user",
-                        error = %err,
-                        "state manager channel closed; dropping fill update"
+                        token_id = %fill.token_id,
+                        price = fill.price,
+                        shares = fill.shares,
+                        ts_ms = fill.ts_ms,
+                        "fill"
                     );
+                    if let Err(err) = tx_events
+                        .send(AppEvent::UserWsUpdate(UserWsUpdate::Fill(fill)))
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "clob_ws_user",
+                            error = %err,
+                            "state manager channel closed; dropping fill update"
+                        );
+                    }
                 }
             }
-            Ok(None) => {
+            Ok(_) => {
                 let order_update = match parse_order_event(text) {
                     Ok(update) => update,
                     Err(err) => {
@@ -424,7 +442,7 @@ impl Backoff {
     }
 }
 
-fn parse_fill_event(text: &str) -> BotResult<Option<FillEvent>> {
+fn parse_trade_fills(text: &str, maker_addresses: &[String]) -> BotResult<Vec<FillEvent>> {
     let value: Value =
         serde_json::from_str(text).map_err(|e| BotError::Other(format!("invalid json: {e}")))?;
 
@@ -436,34 +454,68 @@ fn parse_fill_event(text: &str) -> BotResult<Option<FillEvent>> {
         .to_lowercase();
 
     if event_type != "trade" {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-
-    let token_id = value
-        .get("asset_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| BotError::Other("trade missing asset_id".to_string()))?;
-
-    let price = value
-        .get("price")
-        .and_then(value_to_string)
-        .and_then(|s| s.parse::<f64>().ok())
-        .ok_or_else(|| BotError::Other("trade missing price".to_string()))?;
-
-    let shares = value
-        .get("size")
-        .and_then(value_to_string)
-        .and_then(|s| s.parse::<f64>().ok())
-        .ok_or_else(|| BotError::Other("trade missing size".to_string()))?;
 
     let ts_ms = extract_timestamp_from_value(&value).unwrap_or_else(now_ms);
 
-    Ok(Some(FillEvent {
-        token_id: token_id.to_string(),
-        price,
-        shares,
-        ts_ms,
-    }))
+    let Some(orders) = value.get("maker_orders").and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+
+    if maker_addresses.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut fills = Vec::new();
+    for order in orders {
+        let maker_address = match order.get("maker_address").and_then(|v| v.as_str()) {
+            Some(addr) => addr.trim(),
+            None => continue,
+        };
+        if maker_address.is_empty() {
+            continue;
+        }
+        if !maker_addresses
+            .iter()
+            .any(|addr| addr.eq_ignore_ascii_case(maker_address))
+        {
+            continue;
+        }
+
+        let token_id = match order.get("asset_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.trim().is_empty() => id.trim(),
+            _ => continue,
+        };
+        let price = match order
+            .get("price")
+            .and_then(value_to_string)
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            Some(v) => v,
+            None => continue,
+        };
+        let shares = match order
+            .get("matched_amount")
+            .and_then(value_to_string)
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            Some(v) => v,
+            None => continue,
+        };
+        if !shares.is_finite() || shares <= 0.0 {
+            continue;
+        }
+
+        fills.push(FillEvent {
+            token_id: token_id.to_string(),
+            price,
+            shares,
+            ts_ms,
+        });
+    }
+
+    Ok(fills)
 }
 
 fn parse_order_event(text: &str) -> BotResult<Option<UserOrderUpdate>> {
@@ -813,23 +865,33 @@ mod tests {
     use tokio::time::{timeout, Duration};
 
     #[test]
-    fn parse_trade_message_into_fill_event() {
+    fn parse_trade_message_attributes_only_our_maker_orders() {
+        let maker = "0x63db2184575e93ab59dcd167b2fa6013369561cf".to_string();
         let raw = r#"{
-            "asset_id": "52114319501245915516055106046884209969926127482827954674443846427813813222426",
             "event_type": "trade",
-            "price": "0.57",
-            "size": "10",
+            "maker_orders": [
+              {
+                "asset_id": "token",
+                "maker_address": "0x63dB2184575e93Ab59DCd167b2Fa6013369561cf",
+                "matched_amount": "0.5",
+                "price": "0.41"
+              },
+              {
+                "asset_id": "other",
+                "maker_address": "0xdeadbeef",
+                "matched_amount": "999",
+                "price": "0.99"
+              }
+            ],
             "timestamp": "1672290701"
         }"#;
 
-        let fill = parse_fill_event(raw).unwrap().unwrap();
-        assert_eq!(
-            fill.token_id,
-            "52114319501245915516055106046884209969926127482827954674443846427813813222426"
-        );
-        assert!((fill.price - 0.57).abs() < 1e-12);
-        assert!((fill.shares - 10.0).abs() < 1e-12);
-        assert_eq!(fill.ts_ms, 1_672_290_701_000);
+        let fills = parse_trade_fills(raw, &[maker]).unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].token_id, "token");
+        assert!((fills[0].price - 0.41).abs() < 1e-12);
+        assert!((fills[0].shares - 0.5).abs() < 1e-12);
+        assert_eq!(fills[0].ts_ms, 1_672_290_701_000);
     }
 
     #[test]
@@ -957,6 +1019,7 @@ mod tests {
             "api_passphrase".to_string(),
             Vec::new(),
             None,
+            Vec::new(),
         );
 
         let (tx_events, _rx_events) = tokio::sync::mpsc::channel::<AppEvent>(8);
@@ -994,6 +1057,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_text_forwards_trade_fills_to_state_manager() {
+        let maker = "0x63db2184575e93ab59dcd167b2fa6013369561cf".to_string();
         let loop_ = UserWsLoop::new(
             "ws://127.0.0.1".to_string(),
             "api_key".to_string(),
@@ -1001,15 +1065,21 @@ mod tests {
             "api_passphrase".to_string(),
             Vec::new(),
             None,
+            vec![maker.clone()],
         );
 
         let (tx_events, mut rx_events) = tokio::sync::mpsc::channel::<AppEvent>(8);
 
         let raw = r#"{
-            "asset_id": "token",
             "event_type": "trade",
-            "price": "0.57",
-            "size": "10",
+            "maker_orders": [
+              {
+                "asset_id": "token",
+                "maker_address": "0x63dB2184575e93Ab59DCd167b2Fa6013369561cf",
+                "matched_amount": "0.5",
+                "price": "0.41"
+              }
+            ],
             "timestamp": "1672290701"
         }"#;
 
@@ -1025,8 +1095,8 @@ mod tests {
         match first {
             AppEvent::UserWsUpdate(UserWsUpdate::Fill(fill)) => {
                 assert_eq!(fill.token_id, "token");
-                assert!((fill.price - 0.57).abs() < 1e-12);
-                assert!((fill.shares - 10.0).abs() < 1e-12);
+                assert!((fill.price - 0.41).abs() < 1e-12);
+                assert!((fill.shares - 0.5).abs() < 1e-12);
                 assert_eq!(fill.ts_ms, 1_672_290_701_000);
             }
             other => panic!("expected Fill update, got {other:?}"),
