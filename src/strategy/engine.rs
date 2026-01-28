@@ -27,6 +27,7 @@ pub struct CompletionCommand {
     pub slug: String,
     pub condition_id: String,
     pub token_id: String,
+    pub cancel_order_ids: Vec<String>,
     pub side: Side,
     pub shares: f64,
     pub p_max: f64,
@@ -171,6 +172,13 @@ impl StrategyEngine {
                         slug: slug.clone(),
                         condition_id: state.identity.condition_id.clone(),
                         token_id: taker_action.token_id.clone(),
+                        cancel_order_ids: state
+                            .orders
+                            .live
+                            .values()
+                            .filter(|order| order.remaining.is_finite() && order.remaining > 0.0)
+                            .map(|order| order.order_id.clone())
+                            .collect(),
                         side: taker_action.side,
                         shares: taker_action.shares,
                         p_max: taker_action.p_max,
@@ -554,7 +562,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emits_completion_within_window_or_when_severe() {
+    async fn emits_completion_within_window_or_when_hardcap_breached() {
         let (tx_quote, rx_quote) = mpsc::channel(1);
         // Buffer exec commands so the strategy task never blocks in this test.
         let (tx_exec, _rx_exec) = mpsc::channel(16);
@@ -564,9 +572,13 @@ mod tests {
         completion_cfg.enabled = true;
         completion_cfg.max_loss_usdc = 0.0;
 
+        let mut inventory_cfg = InventoryConfig::default();
+        inventory_cfg.max_unpaired_shares_per_market = 1.0;
+        inventory_cfg.max_unpaired_shares_global = 1.0;
+
         let engine = StrategyEngine::new(
             TradingConfig::default(),
-            InventoryConfig::default(),
+            inventory_cfg,
             completion_cfg,
             RewardsConfig::default(),
             None,
@@ -630,25 +642,28 @@ mod tests {
         let suppressed = timeout(Duration::from_millis(100), rx_completion.recv()).await;
         assert!(suppressed.is_err(), "expected no completion outside window");
 
-        let mut state_severe = MarketState::new(identity.clone(), now_ms + 60_000);
-        state_severe.inventory.up.shares = 1.0;
-        state_severe.inventory.up.notional_usdc = 0.2;
-        state_severe.inventory.down.shares = 0.0;
-        state_severe.down_book.best_ask = Some(0.25);
+        let mut state_hardcap = MarketState::new(identity.clone(), now_ms + 60_000);
+        state_hardcap.inventory.up.shares = 1.0;
+        state_hardcap.inventory.up.notional_usdc = 0.2;
+        state_hardcap.inventory.down.shares = 0.0;
+        state_hardcap.down_book.best_ask = Some(0.25);
 
         tx_quote
             .send(QuoteTick {
                 slug: identity.slug.clone(),
                 now_ms,
-                state: state_severe,
+                state: state_hardcap,
             })
             .await
-            .expect("send quote tick severe outside window");
+            .expect("send quote tick hardcap outside window");
 
         let msg = timeout(Duration::from_millis(200), rx_completion.recv())
             .await
             .expect("completion command timeout");
-        assert!(msg.is_some(), "expected completion when severe outside window");
+        assert!(
+            msg.is_some(),
+            "expected completion when hardcap breached outside window"
+        );
 
         let mut state_above = MarketState::new(identity, now_ms + 30_000);
         state_above.inventory.up.shares = 1.0;

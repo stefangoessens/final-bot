@@ -7,6 +7,8 @@ use crate::strategy::DesiredOrder;
 use polymarket_client_sdk::clob::types::Side;
 
 const UNPAIRED_EPS: f64 = 1e-6;
+const MAX_LOSS_PER_SHARE_CAP: f64 = 0.99;
+const COMPLETION_LIMIT_PRICE_ABS_MAX: f64 = 0.99;
 
 #[derive(Debug, Clone)]
 pub struct TakerAction {
@@ -105,7 +107,8 @@ pub fn should_taker_complete(
     let emergency =
         severe || hardcap_breached || time_to_cancel_s <= inventory_cfg.emergency_window_s;
 
-    if time_to_cancel_s > inventory_cfg.taker_window_s && !severe && !hardcap_breached {
+    // FULL_SPEC 7.6(D),7.8: taker completion is time-gated; do not taker-complete purely due to skew.
+    if time_to_cancel_s > inventory_cfg.taker_window_s && !hardcap_breached {
         return None;
     }
 
@@ -127,7 +130,8 @@ pub fn should_taker_complete(
 
     let avg_cost = excess_avg_cost?;
     let min_profit = if emergency && completion_cfg.max_loss_usdc > 0.0 {
-        -completion_cfg.max_loss_usdc / unpaired
+        let max_loss_per_share = (completion_cfg.max_loss_usdc / unpaired).max(0.0);
+        -max_loss_per_share.min(MAX_LOSS_PER_SHARE_CAP)
     } else {
         completion_cfg.min_profit_per_share
     };
@@ -156,9 +160,15 @@ pub fn should_taker_complete(
         if best_bid < min_quote_price {
             return None;
         }
-        let p_min_raw = min_taker_sell_price(avg_cost, min_profit, unpaired)?
-            .max(min_quote_price);
+        let cap = completion_limit_price_ceiling(excess_tick);
+        let p_min_raw = min_taker_sell_price(avg_cost, min_profit, unpaired)?.max(min_quote_price);
+        if p_min_raw > cap + 1e-12 {
+            return None;
+        }
         let p_min = round_up_to_tick(p_min_raw, excess_tick)?;
+        if p_min > cap + 1e-12 {
+            return None;
+        }
         if best_bid + 1e-12 < p_min {
             return None;
         }
@@ -172,7 +182,8 @@ pub fn should_taker_complete(
         });
     }
 
-    let p_max_raw = max_taker_price(avg_cost, min_profit, unpaired)?;
+    let cap = completion_limit_price_ceiling(tick_size);
+    let p_max_raw = max_taker_price(avg_cost, min_profit, unpaired)?.min(cap);
     let p_max = round_down_to_tick(p_max_raw, tick_size)?;
     if p_max <= 0.0 {
         return None;
@@ -249,11 +260,14 @@ pub fn apply_skew_repair_pricing(
 
     // Hard cap derived from set-completion math (conservative: uses taker fee curve).
     let min_profit = if emergency && completion_cfg.max_loss_usdc > 0.0 {
-        -completion_cfg.max_loss_usdc / unpaired
+        let max_loss_per_share = (completion_cfg.max_loss_usdc / unpaired).max(0.0);
+        -max_loss_per_share.min(MAX_LOSS_PER_SHARE_CAP)
     } else {
         completion_cfg.min_profit_per_share
     };
-    let Some(cap_raw) = max_taker_price(avg_cost, min_profit, unpaired) else {
+    let cap_ceiling = completion_limit_price_ceiling(tick_size);
+    let Some(cap_raw) = max_taker_price(avg_cost, min_profit, unpaired).map(|v| v.min(cap_ceiling))
+    else {
         desired.retain(|o| o.token_id != missing_token);
         return;
     };
@@ -320,6 +334,13 @@ pub fn apply_skew_repair_pricing(
 
     // Never output prices below the quote floor.
     desired.retain(|o| o.price >= trading_cfg.min_quote_price - 1e-12);
+}
+
+fn completion_limit_price_ceiling(tick: f64) -> f64 {
+    // Use a tick-aligned ceiling so that round_up_to_tick never rounds a completion limit up to 1.0
+    // on coarse-tick markets (e.g. 0.99 with tick=0.05 would otherwise round to 1.0).
+    round_down_to_tick(COMPLETION_LIMIT_PRICE_ABS_MAX, tick)
+        .unwrap_or(COMPLETION_LIMIT_PRICE_ABS_MAX)
 }
 
 fn max_taker_price(avg_cost: f64, min_profit: f64, shares: f64) -> Option<f64> {
@@ -586,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn taker_completion_can_trigger_early_when_severe() {
+    fn taker_completion_can_trigger_early_when_hardcap_breached() {
         let mut state = make_state(300_000);
         state.inventory.up.shares = 1.0;
         state.inventory.up.notional_usdc = 0.2; // avg cost 0.2
@@ -595,6 +616,8 @@ mod tests {
 
         let mut inventory_cfg = InventoryConfig::default();
         inventory_cfg.taker_window_s = 30;
+        inventory_cfg.max_unpaired_shares_per_market = 1.0;
+        inventory_cfg.max_unpaired_shares_global = 1.0;
 
         let mut completion_cfg = CompletionConfig::default();
         completion_cfg.enabled = true;
@@ -605,7 +628,7 @@ mod tests {
         let trading_cfg = TradingConfig::default();
         let action =
             should_taker_complete(&state, &inventory_cfg, &completion_cfg, &trading_cfg, 0)
-                .expect("expected early taker completion");
+                .expect("expected early taker completion when hardcap breached");
         assert_eq!(action.token_id, "DOWN");
         assert_eq!(action.side, Side::Buy);
         assert!(action.p_max >= state.down_book.best_ask.unwrap() - 1e-12);
@@ -649,7 +672,7 @@ mod tests {
 
     #[test]
     fn taker_completion_sells_excess_when_missing_ask_below_quote_floor() {
-        let mut state = make_state(300_000);
+        let mut state = make_state(30_000);
         state.inventory.up.shares = 1.0;
         state.inventory.up.notional_usdc = 0.85; // avg cost 0.85 -> p_max ~0.15
         state.inventory.down.shares = 0.0;
@@ -681,7 +704,7 @@ mod tests {
 
     #[test]
     fn taker_completion_sell_clamps_to_quote_floor() {
-        let mut state = make_state(300_000);
+        let mut state = make_state(30_000);
         state.inventory.up.shares = 1.0;
         state.inventory.up.notional_usdc = 0.10; // avg cost 0.10 => p_min below floor
         state.inventory.down.shares = 0.0;

@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use futures_util::future::BoxFuture;
-use polymarket_client_sdk::clob::types::response::OpenOrderResponse;
 use polymarket_client_sdk::clob::types::Side;
 use serde_json::json;
 use tokio::sync::mpsc::Receiver;
@@ -17,10 +16,6 @@ use crate::strategy::engine::CompletionCommand;
 const COMPLETION_RATE_LIMIT_MS: i64 = 1_000;
 
 trait CompletionRestClient: Send + Sync {
-    fn get_active_orders_for_market(
-        &self,
-        condition_id: String,
-    ) -> BoxFuture<'static, BotResult<Vec<OpenOrderResponse>>>;
     fn cancel_orders(&self, order_ids: Vec<OrderId>) -> BoxFuture<'static, BotResult<CancelResult>>;
     fn build_completion_order(
         &self,
@@ -38,14 +33,6 @@ trait CompletionRestClient: Send + Sync {
 }
 
 impl CompletionRestClient for ClobRestClient {
-    fn get_active_orders_for_market(
-        &self,
-        condition_id: String,
-    ) -> BoxFuture<'static, BotResult<Vec<OpenOrderResponse>>> {
-        let client = self.clone();
-        Box::pin(async move { client.get_active_orders_for_market(&condition_id).await })
-    }
-
     fn cancel_orders(&self, order_ids: Vec<OrderId>) -> BoxFuture<'static, BotResult<CancelResult>> {
         let client = self.clone();
         Box::pin(async move { client.cancel_orders(order_ids).await })
@@ -235,11 +222,14 @@ impl CompletionExecutor {
     }
 
     async fn cancel_sweep(&self, cmd: &CompletionCommand) -> BotResult<()> {
-        let active = self
-            .rest
-            .get_active_orders_for_market(cmd.condition_id.clone())
-            .await?;
-        let order_ids: Vec<OrderId> = active.into_iter().map(|order| order.id).collect();
+        let mut order_ids: Vec<OrderId> = cmd
+            .cancel_order_ids
+            .iter()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect();
+        order_ids.sort();
+        order_ids.dedup();
         if order_ids.is_empty() {
             return Ok(());
         }
@@ -363,20 +353,16 @@ mod tests {
 
     #[derive(Clone)]
     struct MockRest {
-        active: Arc<Mutex<Result<Vec<OpenOrderResponse>, String>>>,
         cancel_result: Arc<Mutex<Result<CancelResult, String>>>,
         calls: Arc<Mutex<Vec<&'static str>>>,
-        seen_condition_id: Arc<Mutex<Option<String>>>,
         seen_cancel_ids: Arc<Mutex<Vec<String>>>,
     }
 
     impl MockRest {
-        fn with_active(active: Result<Vec<OpenOrderResponse>, String>) -> Self {
+        fn new() -> Self {
             Self {
-                active: Arc::new(Mutex::new(active)),
                 cancel_result: Arc::new(Mutex::new(Ok(CancelResult::default()))),
                 calls: Arc::new(Mutex::new(Vec::new())),
-                seen_condition_id: Arc::new(Mutex::new(None)),
                 seen_cancel_ids: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -391,26 +377,6 @@ mod tests {
     }
 
     impl CompletionRestClient for MockRest {
-        fn get_active_orders_for_market(
-            &self,
-            condition_id: String,
-        ) -> BoxFuture<'static, BotResult<Vec<OpenOrderResponse>>> {
-            let active = self.active.clone();
-            let calls = self.calls.clone();
-            let seen_condition_id = self.seen_condition_id.clone();
-            Box::pin(async move {
-                calls
-                    .lock()
-                    .expect("lock calls")
-                    .push("get_active_orders_for_market");
-                *seen_condition_id.lock().expect("lock seen_condition_id") = Some(condition_id);
-                match active.lock().expect("lock active").clone() {
-                    Ok(active) => Ok(active),
-                    Err(err) => Err(crate::error::BotError::Other(err)),
-                }
-            })
-        }
-
         fn cancel_orders(
             &self,
             order_ids: Vec<OrderId>,
@@ -468,33 +434,9 @@ mod tests {
         }
     }
 
-    fn open_order(id: &str) -> OpenOrderResponse {
-        serde_json::from_value(json!({
-            "id": id,
-            "status": "LIVE",
-            "owner": "00000000-0000-0000-0000-000000000000",
-            "maker_address": "0x0000000000000000000000000000000000000000",
-            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
-            "asset_id": "1",
-            "side": "BUY",
-            "original_size": "1",
-            "size_matched": "0",
-            "price": "0.5",
-            "associate_trades": [],
-            "outcome": "Yes",
-            "created_at": 0,
-            "expiration": "0",
-            "order_type": "GTC",
-        }))
-        .expect("deserialize OpenOrderResponse")
-    }
-
     #[tokio::test]
     async fn completion_cancels_active_orders_before_posting() {
-        let rest = Arc::new(MockRest::with_active(Ok(vec![
-            open_order("o1"),
-            open_order("o2"),
-        ])));
+        let rest = Arc::new(MockRest::new());
 
         let completion_cfg = CompletionConfig::default();
         let executor = CompletionExecutor::with_client(completion_cfg, rest.clone());
@@ -506,6 +448,7 @@ mod tests {
             slug: "btc-15m-test".to_string(),
             condition_id: "cond".to_string(),
             token_id: "token".to_string(),
+            cancel_order_ids: vec!["o1".to_string(), "o2".to_string()],
             side: Side::Buy,
             shares: 1.0,
             p_max: 0.5,
@@ -523,19 +466,7 @@ mod tests {
 
         assert_eq!(
             rest.calls(),
-            vec![
-                "get_active_orders_for_market",
-                "cancel_orders",
-                "build_completion_order",
-                "post_orders_result"
-            ]
-        );
-        assert_eq!(
-            rest.seen_condition_id
-                .lock()
-                .expect("lock seen_condition_id")
-                .as_deref(),
-            Some("cond")
+            vec!["cancel_orders", "build_completion_order", "post_orders_result"]
         );
         assert_eq!(
             &*rest
@@ -548,7 +479,7 @@ mod tests {
 
     #[tokio::test]
     async fn completion_proceeds_when_cancel_sweep_fails() {
-        let rest = Arc::new(MockRest::with_active(Ok(vec![open_order("o1")])));
+        let rest = Arc::new(MockRest::new());
         rest.set_cancel_result(Err("cancel failed".to_string()));
 
         let completion_cfg = CompletionConfig::default();
@@ -561,6 +492,7 @@ mod tests {
             slug: "btc-15m-test".to_string(),
             condition_id: "cond".to_string(),
             token_id: "token".to_string(),
+            cancel_order_ids: vec!["o1".to_string()],
             side: Side::Buy,
             shares: 1.0,
             p_max: 0.5,
@@ -578,18 +510,13 @@ mod tests {
 
         assert_eq!(
             rest.calls(),
-            vec![
-                "get_active_orders_for_market",
-                "cancel_orders",
-                "build_completion_order",
-                "post_orders_result"
-            ]
+            vec!["cancel_orders", "build_completion_order", "post_orders_result"]
         );
     }
 
     #[tokio::test]
     async fn completion_skips_cancel_when_no_active_orders() {
-        let rest = Arc::new(MockRest::with_active(Ok(Vec::new())));
+        let rest = Arc::new(MockRest::new());
 
         let completion_cfg = CompletionConfig::default();
         let executor = CompletionExecutor::with_client(completion_cfg, rest.clone());
@@ -601,6 +528,7 @@ mod tests {
             slug: "btc-15m-test".to_string(),
             condition_id: "cond".to_string(),
             token_id: "token".to_string(),
+            cancel_order_ids: Vec::new(),
             side: Side::Buy,
             shares: 1.0,
             p_max: 0.5,
@@ -618,11 +546,7 @@ mod tests {
 
         assert_eq!(
             rest.calls(),
-            vec![
-                "get_active_orders_for_market",
-                "build_completion_order",
-                "post_orders_result"
-            ]
+            vec!["build_completion_order", "post_orders_result"]
         );
     }
 }
