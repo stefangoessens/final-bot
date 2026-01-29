@@ -551,11 +551,25 @@ impl FillTracker {
         let entry = self
             .by_order_id
             .entry(order_id.to_string())
-            .or_insert_with(|| FillTrackerEntry {
-                token_id: token_id.to_string(),
-                side: update.side,
-                price: update.price,
-                matched: 0.0,
+            .or_insert_with(|| {
+                // If we reconnect and first see an UPDATE for an existing order, we may have
+                // missed earlier updates that already accumulated `size_matched`. Initialize
+                // `matched` from the current value to avoid double-counting old fills.
+                let initial_matched = if update.update_type == UserOrderUpdateType::Placement {
+                    0.0
+                } else {
+                    update
+                        .size_matched
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .unwrap_or(0.0)
+                };
+
+                FillTrackerEntry {
+                    token_id: token_id.to_string(),
+                    side: update.side,
+                    price: update.price,
+                    matched: initial_matched,
+                }
             });
 
         if entry.token_id != token_id {
@@ -1224,5 +1238,55 @@ mod tests {
             }
             other => panic!("expected Heartbeat update, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn handle_text_does_not_double_count_fill_when_first_seen_is_update() {
+        let loop_ = UserWsLoop::new(
+            "ws://127.0.0.1".to_string(),
+            "api_key".to_string(),
+            "api_secret".to_string(),
+            "api_passphrase".to_string(),
+            Vec::new(),
+            None,
+        );
+
+        let (tx_events, mut rx_events) = tokio::sync::mpsc::channel::<AppEvent>(8);
+
+        // Simulate a reconnect: the first message we see for an existing order is an UPDATE
+        // with a non-zero cumulative matched amount.
+        let update = r#"{
+            "asset_id": "token",
+            "event_type": "order",
+            "id": "order-1",
+            "timestamp": "1672290702",
+            "type": "UPDATE",
+            "side": "BUY",
+            "price": "0.41",
+            "original_size": "1.0",
+            "size_matched": "0.5"
+        }"#;
+
+        let mut tracker = FillTracker::default();
+
+        loop_
+            .handle_text(update, &tx_events, None, None, &mut tracker)
+            .await
+            .expect("handle_text ok");
+
+        // We should only get a heartbeat; the cumulative size_matched must not be emitted as a fill.
+        let first = timeout(Duration::from_millis(50), rx_events.recv())
+            .await
+            .expect("heartbeat should arrive")
+            .expect("channel open");
+        match first {
+            AppEvent::UserWsUpdate(UserWsUpdate::Heartbeat { ts_ms }) => {
+                assert_eq!(ts_ms, 1_672_290_702_000);
+            }
+            other => panic!("expected Heartbeat update, got {other:?}"),
+        }
+
+        let no_fill = timeout(Duration::from_millis(50), rx_events.recv()).await;
+        assert!(no_fill.is_err(), "unexpected extra event: {no_fill:?}");
     }
 }
