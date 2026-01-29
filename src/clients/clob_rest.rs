@@ -22,6 +22,7 @@ use polymarket_client_sdk::{derive_proxy_wallet, POLYGON};
 
 use crate::config::{ApiCredsSource, AppConfig, CompletionOrderType, HeartbeatsConfig, WalletMode};
 use crate::error::{BotError, BotResult};
+use crate::state::state_manager::OrderSide;
 use crate::strategy::DesiredOrder;
 
 pub type OrderId = String;
@@ -371,7 +372,10 @@ impl ClobRestClient {
                 .token_id(token_id)
                 .price(price)
                 .size(size)
-                .side(Side::Buy)
+                .side(match order.side {
+                    OrderSide::Buy => Side::Buy,
+                    OrderSide::Sell => Side::Sell,
+                })
                 .order_type(SdkOrderType::GTC)
                 .post_only(order.post_only)
                 .build()

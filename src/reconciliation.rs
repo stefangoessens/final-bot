@@ -1,10 +1,12 @@
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 use polymarket_client_sdk::clob::types::Side as SdkSide;
 
 use crate::clients::clob_rest::ClobRestClient;
+use crate::clients::clob_ws_user::UserWsConnectionEvent;
 use crate::clients::data_api::{DataApiClient, DataApiPosition};
 use crate::clients::gamma::GammaClient;
 use crate::config::AppConfig;
@@ -12,7 +14,7 @@ use crate::error::{BotError, BotResult};
 use crate::state::inventory::{InventorySide, TokenSide};
 use crate::state::market_state::MarketIdentity;
 use crate::state::order_state::{LiveOrder, OrderStatus};
-use crate::state::state_manager::{AppEvent, InventorySeed, OrderSeed};
+use crate::state::state_manager::{AppEvent, InventorySeed, OrderSeed, OrderSide};
 use crate::time::{interval_start_s, now_s, BTC_15M_INTERVAL_S};
 
 #[derive(Debug, Clone, Default)]
@@ -146,7 +148,7 @@ impl StartupReconciler {
                 let positions = data_api
                     .fetch_positions(&user, Some(&condition_ids))
                     .await?;
-                let (inventory_seeds, readiness) = map_positions(&identities, &positions);
+                let (inventory_seeds, readiness) = map_positions(&identities, &positions, now_ms());
                 for seed in inventory_seeds.values() {
                     tx_events
                         .send(AppEvent::SeedInventory(seed.clone()))
@@ -171,6 +173,146 @@ impl StartupReconciler {
     }
 }
 
+pub async fn run_user_ws_open_orders_resync_loop(
+    cfg: Arc<AppConfig>,
+    gamma: GammaClient,
+    rest: ClobRestClient,
+    mut rx_conn: Receiver<UserWsConnectionEvent>,
+    tx_events: Sender<AppEvent>,
+    tx_order_seed: Sender<OrderSeed>,
+) {
+    // Avoid hammering REST if the user ws is flapping.
+    const MIN_RESYNC_INTERVAL_MS: i64 = 2_000;
+    let mut last_resync_ms: i64 = 0;
+
+    let data_api_user = resolve_data_api_user(&cfg);
+    let data_api = DataApiClient::new(cfg.endpoints.data_api_base_url.clone());
+
+    while let Some(ev) = rx_conn.recv().await {
+        if !ev.connected {
+            continue;
+        }
+        if !rest.authenticated() {
+            tracing::warn!(target: "reconciliation", "user ws resync skipped: rest client not authenticated");
+            continue;
+        }
+
+        if ev.ts_ms.saturating_sub(last_resync_ms) < MIN_RESYNC_INTERVAL_MS {
+            continue;
+        }
+        last_resync_ms = ev.ts_ms;
+
+        let now = now_s();
+        let tracked = tracked_slugs(now, cfg.infra.market_discovery_grace_s);
+        let mut identities = Vec::new();
+
+        for (slug, interval_start) in &tracked {
+            match gamma.fetch_market_by_slug(slug).await {
+                Ok(Some(market)) => match market.to_market_identity(*interval_start) {
+                    Ok(identity) => identities.push(identity),
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "reconciliation",
+                            slug = %slug,
+                            error = %err,
+                            "user ws resync: failed to map market identity"
+                        );
+                    }
+                },
+                Ok(None) => {
+                    tracing::warn!(target: "reconciliation", slug = %slug, "user ws resync: market not found");
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "reconciliation",
+                        slug = %slug,
+                        error = %err,
+                        "user ws resync: gamma fetch failed"
+                    );
+                }
+            }
+        }
+
+        if let Some(user) = data_api_user.as_deref() {
+            let condition_ids: Vec<String> =
+                identities.iter().map(|m| m.condition_id.clone()).collect();
+            if !condition_ids.is_empty() {
+                match data_api.fetch_positions(user, Some(&condition_ids)).await {
+                    Ok(positions) => {
+                        let (inventory_seeds, _readiness) =
+                            map_positions(&identities, &positions, ev.ts_ms);
+                        for seed in inventory_seeds.values() {
+                            let _ = tx_events.send(AppEvent::SeedInventory(seed.clone())).await;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "reconciliation",
+                            error = %err,
+                            "user ws resync: data api positions fetch failed"
+                        );
+                    }
+                }
+            }
+        }
+
+        for identity in identities {
+            let open_orders = match rest
+                .get_active_orders_for_market(&identity.condition_id)
+                .await
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "reconciliation",
+                        condition_id = %identity.condition_id,
+                        error = %err,
+                        "user ws resync: open orders fetch failed"
+                    );
+                    continue;
+                }
+            };
+
+            let open_orders: Vec<OpenOrderLite> = match open_orders
+                .into_iter()
+                .map(OpenOrderLite::try_from_sdk)
+                .collect::<BotResult<Vec<_>>>()
+            {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "reconciliation",
+                        condition_id = %identity.condition_id,
+                        error = %err,
+                        "user ws resync: failed to parse open orders"
+                    );
+                    continue;
+                }
+            };
+
+            let (seed, _cancels) = match map_open_orders(&identity, open_orders) {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "reconciliation",
+                        slug = %identity.slug,
+                        error = %err,
+                        "user ws resync: failed to map open orders"
+                    );
+                    continue;
+                }
+            };
+
+            if seed.orders.is_empty() {
+                continue;
+            }
+
+            let _ = tx_events.send(AppEvent::SeedOrders(seed.clone())).await;
+            let _ = tx_order_seed.send(seed).await;
+        }
+    }
+}
+
 fn tracked_slugs(now_s: i64, grace_s: i64) -> Vec<(String, i64)> {
     let cur_start_s = interval_start_s(now_s);
     let next_start_s = cur_start_s + BTC_15M_INTERVAL_S;
@@ -191,29 +333,40 @@ fn map_open_orders(
     identity: &MarketIdentity,
     orders: Vec<OpenOrderLite>,
 ) -> BotResult<(OrderSeed, Vec<String>)> {
-    let mut by_token: HashMap<String, Vec<_>> = HashMap::new();
+    let mut by_token: HashMap<(String, OrderSide), Vec<_>> = HashMap::new();
     let mut cancels = Vec::new();
 
     for order in orders {
-        if order.side != SdkSide::Buy {
+        let side = match order.side {
+            SdkSide::Buy => Some(OrderSide::Buy),
+            SdkSide::Sell => Some(OrderSide::Sell),
+            _ => None,
+        };
+        let Some(side) = side else {
             cancels.push(order.id);
             continue;
-        }
+        };
         let token_id = order.asset_id.clone();
         if token_id != identity.token_up && token_id != identity.token_down {
             cancels.push(order.id);
             continue;
         }
-        by_token.entry(token_id).or_default().push(order);
+        by_token.entry((token_id, side)).or_default().push(order);
     }
 
     let mut live_orders = Vec::new();
-    for (token_id, mut token_orders) in by_token {
-        token_orders.sort_by(|a, b| {
-            b.price
+    for ((token_id, side), mut token_orders) in by_token {
+        token_orders.sort_by(|a, b| match side {
+            OrderSide::Buy => b
+                .price
                 .partial_cmp(&a.price)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.created_at_ms.cmp(&b.created_at_ms))
+                .then_with(|| a.created_at_ms.cmp(&b.created_at_ms)),
+            OrderSide::Sell => a
+                .price
+                .partial_cmp(&b.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.created_at_ms.cmp(&b.created_at_ms)),
         });
 
         for (level, order) in token_orders.into_iter().enumerate() {
@@ -231,6 +384,7 @@ fn map_open_orders(
             live_orders.push(LiveOrder {
                 order_id: order.id,
                 token_id: token_id.clone(),
+                side,
                 level,
                 price,
                 size,
@@ -254,6 +408,7 @@ fn map_open_orders(
 fn map_positions(
     identities: &[MarketIdentity],
     positions: &[DataApiPosition],
+    ts_ms: i64,
 ) -> (
     HashMap<String, InventorySeed>,
     HashMap<String, ReadinessFlags>,
@@ -281,7 +436,7 @@ fn map_positions(
                 slug: identity.slug.clone(),
                 up: InventorySide::default(),
                 down: InventorySide::default(),
-                ts_ms: now_ms(),
+                ts_ms,
             });
 
         let notional = if pos.size.is_finite() && pos.avg_price.is_finite() {
@@ -428,10 +583,11 @@ mod tests {
             redeemable: false,
         }];
 
-        let (inventory, readiness) = map_positions(&[identity.clone()], &positions);
+        let (inventory, readiness) = map_positions(&[identity.clone()], &positions, 1234);
         let seed = inventory.get(&identity.slug).expect("seed");
         assert_eq!(seed.up.shares, 2.0);
         assert_eq!(seed.up.notional_usdc, 0.8);
+        assert_eq!(seed.ts_ms, 1234);
         assert!(readiness.get(&identity.condition_id).unwrap().mergeable);
     }
 

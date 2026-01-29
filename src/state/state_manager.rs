@@ -42,7 +42,7 @@ pub struct FillEvent {
     pub ts_ms: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OrderSide {
     Buy,
     Sell,
@@ -88,6 +88,7 @@ pub enum OrderUpdate {
     Remove {
         slug: String,
         token_id: String,
+        side: OrderSide,
         level: usize,
         order_id: String,
         ts_ms: i64,
@@ -1010,18 +1011,20 @@ impl StateManager {
             OrderUpdate::Remove {
                 slug,
                 token_id,
+                side,
                 level,
                 order_id,
                 ..
             } => {
                 if let Some(state) = self.markets.get_mut(&slug) {
-                    let key = (token_id.clone(), level);
+                    let key = (token_id.clone(), side, level);
                     if let Some(existing) = state.orders.live.get(&key) {
                         if existing.order_id != order_id {
                             tracing::debug!(
                                 target: "state_manager",
                                 slug = %slug,
                                 token_id = %token_id,
+                                side = ?side,
                                 level,
                                 order_id = %order_id,
                                 existing_id = %existing.order_id,
@@ -1030,7 +1033,7 @@ impl StateManager {
                             return;
                         }
                     }
-                    state.orders.remove(&token_id, level);
+                    state.orders.remove_exact(&token_id, side, level);
                 } else {
                     tracing::debug!(
                         target: "state_manager",
@@ -1081,6 +1084,9 @@ fn market_exposure_usdc(state: &MarketState) -> (f64, f64, f64) {
         (state.inventory.up.notional_usdc + state.inventory.down.notional_usdc).max(0.0);
     let mut open_order_usdc = 0.0;
     for order in state.orders.live.values() {
+        if order.side != OrderSide::Buy {
+            continue;
+        }
         if !order.price.is_finite() || !order.remaining.is_finite() {
             continue;
         }
@@ -1730,6 +1736,7 @@ mod tests {
         let order = LiveOrder {
             order_id: "order-1".to_string(),
             token_id: "up".to_string(),
+            side: OrderSide::Buy,
             level: 0,
             price: 0.48,
             size: 5.0,
@@ -1750,7 +1757,7 @@ mod tests {
         let live = state
             .orders
             .live
-            .get(&(order.token_id.clone(), order.level))
+            .get(&(order.token_id.clone(), order.side, order.level))
             .expect("live order stored");
         assert_eq!(live.order_id, "order-1");
 
@@ -1758,6 +1765,7 @@ mod tests {
             AppEvent::OrderUpdate(OrderUpdate::Remove {
                 slug: "btc-updown-15m-0".to_string(),
                 token_id: "up".to_string(),
+                side: OrderSide::Buy,
                 level: 0,
                 order_id: "order-1".to_string(),
                 ts_ms: 2_000,
@@ -1905,6 +1913,7 @@ mod tests {
                 order: LiveOrder {
                     order_id: "order-1".to_string(),
                     token_id: "up".to_string(),
+                    side: OrderSide::Buy,
                     level: 0,
                     price: 0.4,
                     size: 5.0,

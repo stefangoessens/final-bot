@@ -41,7 +41,14 @@ pub struct UserWsLoop {
     api_secret: String,
     api_passphrase: String,
     markets: Vec<String>,
+    conn_tx: Option<Sender<UserWsConnectionEvent>>,
     user_order_tx: Option<Sender<UserOrderUpdate>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserWsConnectionEvent {
+    pub connected: bool,
+    pub ts_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +111,7 @@ impl UserWsLoop {
             api_secret,
             api_passphrase,
             markets,
+            None,
             user_order_tx,
         ))
     }
@@ -114,6 +122,7 @@ impl UserWsLoop {
         api_secret: String,
         api_passphrase: String,
         markets: Vec<String>,
+        conn_tx: Option<Sender<UserWsConnectionEvent>>,
         user_order_tx: Option<Sender<UserOrderUpdate>>,
     ) -> Self {
         Self {
@@ -122,6 +131,7 @@ impl UserWsLoop {
             api_secret,
             api_passphrase,
             markets,
+            conn_tx,
             user_order_tx,
         }
     }
@@ -143,6 +153,7 @@ impl UserWsLoop {
         log_tx: Option<Sender<LogEvent>>,
     ) -> BotResult<()> {
         let mut backoff = Backoff::new(BACKOFF_MIN_MS, BACKOFF_MAX_MS, BACKOFF_MULTIPLIER);
+        let conn_tx = self.conn_tx.clone();
 
         loop {
             tracing::info!(target: "clob_ws_user", url = %self.url, "connecting");
@@ -150,6 +161,13 @@ impl UserWsLoop {
                 Ok((ws_stream, _)) => {
                     tracing::info!(target: "clob_ws_user", url = %self.url, "connected");
                     backoff.reset();
+
+                    if let Some(tx) = conn_tx.as_ref() {
+                        let _ = tx.try_send(UserWsConnectionEvent {
+                            connected: true,
+                            ts_ms: now_ms(),
+                        });
+                    }
 
                     let order_tx = tx_order_updates.clone();
                     if let Err(err) = self
@@ -165,6 +183,13 @@ impl UserWsLoop {
                     }
 
                     tracing::info!(target: "clob_ws_user", url = %self.url, "disconnected");
+
+                    if let Some(tx) = conn_tx.as_ref() {
+                        let _ = tx.try_send(UserWsConnectionEvent {
+                            connected: false,
+                            ts_ms: now_ms(),
+                        });
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -1113,6 +1138,7 @@ mod tests {
             "api_passphrase".to_string(),
             Vec::new(),
             None,
+            None,
         );
 
         let (tx_events, _rx_events) = tokio::sync::mpsc::channel::<AppEvent>(8);
@@ -1158,6 +1184,7 @@ mod tests {
             "api_secret".to_string(),
             "api_passphrase".to_string(),
             Vec::new(),
+            None,
             None,
         );
 
@@ -1245,6 +1272,7 @@ mod tests {
             "api_passphrase".to_string(),
             Vec::new(),
             None,
+            None,
         );
 
         let (tx_events, mut rx_events) = tokio::sync::mpsc::channel::<AppEvent>(8);
@@ -1295,6 +1323,7 @@ mod tests {
             "api_secret".to_string(),
             "api_passphrase".to_string(),
             Vec::new(),
+            None,
             None,
         );
 

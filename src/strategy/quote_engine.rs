@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use crate::config::TradingConfig;
 use crate::state::book::TokenBookTop;
 use crate::state::market_state::MarketState;
+use crate::state::state_manager::OrderSide;
 use crate::strategy::{DesiredOrder, TimeInForce};
 
 #[derive(Debug, Default, Clone)]
@@ -234,6 +235,7 @@ pub fn build_desired_orders(
     build_ladder(
         &mut desired,
         &state.identity.token_up,
+        OrderSide::Buy,
         up_p0,
         tick_up,
         base_size,
@@ -244,6 +246,7 @@ pub fn build_desired_orders(
     build_ladder(
         &mut desired,
         &state.identity.token_down,
+        OrderSide::Buy,
         down_p0,
         tick_down,
         base_size,
@@ -251,6 +254,42 @@ pub fn build_desired_orders(
         ladder_step_ticks,
         cfg,
     );
+
+    if cfg.maker_sell_enabled {
+        let unpaired = state.inventory.unpaired_shares();
+        if unpaired >= cfg.maker_sell_trigger_unpaired_shares.max(0.0) && unpaired > 1e-9 {
+            let (excess_token, excess_book, excess_tick, improve_ticks) =
+                if state.inventory.up.shares > state.inventory.down.shares {
+                    (
+                        state.identity.token_up.as_str(),
+                        &state.up_book,
+                        tick_up,
+                        up_improve,
+                    )
+                } else {
+                    (
+                        state.identity.token_down.as_str(),
+                        &state.down_book,
+                        tick_down,
+                        down_improve,
+                    )
+                };
+
+            let sell_p0 = top_sell_price(excess_book, cfg, improve_ticks);
+            if sell_p0 > 0.0 {
+                build_sell_ladder(
+                    &mut desired,
+                    excess_token,
+                    sell_p0,
+                    excess_tick,
+                    base_size.min(unpaired),
+                    cfg.maker_sell_levels.max(1),
+                    ladder_step_ticks,
+                    cfg,
+                );
+            }
+        }
+    }
 
     if state.inventory.unpaired_shares() <= 1e-9 {
         let mut has_up = false;
@@ -275,6 +314,7 @@ pub fn build_desired_orders(
 fn build_ladder(
     out: &mut Vec<DesiredOrder>,
     token_id: &str,
+    side: OrderSide,
     p0: f64,
     tick: f64,
     base_size: f64,
@@ -309,6 +349,55 @@ fn build_ladder(
 
         out.push(DesiredOrder {
             token_id: token_id.to_string(),
+            side,
+            level,
+            price,
+            size,
+            post_only: true,
+            tif: TimeInForce::Gtc,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_sell_ladder(
+    out: &mut Vec<DesiredOrder>,
+    token_id: &str,
+    p0: f64,
+    tick: f64,
+    base_size: f64,
+    ladder_levels: usize,
+    ladder_step_ticks: u64,
+    cfg: &TradingConfig,
+) {
+    if p0 <= 0.0 || tick <= 0.0 {
+        return;
+    }
+
+    let step = ladder_step_ticks as f64 * tick;
+    for level in 0..ladder_levels {
+        let decay = if level == 0 {
+            1.0
+        } else {
+            cfg.size_decay.powi(level as i32)
+        };
+        let size = (base_size * decay).max(cfg.min_order_size_shares);
+        if size <= 0.0 {
+            continue;
+        }
+
+        let raw_price = p0 + (level as f64) * step;
+        let price = ceil_to_tick(raw_price.max(0.0), tick);
+        if price <= 0.0 {
+            continue;
+        }
+        if price < cfg.min_quote_price {
+            continue;
+        }
+
+        out.push(DesiredOrder {
+            token_id: token_id.to_string(),
+            side: OrderSide::Sell,
             level,
             price,
             size,
@@ -346,6 +435,33 @@ fn top_price(book: &TokenBookTop, cap: f64, cfg: &TradingConfig, improve_ticks: 
 
     let capped = comp.min(cap).min(0.99);
     floor_to_tick(capped.max(0.0), tick)
+}
+
+fn top_sell_price(book: &TokenBookTop, cfg: &TradingConfig, improve_ticks: u64) -> f64 {
+    let tick = book.tick_size;
+    if tick <= 0.0 {
+        return 0.0;
+    }
+
+    let improve_ticks = improve_ticks.min(cfg.max_improve_ticks);
+    let improve = improve_ticks as f64 * tick;
+
+    let mut ask = if let Some(best_ask) = book.best_ask {
+        // More aggressive asks are LOWER; undercut by improve ticks.
+        best_ask - improve
+    } else if let Some(bid) = book.best_bid {
+        bid + (cfg.min_ticks_from_ask.max(1) as f64) * tick
+    } else {
+        0.0
+    };
+
+    if let Some(bid) = book.best_bid {
+        let post_only_floor = bid + (cfg.min_ticks_from_ask.max(1) as f64) * tick;
+        ask = ask.max(post_only_floor);
+    }
+
+    let capped = ask.min(0.99);
+    ceil_to_tick(capped.max(0.0), tick)
 }
 
 fn observed_market_price(book: &TokenBookTop) -> Option<f64> {
@@ -414,6 +530,31 @@ fn floor_to_tick(price: f64, tick: f64) -> f64 {
     }
     if !rounded.is_finite() || rounded < 0.0 {
         return 0.0;
+    }
+    rounded
+}
+
+fn ceil_to_tick(price: f64, tick: f64) -> f64 {
+    if tick <= 0.0 || !price.is_finite() {
+        return 0.0;
+    }
+    let eps = (tick.abs() * 1e-6).max(1e-12);
+    let steps = ((price - eps) / tick).ceil();
+    if !steps.is_finite() {
+        return 0.0;
+    }
+    let mut rounded = steps * tick;
+    if rounded + eps < price {
+        rounded = (steps + 1.0) * tick;
+    }
+    if !rounded.is_finite() || rounded < 0.0 {
+        return 0.0;
+    }
+    if rounded > 1.0 + eps {
+        return 0.0;
+    }
+    if rounded > 1.0 && rounded <= 1.0 + eps {
+        rounded = 1.0;
     }
     rounded
 }

@@ -633,6 +633,7 @@ mod tests {
         let mut inventory_cfg = InventoryConfig::default();
         inventory_cfg.max_unpaired_shares_per_market = 1.0;
         inventory_cfg.max_unpaired_shares_global = 1.0;
+        inventory_cfg.taker_window_s = 30;
 
         let engine = StrategyEngine::new(
             TradingConfig::default(),
@@ -770,6 +771,7 @@ mod tests {
         let cfg = TradingConfig::default();
         let mut desired = vec![DesiredOrder {
             token_id: state.identity.token_up.clone(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.25,
             size: 1.0,
@@ -796,6 +798,7 @@ mod tests {
         let mut desired = vec![
             DesiredOrder {
                 token_id: state.identity.token_up.clone(),
+                side: crate::state::state_manager::OrderSide::Buy,
                 level: 0,
                 price: 0.25,
                 size: 1.0,
@@ -804,6 +807,7 @@ mod tests {
             },
             DesiredOrder {
                 token_id: state.identity.token_down.clone(),
+                side: crate::state::state_manager::OrderSide::Buy,
                 level: 0,
                 price: 0.25,
                 size: 1.0,
@@ -830,6 +834,7 @@ mod tests {
         let mut desired = vec![
             DesiredOrder {
                 token_id: state.identity.token_up.clone(),
+                side: crate::state::state_manager::OrderSide::Buy,
                 level: 0,
                 price: cfg.min_quote_price - 0.01,
                 size: 1.0,
@@ -838,6 +843,7 @@ mod tests {
             },
             DesiredOrder {
                 token_id: state.identity.token_down.clone(),
+                side: crate::state::state_manager::OrderSide::Buy,
                 level: 0,
                 price: cfg.min_quote_price + 0.05,
                 size: 1.0,
@@ -863,6 +869,7 @@ mod tests {
         let mut desired = vec![
             DesiredOrder {
                 token_id: state.identity.token_up.clone(),
+                side: crate::state::state_manager::OrderSide::Buy,
                 level: 0,
                 price: 0.49,
                 size: 1.0,
@@ -871,6 +878,7 @@ mod tests {
             },
             DesiredOrder {
                 token_id: state.identity.token_down.clone(),
+                side: crate::state::state_manager::OrderSide::Buy,
                 level: 0,
                 price: 0.49,
                 size: 1.0,

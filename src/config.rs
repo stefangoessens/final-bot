@@ -255,6 +255,11 @@ pub struct TradingConfig {
     pub max_improve_ticks: u64,
     pub min_ticks_from_ask: u64,
 
+    /// When enabled, post maker SELL orders on the excess token to unwind unpaired inventory.
+    pub maker_sell_enabled: bool,
+    pub maker_sell_trigger_unpaired_shares: f64,
+    pub maker_sell_levels: usize,
+
     pub reprice_min_ticks: u64,
     pub resize_min_pct: f64,
     pub min_update_interval_ms: u64,
@@ -323,6 +328,11 @@ impl Default for TradingConfig {
             base_improve_ticks: 0,
             max_improve_ticks: 2,
             min_ticks_from_ask: 1,
+
+            maker_sell_enabled: true,
+            maker_sell_trigger_unpaired_shares: 50.0,
+            maker_sell_levels: 1,
+
             reprice_min_ticks: 1,
             resize_min_pct: 0.10,
             min_update_interval_ms: 250,
@@ -470,6 +480,20 @@ impl TradingConfig {
             )));
         }
 
+        if !self.maker_sell_trigger_unpaired_shares.is_finite()
+            || self.maker_sell_trigger_unpaired_shares < 0.0
+        {
+            return Err(BotError::Config(format!(
+                "trading.maker_sell_trigger_unpaired_shares must be finite and >=0, got {}",
+                self.maker_sell_trigger_unpaired_shares
+            )));
+        }
+        if self.maker_sell_enabled && self.maker_sell_levels == 0 {
+            return Err(BotError::Config(
+                "trading.maker_sell_levels must be >=1 when maker_sell_enabled".to_string(),
+            ));
+        }
+
         if self.markout_horizon_short_ms <= 0 {
             return Err(BotError::Config(format!(
                 "trading.markout_horizon_short_ms must be >0, got {}",
@@ -594,7 +618,7 @@ impl Default for InventoryConfig {
             max_unpaired_shares_per_market: 250.0,
             max_unpaired_shares_global: 400.0,
             emergency_window_s: 90,
-            taker_window_s: 30,
+            taker_window_s: 900,
             completion_min_profit_per_share: 0.001,
             allow_taker_completion: true,
             allow_negative_completion: false,
@@ -850,6 +874,7 @@ pub struct CompletionConfig {
     pub order_type: CompletionOrderType,
     pub max_loss_usdc: f64,
     pub min_profit_per_share: f64,
+    pub controlled_loss_skew_shares: f64,
     pub use_explicit_price_cap: bool,
 }
 
@@ -859,7 +884,8 @@ impl Default for CompletionConfig {
             enabled: true,
             order_type: CompletionOrderType::Fak,
             max_loss_usdc: 10.0,
-            min_profit_per_share: 0.0005,
+            min_profit_per_share: 0.0,
+            controlled_loss_skew_shares: 50.0,
             use_explicit_price_cap: true,
         }
     }
@@ -877,6 +903,12 @@ impl CompletionConfig {
             return Err(BotError::Config(format!(
                 "completion.min_profit_per_share must be >=0, got {}",
                 self.min_profit_per_share
+            )));
+        }
+        if !self.controlled_loss_skew_shares.is_finite() || self.controlled_loss_skew_shares < 0.0 {
+            return Err(BotError::Config(format!(
+                "completion.controlled_loss_skew_shares must be finite and >=0, got {}",
+                self.controlled_loss_skew_shares
             )));
         }
         if self.enabled && !self.use_explicit_price_cap {

@@ -2,6 +2,7 @@
 
 use crate::config::{CompletionConfig, CompletionOrderType, InventoryConfig, TradingConfig};
 use crate::state::market_state::MarketState;
+use crate::state::state_manager::OrderSide;
 use crate::strategy::fee;
 use crate::strategy::DesiredOrder;
 use polymarket_client_sdk::clob::types::Side;
@@ -33,13 +34,13 @@ pub fn adjust_for_inventory(
     let down_shares = state.inventory.down.shares;
     let unpaired = (up_shares - down_shares).abs();
     if unpaired <= UNPAIRED_EPS {
-        let has_up = desired
+        let has_up_buy = desired
             .iter()
-            .any(|order| order.token_id == state.identity.token_up);
-        let has_down = desired
-            .iter()
-            .any(|order| order.token_id == state.identity.token_down);
-        if has_up ^ has_down {
+            .any(|order| order.token_id == state.identity.token_up && order.side == OrderSide::Buy);
+        let has_down_buy = desired.iter().any(|order| {
+            order.token_id == state.identity.token_down && order.side == OrderSide::Buy
+        });
+        if has_up_buy ^ has_down_buy {
             desired.clear();
         }
         return;
@@ -70,13 +71,13 @@ pub fn adjust_for_inventory(
     };
 
     for order in desired.iter_mut() {
-        if order.token_id == missing_token {
+        if order.token_id == missing_token && order.side == OrderSide::Buy {
             order.size *= missing_mult;
         }
     }
 
     // Strict pairing: when unpaired, do not quote *any* levels on the excess side.
-    desired.retain(|order| order.token_id != excess_token);
+    desired.retain(|order| !(order.token_id == excess_token && order.side == OrderSide::Buy));
 }
 
 pub fn should_taker_complete(
@@ -107,6 +108,10 @@ pub fn should_taker_complete(
     let emergency =
         severe || hardcap_breached || time_to_cancel_s <= inventory_cfg.emergency_window_s;
 
+    let controlled_loss = completion_cfg.max_loss_usdc > 0.0
+        && completion_cfg.controlled_loss_skew_shares > 0.0
+        && unpaired >= completion_cfg.controlled_loss_skew_shares;
+
     // FULL_SPEC 7.6(D),7.8: taker completion is time-gated; do not taker-complete purely due to skew.
     if time_to_cancel_s > inventory_cfg.taker_window_s && !hardcap_breached {
         return None;
@@ -129,7 +134,7 @@ pub fn should_taker_complete(
     };
 
     let avg_cost = excess_avg_cost?;
-    let min_profit = if emergency && completion_cfg.max_loss_usdc > 0.0 {
+    let min_profit = if (emergency || controlled_loss) && completion_cfg.max_loss_usdc > 0.0 {
         let max_loss_per_share = (completion_cfg.max_loss_usdc / unpaired).max(0.0);
         -max_loss_per_share.min(MAX_LOSS_PER_SHARE_CAP)
     } else {
@@ -239,7 +244,10 @@ pub fn apply_skew_repair_pricing(
         )
     };
 
-    if !desired.iter().any(|o| o.token_id == missing_token) {
+    if !desired
+        .iter()
+        .any(|o| o.token_id == missing_token && o.side == OrderSide::Buy)
+    {
         return;
     }
 
@@ -258,8 +266,12 @@ pub fn apply_skew_repair_pricing(
     let emergency =
         severe || hardcap_breached || time_to_cancel_s <= inventory_cfg.emergency_window_s;
 
+    let controlled_loss = completion_cfg.max_loss_usdc > 0.0
+        && completion_cfg.controlled_loss_skew_shares > 0.0
+        && unpaired >= completion_cfg.controlled_loss_skew_shares;
+
     // Hard cap derived from set-completion math (conservative: uses taker fee curve).
-    let min_profit = if emergency && completion_cfg.max_loss_usdc > 0.0 {
+    let min_profit = if (emergency || controlled_loss) && completion_cfg.max_loss_usdc > 0.0 {
         let max_loss_per_share = (completion_cfg.max_loss_usdc / unpaired).max(0.0);
         -max_loss_per_share.min(MAX_LOSS_PER_SHARE_CAP)
     } else {
@@ -302,7 +314,10 @@ pub fn apply_skew_repair_pricing(
         0.0
     };
 
-    for order in desired.iter_mut().filter(|o| o.token_id == missing_token) {
+    for order in desired
+        .iter_mut()
+        .filter(|o| o.token_id == missing_token && o.side == OrderSide::Buy)
+    {
         order.post_only = true;
 
         let level_offset = (order.level as f64) * step;
@@ -489,6 +504,7 @@ mod tests {
         let mut desired = vec![
             DesiredOrder {
                 token_id: state.identity.token_up.clone(),
+                side: OrderSide::Buy,
                 level: 0,
                 price: 0.4,
                 size: 1.0,
@@ -497,6 +513,7 @@ mod tests {
             },
             DesiredOrder {
                 token_id: state.identity.token_up.clone(),
+                side: OrderSide::Buy,
                 level: 1,
                 price: 0.39,
                 size: 1.0,
@@ -505,6 +522,7 @@ mod tests {
             },
             DesiredOrder {
                 token_id: state.identity.token_down.clone(),
+                side: OrderSide::Buy,
                 level: 0,
                 price: 0.4,
                 size: 1.0,
@@ -531,6 +549,7 @@ mod tests {
         let state = make_state(10_000_000);
         let mut desired = vec![DesiredOrder {
             token_id: state.identity.token_up.clone(),
+            side: OrderSide::Buy,
             level: 0,
             price: 0.4,
             size: 1.0,
@@ -837,6 +856,7 @@ mod tests {
         let mut desired = vec![
             DesiredOrder {
                 token_id: state.identity.token_down.clone(),
+                side: OrderSide::Buy,
                 level: 0,
                 price: 0.1,
                 size: 1.0,
@@ -845,6 +865,7 @@ mod tests {
             },
             DesiredOrder {
                 token_id: state.identity.token_down.clone(),
+                side: OrderSide::Buy,
                 level: 1,
                 price: 0.1,
                 size: 1.0,
@@ -853,6 +874,7 @@ mod tests {
             },
             DesiredOrder {
                 token_id: state.identity.token_down.clone(),
+                side: OrderSide::Buy,
                 level: 2,
                 price: 0.1,
                 size: 1.0,
@@ -910,6 +932,7 @@ mod tests {
 
         let mut desired = vec![DesiredOrder {
             token_id: state.identity.token_down.clone(),
+            side: OrderSide::Buy,
             level: 0,
             price: 0.25,
             size: 1.0,
@@ -1075,6 +1098,7 @@ mod tests {
         let mut desired = vec![
             DesiredOrder {
                 token_id: state.identity.token_up.clone(),
+                side: OrderSide::Buy,
                 level: 0,
                 price: 0.25,
                 size: 1.0,
@@ -1083,6 +1107,7 @@ mod tests {
             },
             DesiredOrder {
                 token_id: state.identity.token_up.clone(),
+                side: OrderSide::Buy,
                 level: 1,
                 price: 0.24,
                 size: 1.0,

@@ -51,6 +51,8 @@ async fn main() -> BotResult<()> {
     let (tx_completion, rx_completion) = mpsc::channel(256);
     let (tx_market_ws_cmd, rx_market_ws_cmd) = mpsc::channel(256);
     let (tx_user_orders, rx_user_orders) = mpsc::channel(256);
+    let (tx_order_seed, rx_order_seed) = mpsc::channel(64);
+    let (tx_user_ws_conn, rx_user_ws_conn) = mpsc::channel(64);
     let rewards_enabled = cfg.rewards.enable_liquidity_rewards_chasing;
     let (fatal_tx, fatal_rx) = tokio::sync::watch::channel::<Option<String>>(None);
     let data_api_user = reconciliation::resolve_data_api_user(&cfg);
@@ -302,7 +304,12 @@ async fn main() -> BotResult<()> {
         }
     }
     // W7.15: forward live order updates to StateManager for rewards scoring.
-    tokio::spawn(order_manager.run(rx_exec, tx_events.clone(), Some(tx_log.clone())));
+    tokio::spawn(order_manager.run(
+        rx_exec,
+        rx_order_seed,
+        tx_events.clone(),
+        Some(tx_log.clone()),
+    ));
 
     let completion_executor =
         execution::completion::CompletionExecutor::new(cfg.completion.clone(), rest.clone());
@@ -352,12 +359,27 @@ async fn main() -> BotResult<()> {
             )
         })?;
 
+        tokio::spawn(reconciliation::run_user_ws_open_orders_resync_loop(
+            std::sync::Arc::new(cfg.clone()),
+            clients::gamma::GammaClient::new(cfg.endpoints.gamma_base_url.clone()),
+            rest.clone(),
+            rx_user_ws_conn,
+            tx_events.clone(),
+            tx_order_seed,
+        ));
+
+        // NOTE: Polymarket User WS subscribe `markets` expects condition IDs (not slugs).
+        // To avoid startup Gamma lookups here, we subscribe to *all* user events by omitting
+        // the `markets` filter and rely on downstream filtering/resync.
+        let markets = Vec::new();
+
         let user_ws = clients::clob_ws_user::UserWsLoop::new(
             cfg.endpoints.clob_ws_user_url.clone(),
             creds.api_key,
             creds.api_secret,
             creds.api_passphrase,
-            Vec::new(),
+            markets,
+            Some(tx_user_ws_conn),
             Some(tx_user_orders),
         );
         let tx_log_user = tx_log.clone();

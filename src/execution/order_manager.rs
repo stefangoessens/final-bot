@@ -14,7 +14,7 @@ use crate::error::{BotError, BotResult};
 use crate::execution::batch;
 use crate::persistence::LogEvent;
 use crate::state::order_state::{LiveOrder, OrderStatus};
-use crate::state::state_manager::{AppEvent, FillEvent, OrderUpdate};
+use crate::state::state_manager::{AppEvent, FillEvent, OrderSeed, OrderSide, OrderUpdate};
 use crate::strategy::engine::ExecCommand;
 use crate::strategy::DesiredOrder;
 use crate::time::BTC_15M_INTERVAL_S;
@@ -173,6 +173,7 @@ impl OrderRestClient for ClobRestClient {
 #[derive(Debug, Clone)]
 struct CancelAction {
     token_id: String,
+    side: OrderSide,
     level: usize,
     order_id: String,
 }
@@ -191,9 +192,9 @@ impl DiffPlan {
 
 #[derive(Default)]
 struct MarketOrderCache {
-    live: HashMap<(String, usize), LiveOrder>,
-    last_update_ms: HashMap<(String, usize), i64>,
-    order_id_index: HashMap<String, (String, usize)>,
+    live: HashMap<(String, OrderSide, usize), LiveOrder>,
+    last_update_ms: HashMap<(String, OrderSide, usize), i64>,
+    order_id_index: HashMap<String, (String, OrderSide, usize)>,
     tracked_tokens: HashSet<String>,
     tick_size: HashMap<String, f64>,
     backoff_until_ms: i64,
@@ -202,7 +203,7 @@ struct MarketOrderCache {
 
 impl MarketOrderCache {
     fn insert_live(&mut self, order: LiveOrder) {
-        let key = (order.token_id.clone(), order.level);
+        let key = (order.token_id.clone(), order.side, order.level);
         self.order_id_index
             .insert(order.order_id.clone(), key.clone());
         self.last_update_ms
@@ -218,7 +219,7 @@ impl MarketOrderCache {
         self.tracked_tokens.clear();
     }
 
-    fn remove_live_by_key(&mut self, key: &(String, usize)) -> Option<LiveOrder> {
+    fn remove_live_by_key(&mut self, key: &(String, OrderSide, usize)) -> Option<LiveOrder> {
         let live = self.live.remove(key);
         if let Some(order) = &live {
             self.order_id_index.remove(&order.order_id);
@@ -227,7 +228,7 @@ impl MarketOrderCache {
         live
     }
 
-    fn key_for_order_id(&self, order_id: &str) -> Option<(String, usize)> {
+    fn key_for_order_id(&self, order_id: &str) -> Option<(String, OrderSide, usize)> {
         self.order_id_index.get(order_id).cloned()
     }
 
@@ -246,6 +247,9 @@ impl MarketOrderCache {
 
         let mut by_token: HashMap<String, Vec<&DesiredOrder>> = HashMap::new();
         for order in desired {
+            if order.side != OrderSide::Buy {
+                continue;
+            }
             by_token
                 .entry(order.token_id.clone())
                 .or_default()
@@ -281,7 +285,7 @@ impl MarketOrderCache {
 
     fn apply_dry_run(&mut self, plan: &DiffPlan, now_ms: i64) {
         for cancel in &plan.cancels {
-            let key = (cancel.token_id.clone(), cancel.level);
+            let key = (cancel.token_id.clone(), cancel.side, cancel.level);
             self.remove_live_by_key(&key);
         }
 
@@ -290,6 +294,7 @@ impl MarketOrderCache {
             self.insert_live(LiveOrder {
                 order_id,
                 token_id: post.token_id.clone(),
+                side: post.side,
                 level: post.level,
                 price: post.price,
                 size: post.size,
@@ -316,23 +321,27 @@ pub struct OrderManager {
 enum OmInternal {
     CancelBatch {
         slug: String,
+        gen: u64,
         now_ms: i64,
         cancels: Vec<CancelAction>,
         result: CancelResult,
     },
     CancelFinished {
         slug: String,
+        gen: u64,
         now_ms: i64,
         fatal: Option<BotError>,
     },
     PostBatch {
         slug: String,
+        gen: u64,
         now_ms: i64,
         posts: Vec<DesiredOrder>,
         outcome: PostOutcome,
     },
     PostFinished {
         slug: String,
+        gen: u64,
         now_ms: i64,
         fatal: Option<BotError>,
     },
@@ -346,6 +355,7 @@ enum InFlightStage {
 
 #[derive(Debug, Default)]
 struct InFlight {
+    gen: u64,
     busy: bool,
     stage: Option<InFlightStage>,
     current_cmd: Option<ExecCommand>,
@@ -397,6 +407,7 @@ impl OrderManager {
     pub async fn run(
         mut self,
         mut rx_exec: Receiver<ExecCommand>,
+        mut rx_seed: Receiver<OrderSeed>,
         tx_events: Sender<AppEvent>,
         log_tx: Option<Sender<LogEvent>>,
     ) {
@@ -413,6 +424,9 @@ impl OrderManager {
                         &tx_internal,
                         &mut inflight_by_slug,
                     );
+                }
+                Some(seed) = rx_seed.recv() => {
+                    self.apply_seed_orders(seed, &mut inflight_by_slug);
                 }
                 update = async {
                     match &mut user_orders {
@@ -439,6 +453,35 @@ impl OrderManager {
                 else => break,
             }
         }
+    }
+
+    fn apply_seed_orders(
+        &mut self,
+        seed: OrderSeed,
+        inflight_by_slug: &mut HashMap<String, InFlight>,
+    ) {
+        let slug = seed.slug.clone();
+        let cache = self.markets.entry(slug.clone()).or_default();
+        cache.clear();
+        for order in seed.orders {
+            cache.insert_live(order);
+        }
+
+        let slot = inflight_by_slug.entry(slug.clone()).or_default();
+        slot.gen = slot.gen.wrapping_add(1);
+        slot.busy = false;
+        slot.stage = None;
+        slot.current_cmd = None;
+        slot.pending_latest = None;
+        slot.post_failures = 0;
+
+        tracing::info!(
+            target: "order_manager",
+            slug = %slug,
+            live_orders = cache.live.len(),
+            action = "seed_orders",
+            "seeded live orders"
+        );
     }
 
     fn on_exec_nonblocking(
@@ -483,17 +526,25 @@ impl OrderManager {
         match msg {
             OmInternal::CancelBatch {
                 slug,
+                gen,
                 now_ms,
                 cancels,
                 result,
             } => {
+                if inflight_by_slug.get(&slug).map(|s| s.gen) != Some(gen) {
+                    return;
+                }
                 self.apply_cancel_batch(&slug, now_ms, cancels, result, Some(tx_events));
             }
             OmInternal::CancelFinished {
                 slug,
+                gen,
                 now_ms,
                 fatal,
             } => {
+                if inflight_by_slug.get(&slug).map(|s| s.gen) != Some(gen) {
+                    return;
+                }
                 if let Some(slot) = inflight_by_slug.get_mut(&slug) {
                     slot.stage = None;
                 }
@@ -526,10 +577,14 @@ impl OrderManager {
             }
             OmInternal::PostBatch {
                 slug,
+                gen,
                 now_ms,
                 posts,
                 outcome,
             } => {
+                if inflight_by_slug.get(&slug).map(|s| s.gen) != Some(gen) {
+                    return;
+                }
                 if let Some(slot) = inflight_by_slug.get_mut(&slug) {
                     slot.post_failures = slot.post_failures.saturating_add(outcome.failure_count());
                 }
@@ -537,9 +592,13 @@ impl OrderManager {
             }
             OmInternal::PostFinished {
                 slug,
+                gen,
                 now_ms,
                 fatal,
             } => {
+                if inflight_by_slug.get(&slug).map(|s| s.gen) != Some(gen) {
+                    return;
+                }
                 if let Some(slot) = inflight_by_slug.get_mut(&slug) {
                     slot.stage = None;
 
@@ -617,6 +676,12 @@ impl OrderManager {
     ) {
         let now_ms = now_ms();
         let slug = cmd.slug.clone();
+
+        let gen = {
+            let slot = inflight_by_slug.entry(slug.clone()).or_default();
+            slot.gen = slot.gen.wrapping_add(1);
+            slot.gen
+        };
 
         if self.owner.as_deref().unwrap_or_default().is_empty() {
             tracing::warn!(
@@ -754,7 +819,7 @@ impl OrderManager {
             let tx = tx_internal.clone();
             let log = log_tx.cloned();
             tokio::spawn(async move {
-                run_cancel_stage(rest, slug, now_ms, cancels, log, tx).await;
+                run_cancel_stage(rest, slug, gen, now_ms, cancels, log, tx).await;
             });
             return;
         }
@@ -768,7 +833,7 @@ impl OrderManager {
             let tx = tx_internal.clone();
             let log = log_tx.cloned();
             tokio::spawn(async move {
-                run_post_stage(rest, slug, now_ms, posts, log, tx).await;
+                run_post_stage(rest, slug, gen, now_ms, posts, log, tx).await;
             });
             return;
         }
@@ -825,12 +890,13 @@ impl OrderManager {
 
         for cancel in cancels {
             if canceled_ids.contains(&cancel.order_id) {
-                let key = (cancel.token_id.clone(), cancel.level);
+                let key = (cancel.token_id.clone(), cancel.side, cancel.level);
                 cache.remove_live_by_key(&key);
                 tracing::info!(
                     target: "order_manager",
                     slug = %slug,
                     token_id = %cancel.token_id,
+                    side = ?cancel.side,
                     level = cancel.level,
                     order_id = %cancel.order_id,
                     action = "cancel_sent",
@@ -841,6 +907,7 @@ impl OrderManager {
                     OrderUpdate::Remove {
                         slug: slug.to_string(),
                         token_id: cancel.token_id,
+                        side: cancel.side,
                         level: cancel.level,
                         order_id: cancel.order_id,
                         ts_ms: now_ms,
@@ -879,6 +946,7 @@ impl OrderManager {
                 let live = LiveOrder {
                     order_id: order_id.clone(),
                     token_id: post.token_id.clone(),
+                    side: post.side,
                     level: post.level,
                     price: post.price,
                     size: post.size,
@@ -898,6 +966,7 @@ impl OrderManager {
                     target: "order_manager",
                     slug = %slug,
                     token_id = %post.token_id,
+                    side = ?post.side,
                     level = post.level,
                     price = post.price,
                     size = post.size,
@@ -910,6 +979,7 @@ impl OrderManager {
                     target: "order_manager",
                     slug = %slug,
                     token_id = %post.token_id,
+                    side = ?post.side,
                     level = post.level,
                     price = post.price,
                     size = post.size,
@@ -989,7 +1059,7 @@ impl OrderManager {
         posts.retain(|post| {
             !cache
                 .live
-                .contains_key(&(post.token_id.clone(), post.level))
+                .contains_key(&(post.token_id.clone(), post.side, post.level))
         });
 
         // Defense-in-depth: never post a maker order below the quote floor, even if a
@@ -1317,6 +1387,7 @@ struct AppliedUserOrderUpdate {
 async fn run_cancel_stage(
     rest: Arc<dyn OrderRestClient>,
     slug: String,
+    gen: u64,
     now_ms: i64,
     cancels: Vec<CancelAction>,
     log_tx: Option<Sender<LogEvent>>,
@@ -1335,6 +1406,7 @@ async fn run_cancel_stage(
                 if tx_internal
                     .send(OmInternal::CancelBatch {
                         slug: slug.clone(),
+                        gen,
                         now_ms,
                         cancels: cancel_batch,
                         result,
@@ -1349,6 +1421,7 @@ async fn run_cancel_stage(
                 let _ = tx_internal
                     .send(OmInternal::CancelFinished {
                         slug: slug.clone(),
+                        gen,
                         now_ms,
                         fatal: Some(err),
                     })
@@ -1361,6 +1434,7 @@ async fn run_cancel_stage(
     let _ = tx_internal
         .send(OmInternal::CancelFinished {
             slug,
+            gen,
             now_ms,
             fatal: None,
         })
@@ -1370,6 +1444,7 @@ async fn run_cancel_stage(
 async fn run_post_stage(
     rest: Arc<dyn OrderRestClient>,
     slug: String,
+    gen: u64,
     now_ms: i64,
     posts: Vec<DesiredOrder>,
     log_tx: Option<Sender<LogEvent>>,
@@ -1386,6 +1461,7 @@ async fn run_post_stage(
                 let _ = tx_internal
                     .send(OmInternal::PostFinished {
                         slug: slug.clone(),
+                        gen,
                         now_ms,
                         fatal: Some(err),
                     })
@@ -1400,6 +1476,7 @@ async fn run_post_stage(
                 let _ = tx_internal
                     .send(OmInternal::PostFinished {
                         slug: slug.clone(),
+                        gen,
                         now_ms,
                         fatal: Some(err),
                     })
@@ -1412,6 +1489,7 @@ async fn run_post_stage(
             let _ = tx_internal
                 .send(OmInternal::PostFinished {
                     slug: slug.clone(),
+                    gen,
                     now_ms,
                     fatal: Some(BotError::Other(format!(
                         "post_orders returned {} results for {} orders",
@@ -1516,6 +1594,7 @@ async fn run_post_stage(
         if tx_internal
             .send(OmInternal::PostBatch {
                 slug: slug.clone(),
+                gen,
                 now_ms,
                 posts: post_batch,
                 outcome,
@@ -1530,6 +1609,7 @@ async fn run_post_stage(
     let _ = tx_internal
         .send(OmInternal::PostFinished {
             slug,
+            gen,
             now_ms,
             fatal: None,
         })
@@ -1593,12 +1673,13 @@ async fn execute_cancels(
 
     for cancel in &plan.cancels {
         if canceled_ids.contains(&cancel.order_id) {
-            let key = (cancel.token_id.clone(), cancel.level);
+            let key = (cancel.token_id.clone(), cancel.side, cancel.level);
             cache.remove_live_by_key(&key);
             tracing::info!(
                 target: "order_manager",
                 slug = %slug,
                 token_id = %cancel.token_id,
+                side = ?cancel.side,
                 level = cancel.level,
                 order_id = %cancel.order_id,
                 action = "cancel_sent",
@@ -1609,6 +1690,7 @@ async fn execute_cancels(
                 OrderUpdate::Remove {
                     slug: slug.to_string(),
                     token_id: cancel.token_id.clone(),
+                    side: cancel.side,
                     level: cancel.level,
                     order_id: cancel.order_id.clone(),
                     ts_ms: now_ms,
@@ -1790,6 +1872,7 @@ async fn execute_posts(
                     target: "order_manager",
                     slug = %slug,
                     token_id = %post.token_id,
+                    side = ?post.side,
                     level = post.level,
                     price = post.price,
                     size = post.size,
@@ -1805,6 +1888,7 @@ async fn execute_posts(
                     let live = LiveOrder {
                         order_id: order_id.clone(),
                         token_id: post.token_id.clone(),
+                        side: post.side,
                         level: post.level,
                         price: post.price,
                         size: post.size,
@@ -1824,6 +1908,7 @@ async fn execute_posts(
                         target: "order_manager",
                         slug = %slug,
                         token_id = %post.token_id,
+                        side = ?post.side,
                         level = post.level,
                         price = post.price,
                         size = post.size,
@@ -1836,6 +1921,7 @@ async fn execute_posts(
                         target: "order_manager",
                         slug = %slug,
                         token_id = %post.token_id,
+                        side = ?post.side,
                         level = post.level,
                         price = post.price,
                         size = post.size,
@@ -1870,6 +1956,7 @@ fn apply_user_order_update(
                 target: "order_manager",
                 slug = %slug,
                 token_id = %live.token_id,
+                side = ?live.side,
                 level = live.level,
                 order_id = %live.order_id,
                 action = "user_cancel",
@@ -1879,6 +1966,7 @@ fn apply_user_order_update(
                 order_update: OrderUpdate::Remove {
                     slug: slug.to_string(),
                     token_id: live.token_id.clone(),
+                    side: live.side,
                     level: live.level,
                     order_id: live.order_id.clone(),
                     ts_ms: update.ts_ms,
@@ -1891,6 +1979,7 @@ fn apply_user_order_update(
                 target: "order_manager",
                 slug = %slug,
                 token_id = %live.token_id,
+                side = ?live.side,
                 level = live.level,
                 order_id = %live.order_id,
                 action = "user_reject",
@@ -1900,6 +1989,7 @@ fn apply_user_order_update(
                 order_update: OrderUpdate::Remove {
                     slug: slug.to_string(),
                     token_id: live.token_id.clone(),
+                    side: live.side,
                     level: live.level,
                     order_id: live.order_id.clone(),
                     ts_ms: update.ts_ms,
@@ -1950,9 +2040,7 @@ fn apply_user_order_update(
         let fill = if delta > 0.0 && price.is_finite() && price > 0.0 {
             Some(FillEvent {
                 token_id: live.token_id.clone(),
-                side: update
-                    .side
-                    .unwrap_or(crate::state::state_manager::OrderSide::Buy),
+                side: update.side.unwrap_or(live.side),
                 price,
                 shares: delta,
                 ts_ms: update.ts_ms,
@@ -1966,6 +2054,7 @@ fn apply_user_order_update(
                 target: "order_manager",
                 slug = %slug,
                 token_id = %live.token_id,
+                side = ?live.side,
                 level = live.level,
                 order_id = %live.order_id,
                 matched,
@@ -1976,6 +2065,7 @@ fn apply_user_order_update(
                 order_update: OrderUpdate::Remove {
                     slug: slug.to_string(),
                     token_id: live.token_id.clone(),
+                    side: live.side,
                     level: live.level,
                     order_id: live.order_id.clone(),
                     ts_ms: update.ts_ms,
@@ -1988,6 +2078,7 @@ fn apply_user_order_update(
             target: "order_manager",
             slug = %slug,
             token_id = %live.token_id,
+            side = ?live.side,
             level = live.level,
             order_id = %live.order_id,
             remaining,
@@ -2020,6 +2111,7 @@ fn emit_dry_run_updates(
             OrderUpdate::Remove {
                 slug: slug.to_string(),
                 token_id: cancel.token_id.clone(),
+                side: cancel.side,
                 level: cancel.level,
                 order_id: cancel.order_id.clone(),
                 ts_ms: now_ms,
@@ -2036,6 +2128,7 @@ fn emit_dry_run_updates(
                 order: LiveOrder {
                     order_id,
                     token_id: post.token_id.clone(),
+                    side: post.side,
                     level: post.level,
                     price: post.price,
                     size: post.size,
@@ -2113,20 +2206,23 @@ fn order_posts_by_level(posts: &mut [DesiredOrder]) {
 
 fn diff_orders(
     desired: &[DesiredOrder],
-    live: &HashMap<(String, usize), LiveOrder>,
+    live: &HashMap<(String, OrderSide, usize), LiveOrder>,
     tick_size: &HashMap<String, f64>,
     cfg: &TradingConfig,
     now_ms: i64,
-    last_update_ms: &HashMap<(String, usize), i64>,
+    last_update_ms: &HashMap<(String, OrderSide, usize), i64>,
 ) -> DiffPlan {
-    let mut desired_map: HashMap<(String, usize), DesiredOrder> = HashMap::new();
+    let mut desired_map: HashMap<(String, OrderSide, usize), DesiredOrder> = HashMap::new();
     for order in desired {
-        desired_map.insert((order.token_id.clone(), order.level), order.clone());
+        desired_map.insert(
+            (order.token_id.clone(), order.side, order.level),
+            order.clone(),
+        );
     }
 
     let mut plan = DiffPlan::default();
     let mut cancel_ids: HashSet<String> = HashSet::new();
-    let mut post_keys: HashSet<(String, usize)> = HashSet::new();
+    let mut post_keys: HashSet<(String, OrderSide, usize)> = HashSet::new();
 
     for (key, desired_order) in &desired_map {
         match live.get(key) {
@@ -2157,6 +2253,7 @@ fn diff_orders(
                 if cancel_ids.insert(live_order.order_id.clone()) {
                     plan.cancels.push(CancelAction {
                         token_id: live_order.token_id.clone(),
+                        side: live_order.side,
                         level: live_order.level,
                         order_id: live_order.order_id.clone(),
                     });
@@ -2175,6 +2272,7 @@ fn diff_orders(
         if cancel_ids.insert(live_order.order_id.clone()) {
             plan.cancels.push(CancelAction {
                 token_id: live_order.token_id.clone(),
+                side: live_order.side,
                 level: live_order.level,
                 order_id: live_order.order_id.clone(),
             });
@@ -2213,9 +2311,9 @@ fn needs_update(desired: &DesiredOrder, live: &LiveOrder, tick: f64, cfg: &Tradi
 }
 
 fn is_debounced(
-    key: &(String, usize),
+    key: &(String, OrderSide, usize),
     live: &LiveOrder,
-    last_update_ms: &HashMap<(String, usize), i64>,
+    last_update_ms: &HashMap<(String, OrderSide, usize), i64>,
     now_ms: i64,
     min_update_interval_ms: u64,
 ) -> bool {
@@ -2242,7 +2340,7 @@ fn effective_live_size(live: &LiveOrder) -> f64 {
     }
 }
 
-fn log_plan(slug: &str, plan: &DiffPlan, live: &HashMap<(String, usize), LiveOrder>) {
+fn log_plan(slug: &str, plan: &DiffPlan, live: &HashMap<(String, OrderSide, usize), LiveOrder>) {
     let cancel_batches = batch::chunk(
         plan.cancels.iter().collect::<Vec<_>>(),
         batch::MAX_BATCH_ORDERS,
@@ -2257,7 +2355,7 @@ fn log_plan(slug: &str, plan: &DiffPlan, live: &HashMap<(String, usize), LiveOrd
             "planned cancel batch"
         );
         for cancel in batch {
-            let key = (cancel.token_id.clone(), cancel.level);
+            let key = (cancel.token_id.clone(), cancel.side, cancel.level);
             let (price, size) = live
                 .get(&key)
                 .map(|order| (order.price, effective_live_size(order)))
@@ -2266,6 +2364,7 @@ fn log_plan(slug: &str, plan: &DiffPlan, live: &HashMap<(String, usize), LiveOrd
                 target: "order_manager",
                 slug = %slug,
                 token_id = %cancel.token_id,
+                side = ?cancel.side,
                 level = cancel.level,
                 price,
                 size,
@@ -2294,6 +2393,7 @@ fn log_plan(slug: &str, plan: &DiffPlan, live: &HashMap<(String, usize), LiveOrd
                 target: "order_manager",
                 slug = %slug,
                 token_id = %post.token_id,
+                side = ?post.side,
                 level = post.level,
                 price = post.price,
                 size = post.size,
@@ -2815,6 +2915,7 @@ mod tests {
 
         let desired = vec![DesiredOrder {
             token_id: "token".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.52,
             size: 10.0,
@@ -2824,10 +2925,15 @@ mod tests {
 
         let mut live = HashMap::new();
         live.insert(
-            ("token".to_string(), 0),
+            (
+                "token".to_string(),
+                crate::state::state_manager::OrderSide::Buy,
+                0,
+            ),
             LiveOrder {
                 order_id: "order-1".to_string(),
                 token_id: "token".to_string(),
+                side: crate::state::state_manager::OrderSide::Buy,
                 level: 0,
                 price: 0.50,
                 size: 10.0,
@@ -2960,6 +3066,7 @@ mod tests {
 
         let desired = vec![DesiredOrder {
             token_id: "token".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.50,
             size: 10.5,
@@ -2969,10 +3076,15 @@ mod tests {
 
         let mut live = HashMap::new();
         live.insert(
-            ("token".to_string(), 0),
+            (
+                "token".to_string(),
+                crate::state::state_manager::OrderSide::Buy,
+                0,
+            ),
             LiveOrder {
                 order_id: "order-2".to_string(),
                 token_id: "token".to_string(),
+                side: crate::state::state_manager::OrderSide::Buy,
                 level: 0,
                 price: 0.50,
                 size: 10.0,
@@ -3012,6 +3124,7 @@ mod tests {
         cache.insert_live(LiveOrder {
             order_id: "order-old".to_string(),
             token_id: "token".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.50,
             size: 10.0,
@@ -3022,6 +3135,7 @@ mod tests {
 
         let desired = vec![DesiredOrder {
             token_id: "token".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.50,
             size: 12.0,
@@ -3058,6 +3172,7 @@ mod tests {
         cache.insert_live(LiveOrder {
             order_id: "order-old".to_string(),
             token_id: "token".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.50,
             size: 10.0,
@@ -3079,7 +3194,11 @@ mod tests {
 
         let cache = manager.markets.get(&slug).expect("cache exists");
         assert!(
-            !cache.live.contains_key(&("token".to_string(), 0)),
+            !cache.live.contains_key(&(
+                "token".to_string(),
+                crate::state::state_manager::OrderSide::Buy,
+                0
+            )),
             "expected order to be removed from cache"
         );
         assert!(
@@ -3105,6 +3224,7 @@ mod tests {
 
         let desired = vec![DesiredOrder {
             token_id: "token".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.42,
             size: 5.0,
@@ -3126,7 +3246,11 @@ mod tests {
         let cache = manager.markets.get(&slug).expect("cache exists");
         let live = cache
             .live
-            .get(&("token".to_string(), 0))
+            .get(&(
+                "token".to_string(),
+                crate::state::state_manager::OrderSide::Buy,
+                0,
+            ))
             .expect("order stored");
         assert_eq!(live.order_id, "order-123");
         assert_eq!(live.price, 0.42);
@@ -3143,6 +3267,7 @@ mod tests {
         cache.insert_live(LiveOrder {
             order_id: "order-1".to_string(),
             token_id: "token".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.50,
             size: 10.0,
@@ -3172,6 +3297,7 @@ mod tests {
 
         let desired = vec![DesiredOrder {
             token_id: "token".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.50,
             size: 10.0,
@@ -3214,6 +3340,7 @@ mod tests {
         cache.insert_live(LiveOrder {
             order_id: "order-1".to_string(),
             token_id: "token".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.50,
             size: 10.0,
@@ -3281,6 +3408,7 @@ mod tests {
 
         let desired = vec![DesiredOrder {
             token_id: "token".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.50,
             size: 10.0,
@@ -3351,6 +3479,7 @@ mod tests {
 
         let desired = vec![DesiredOrder {
             token_id: "token".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.50,
             size: 10.0,
@@ -3399,6 +3528,7 @@ mod tests {
 
         let desired = vec![DesiredOrder {
             token_id: "token".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.50,
             size: 10.0,
@@ -3453,6 +3583,7 @@ mod tests {
         cache.insert_live(LiveOrder {
             order_id: "order-1".to_string(),
             token_id: "token".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.50,
             size: 10.0,
@@ -3463,6 +3594,7 @@ mod tests {
 
         let desired = vec![DesiredOrder {
             token_id: "token".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.50,
             size: 12.0,
@@ -3484,6 +3616,7 @@ mod tests {
         let order = LiveOrder {
             order_id: "order-1".to_string(),
             token_id: "token".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.50,
             size: 10.0,
@@ -3492,7 +3625,14 @@ mod tests {
             last_update_ms: 0,
         };
 
-        cache.live.insert(("token".to_string(), 0), order.clone());
+        cache.live.insert(
+            (
+                "token".to_string(),
+                crate::state::state_manager::OrderSide::Buy,
+                0,
+            ),
+            order.clone(),
+        );
         let update = UserOrderUpdate {
             order_id: "order-1".to_string(),
             token_id: "token".to_string(),
@@ -3654,6 +3794,7 @@ mod tests {
         LiveOrder {
             order_id: order_id.to_string(),
             token_id: token_id.to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level,
             price,
             size,
@@ -3666,6 +3807,7 @@ mod tests {
     fn make_desired(token_id: &str, level: usize, price: f64, size: f64) -> DesiredOrder {
         DesiredOrder {
             token_id: token_id.to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level,
             price,
             size,
@@ -3706,6 +3848,7 @@ mod tests {
         let plan = DiffPlan {
             cancels: vec![CancelAction {
                 token_id: "token-a".to_string(),
+                side: crate::state::state_manager::OrderSide::Buy,
                 level: 0,
                 order_id: "order-old".to_string(),
             }],
@@ -3773,6 +3916,7 @@ mod tests {
         let plan = DiffPlan {
             cancels: vec![CancelAction {
                 token_id: "token-a".to_string(),
+                side: crate::state::state_manager::OrderSide::Buy,
                 level: 0,
                 order_id: "order-old".to_string(),
             }],
@@ -3851,6 +3995,7 @@ mod tests {
         cache.insert_live(LiveOrder {
             order_id: "order-1".to_string(),
             token_id: "token".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.50,
             size: 10.0,
@@ -3885,8 +4030,9 @@ mod tests {
         let manager = OrderManager::with_client(cfg, Arc::new(rest.clone()), rx_user_orders);
 
         let (tx_exec, rx_exec) = mpsc::channel(16);
+        let (_tx_seed, rx_seed) = mpsc::channel(16);
         let (tx_events, _rx_events) = mpsc::channel(128);
-        let handle = tokio::spawn(manager.run(rx_exec, tx_events, None));
+        let handle = tokio::spawn(manager.run(rx_exec, rx_seed, tx_events, None));
 
         let slug = future_slug();
         tx_exec

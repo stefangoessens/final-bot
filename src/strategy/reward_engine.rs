@@ -141,7 +141,7 @@ impl RewardRestClient for ClobRestClient {
 
 fn extract_level0_order_ids(state: &MarketState) -> HashSet<String> {
     let mut out = HashSet::new();
-    for ((_, level), order) in &state.orders.live {
+    for ((_, _, level), order) in &state.orders.live {
         if *level == 0 {
             out.insert(order.order_id.clone());
         }
@@ -172,12 +172,20 @@ pub fn apply_reward_hints(
     let up_live = state
         .orders
         .live
-        .get(&(state.identity.token_up.clone(), 0))
+        .get(&(
+            state.identity.token_up.clone(),
+            crate::state::state_manager::OrderSide::Buy,
+            0,
+        ))
         .and_then(|o| rewards.scoring.get(&o.order_id).copied());
     let down_live = state
         .orders
         .live
-        .get(&(state.identity.token_down.clone(), 0))
+        .get(&(
+            state.identity.token_down.clone(),
+            crate::state::state_manager::OrderSide::Buy,
+            0,
+        ))
         .and_then(|o| rewards.scoring.get(&o.order_id).copied());
 
     let mut summary = RewardApplySummary {
@@ -186,16 +194,18 @@ pub fn apply_reward_hints(
         ..RewardApplySummary::default()
     };
 
-    let Some(up_idx) = desired
-        .iter()
-        .position(|o| o.token_id == state.identity.token_up && o.level == 0)
-    else {
+    let Some(up_idx) = desired.iter().position(|o| {
+        o.token_id == state.identity.token_up
+            && o.side == crate::state::state_manager::OrderSide::Buy
+            && o.level == 0
+    }) else {
         return summary;
     };
-    let Some(down_idx) = desired
-        .iter()
-        .position(|o| o.token_id == state.identity.token_down && o.level == 0)
-    else {
+    let Some(down_idx) = desired.iter().position(|o| {
+        o.token_id == state.identity.token_down
+            && o.side == crate::state::state_manager::OrderSide::Buy
+            && o.level == 0
+    }) else {
         return summary;
     };
 
@@ -398,6 +408,7 @@ mod tests {
         state.orders.upsert(LiveOrder {
             order_id: "o_up".to_string(),
             token_id: "up".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.48,
             size: 1.0,
@@ -408,6 +419,7 @@ mod tests {
         state.orders.upsert(LiveOrder {
             order_id: "o_down".to_string(),
             token_id: "down".to_string(),
+            side: crate::state::state_manager::OrderSide::Buy,
             level: 0,
             price: 0.48,
             size: 1.0,
@@ -423,6 +435,7 @@ mod tests {
         vec![
             DesiredOrder {
                 token_id: "up".to_string(),
+                side: crate::state::state_manager::OrderSide::Buy,
                 level: 0,
                 price: 0.48,
                 size: 1.0,
@@ -431,6 +444,7 @@ mod tests {
             },
             DesiredOrder {
                 token_id: "down".to_string(),
+                side: crate::state::state_manager::OrderSide::Buy,
                 level: 0,
                 price: 0.48,
                 size: 1.0,
@@ -557,8 +571,9 @@ mod tests {
         trading_cfg.min_update_interval_ms = 0;
         let rest = ClobRestClient::new("http://localhost".to_string());
         let (_tx_user_orders, rx_user_orders) = mpsc::channel(1);
+        let (_tx_order_seed, rx_order_seed) = mpsc::channel(1);
         let order_manager = OrderManager::new(trading_cfg, rest, rx_user_orders);
-        tokio::spawn(order_manager.run(rx_exec, tx_events.clone(), None));
+        tokio::spawn(order_manager.run(rx_exec, rx_order_seed, tx_events.clone(), None));
 
         let now_s = now_ms() / 1_000;
         let slug = format!("btc-updown-15m-{now_s}");
@@ -582,6 +597,7 @@ mod tests {
         let desired = vec![
             DesiredOrder {
                 token_id: "up".to_string(),
+                side: crate::state::state_manager::OrderSide::Buy,
                 level: 0,
                 price: 0.48,
                 size: 1.0,
@@ -590,6 +606,7 @@ mod tests {
             },
             DesiredOrder {
                 token_id: "down".to_string(),
+                side: crate::state::state_manager::OrderSide::Buy,
                 level: 0,
                 price: 0.48,
                 size: 1.0,
