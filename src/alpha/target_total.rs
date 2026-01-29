@@ -35,7 +35,40 @@ pub fn compute_target_total(
 
     let raw =
         trading.target_total_base - vol_penalty - spread_penalty - time_penalty - fast_move_penalty;
-    raw.clamp(trading.target_total_min, trading.target_total_max)
+
+    let (lo, hi) = if trading.adaptive_target_total_enabled {
+        let tox = vol_ratio
+            .max(spread_ratio)
+            .max(time_ratio)
+            .max(if fast_move { 1.0 } else { 0.0 });
+        let min = lerp(
+            trading.target_total_min,
+            trading.target_total_min_toxic,
+            tox,
+        );
+        let max = lerp(
+            trading.target_total_max,
+            trading.target_total_max_toxic,
+            tox,
+        );
+        (min.min(max), max.max(min))
+    } else {
+        (trading.target_total_min, trading.target_total_max)
+    };
+
+    raw.clamp(lo, hi)
+}
+
+fn lerp(a: f64, b: f64, t: f64) -> f64 {
+    if !a.is_finite() || !b.is_finite() {
+        return a;
+    }
+    let t = if t.is_finite() {
+        t.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    a + (b - a) * t
 }
 
 #[cfg(test)]
@@ -49,6 +82,7 @@ mod tests {
             target_total_base: 0.985,
             target_total_min: 0.97,
             target_total_max: 0.99,
+            adaptive_target_total_enabled: false,
             ..TradingConfig::default()
         };
         let alpha = AlphaConfig {
@@ -64,5 +98,32 @@ mod tests {
 
         let high = compute_target_total(&trading, &alpha, 0.0, 0.0, 10_000.0, false);
         assert!(high <= trading.target_total_max + 1e-12);
+    }
+
+    #[test]
+    fn adaptive_target_total_can_go_below_normal_floor() {
+        let trading = TradingConfig {
+            adaptive_target_total_enabled: true,
+            target_total_min: 0.97,
+            target_total_max: 0.99,
+            target_total_min_toxic: 0.95,
+            target_total_max_toxic: 0.98,
+            ..TradingConfig::default()
+        };
+        let alpha = AlphaConfig {
+            var_ref: 1.0,
+            spread_ref: 1.0,
+            k_vol: 1.0,
+            k_spread: 0.0,
+            k_time: 0.0,
+            k_fast: 0.0,
+            ..AlphaConfig::default()
+        };
+
+        // vol_ratio=1 => tox=1 => clamp to toxic bounds.
+        let out = compute_target_total(&trading, &alpha, 1.0, 0.0, 10_000.0, false);
+        assert!(out <= trading.target_total_max_toxic + 1e-12);
+        assert!(out >= trading.target_total_min_toxic - 1e-12);
+        assert!(out < trading.target_total_min - 1e-12);
     }
 }

@@ -14,6 +14,13 @@ pub fn build_desired_orders(
         return Vec::new();
     }
 
+    // Maker quoting is toxic during fast moves and when oracles disagree: we get picked off.
+    // Instead, pause maker quotes and rely on the completion logic (time-gated) to handle
+    // any unpaired inventory as we approach cutoff.
+    if state.alpha.fast_move || state.alpha.oracle_disagree {
+        return Vec::new();
+    }
+
     let tick_up = state.up_book.tick_size.max(0.0);
     let tick_down = state.down_book.tick_size.max(0.0);
     if tick_up == 0.0 || tick_down == 0.0 {
@@ -65,7 +72,22 @@ pub fn build_desired_orders(
     let size_scalar = state.alpha.size_scalar.clamp(0.0, 1.0);
     let base_size = (base_size * size_scalar).max(cfg.min_order_size_shares);
 
-    let mut desired = Vec::with_capacity(cfg.ladder_levels.saturating_mul(2));
+    let (ladder_levels, ladder_step_ticks) = if cfg.adaptive_ladder_enabled {
+        let toxic = state.alpha.vol_ratio >= cfg.adaptive_ladder_vol_ratio_threshold
+            || state.alpha.binance_stale;
+        if toxic {
+            (
+                cfg.ladder_levels_toxic.max(1),
+                cfg.ladder_step_ticks_toxic.max(1),
+            )
+        } else {
+            (cfg.ladder_levels, cfg.ladder_step_ticks)
+        }
+    } else {
+        (cfg.ladder_levels, cfg.ladder_step_ticks)
+    };
+
+    let mut desired = Vec::with_capacity(ladder_levels.saturating_mul(2));
 
     build_ladder(
         &mut desired,
@@ -73,6 +95,8 @@ pub fn build_desired_orders(
         up_p0,
         tick_up,
         base_size,
+        ladder_levels,
+        ladder_step_ticks,
         cfg,
     );
     build_ladder(
@@ -81,6 +105,8 @@ pub fn build_desired_orders(
         down_p0,
         tick_down,
         base_size,
+        ladder_levels,
+        ladder_step_ticks,
         cfg,
     );
 
@@ -103,20 +129,23 @@ pub fn build_desired_orders(
     desired
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_ladder(
     out: &mut Vec<DesiredOrder>,
     token_id: &str,
     p0: f64,
     tick: f64,
     base_size: f64,
+    ladder_levels: usize,
+    ladder_step_ticks: u64,
     cfg: &TradingConfig,
 ) {
     if p0 <= 0.0 || tick <= 0.0 {
         return;
     }
 
-    let step = cfg.ladder_step_ticks as f64 * tick;
-    for level in 0..cfg.ladder_levels {
+    let step = ladder_step_ticks as f64 * tick;
+    for level in 0..ladder_levels {
         let decay = if level == 0 {
             1.0
         } else {

@@ -79,8 +79,25 @@ pub fn update_alpha(
     );
     let regime = regime_eval.regime;
 
+    market_state.alpha.chainlink_stale = regime_eval.chainlink_stale;
+    market_state.alpha.binance_stale = regime_eval.binance_stale;
+    market_state.alpha.market_ws_stale = regime_eval.market_ws_stale;
+    market_state.alpha.fast_move = regime_eval.fast_move;
+    market_state.alpha.oracle_disagree = regime_eval.oracle_disagree;
+
     let time_to_cancel_s = ((market_state.cutoff_ts_ms - now_ms).max(0) as f64) / 1_000.0;
     let avg_spread = average_spread(&market_state.up_book, &market_state.down_book).unwrap_or(0.0);
+
+    market_state.alpha.vol_ratio = if alpha_cfg.var_ref > 0.0 {
+        (var_per_s / alpha_cfg.var_ref).clamp(0.0, 10.0)
+    } else {
+        0.0
+    };
+    market_state.alpha.spread_ratio = if alpha_cfg.spread_ref > 0.0 {
+        (avg_spread / alpha_cfg.spread_ref).clamp(0.0, 10.0)
+    } else {
+        0.0
+    };
 
     let target_total = target_total::compute_target_total(
         trading_cfg,

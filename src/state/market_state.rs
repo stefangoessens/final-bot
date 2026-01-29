@@ -27,6 +27,10 @@ pub struct AlphaState {
     pub last_update_ms: i64,
     pub var_per_s: f64,
     pub drift_per_s: f64,
+    /// var_per_s / alpha.var_ref (clamped) for strategy heuristics.
+    pub vol_ratio: f64,
+    /// avg_spread / alpha.spread_ref (clamped) for strategy heuristics.
+    pub spread_ratio: f64,
     pub last_price: Option<f64>,
     pub last_ts_ms: Option<i64>,
     pub divergence_since_ms: Option<i64>,
@@ -34,6 +38,13 @@ pub struct AlphaState {
     pub fast_move_binance_ts_ms: Option<i64>,
     pub fast_move_chainlink_price: Option<f64>,
     pub fast_move_chainlink_ts_ms: Option<i64>,
+
+    // Regime flags (set by alpha::toxicity).
+    pub chainlink_stale: bool,
+    pub binance_stale: bool,
+    pub market_ws_stale: bool,
+    pub fast_move: bool,
+    pub oracle_disagree: bool,
 
     pub cap_up: f64,
     pub cap_down: f64,

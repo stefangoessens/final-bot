@@ -224,6 +224,12 @@ pub struct TradingConfig {
     pub target_total_min: f64,
     pub target_total_max: f64,
 
+    /// When enabled, allow `target_total` to widen (go lower) under toxic conditions
+    /// (high vol, wide spreads, close to cutoff, fast move).
+    pub adaptive_target_total_enabled: bool,
+    pub target_total_min_toxic: f64,
+    pub target_total_max_toxic: f64,
+
     pub cutoff_seconds: i64,
     /// Hard per-market USDC exposure cap (inventory cost + open order notional).
     pub max_usdc_exposure_per_market: f64,
@@ -233,6 +239,12 @@ pub struct TradingConfig {
 
     pub ladder_levels: usize,
     pub ladder_step_ticks: u64,
+
+    /// When enabled, reduce ladder depth / widen spacing under higher volatility.
+    pub adaptive_ladder_enabled: bool,
+    pub adaptive_ladder_vol_ratio_threshold: f64,
+    pub ladder_levels_toxic: usize,
+    pub ladder_step_ticks_toxic: u64,
     pub size_decay: f64,
 
     pub base_size_shares_current: f64,
@@ -260,11 +272,18 @@ impl Default for TradingConfig {
             target_total_base: 0.985,
             target_total_min: 0.97,
             target_total_max: 0.99,
+            adaptive_target_total_enabled: true,
+            target_total_min_toxic: 0.955,
+            target_total_max_toxic: 0.985,
             cutoff_seconds: 60,
             max_usdc_exposure_per_market: 10.0,
             min_quote_price: 0.20,
             ladder_levels: 2,
             ladder_step_ticks: 1,
+            adaptive_ladder_enabled: true,
+            adaptive_ladder_vol_ratio_threshold: 2.0,
+            ladder_levels_toxic: 1,
+            ladder_step_ticks_toxic: 2,
             size_decay: 0.6,
             base_size_shares_current: 5.0,
             base_size_shares_next: 3.0,
@@ -312,11 +331,50 @@ impl TradingConfig {
                 self.target_total_min, self.target_total_max
             )));
         }
+
+        if !(0.0..=1.0).contains(&self.target_total_min_toxic) {
+            return Err(BotError::Config(format!(
+                "trading.target_total_min_toxic must be in [0,1], got {}",
+                self.target_total_min_toxic
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.target_total_max_toxic) {
+            return Err(BotError::Config(format!(
+                "trading.target_total_max_toxic must be in [0,1], got {}",
+                self.target_total_max_toxic
+            )));
+        }
+        if self.target_total_min_toxic > self.target_total_max_toxic {
+            return Err(BotError::Config(format!(
+                "trading.target_total_min_toxic ({}) > trading.target_total_max_toxic ({})",
+                self.target_total_min_toxic, self.target_total_max_toxic
+            )));
+        }
+
+        if self.adaptive_ladder_vol_ratio_threshold < 0.0
+            || !self.adaptive_ladder_vol_ratio_threshold.is_finite()
+        {
+            return Err(BotError::Config(format!(
+                "trading.adaptive_ladder_vol_ratio_threshold must be finite and >=0, got {}",
+                self.adaptive_ladder_vol_ratio_threshold
+            )));
+        }
         if self.ladder_levels < 2 {
             return Err(BotError::Config(format!(
                 "trading.ladder_levels must be >=2, got {}",
                 self.ladder_levels
             )));
+        }
+        if self.ladder_levels_toxic == 0 {
+            return Err(BotError::Config(format!(
+                "trading.ladder_levels_toxic must be >=1, got {}",
+                self.ladder_levels_toxic
+            )));
+        }
+        if self.ladder_step_ticks_toxic == 0 {
+            return Err(BotError::Config(
+                "trading.ladder_step_ticks_toxic must be >=1".to_string(),
+            ));
         }
         if !self.max_usdc_exposure_per_market.is_finite()
             || self.max_usdc_exposure_per_market <= 0.0
