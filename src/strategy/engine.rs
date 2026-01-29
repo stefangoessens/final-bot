@@ -241,7 +241,7 @@ impl StrategyEngine {
             let safety_pruned = enforce_final_safety(&mut desired, &state, &self.trading);
 
             log_desired_summary(&slug, &state, &desired);
-            log_desired_orders(&log_tx, &slug, now_ms, &desired);
+            log_desired_orders(&log_tx, &slug, now_ms, &state, &desired);
             log_reward_summary(&log_tx, &slug, now_ms, &reward_summary);
             if budget_pruned {
                 log_budget_prune(&log_tx, &slug, now_ms, &state, &desired, &self.trading);
@@ -370,10 +370,23 @@ fn log_desired_summary(slug: &str, state: &MarketState, desired: &[DesiredOrder]
     let top_up = top_level_order(desired, &state.identity.token_up);
     let top_down = top_level_order(desired, &state.identity.token_down);
 
+    let level0_total = match (top_up.map(|o| o.price), top_down.map(|o| o.price)) {
+        (Some(u), Some(d)) => Some(u + d),
+        _ => None,
+    };
+
     tracing::info!(
         target: "strategy_engine",
         slug = %slug,
         desired_count = desired.len(),
+        target_total = state.alpha.target_total,
+        level0_total = ?level0_total,
+        level0_edge = ?level0_total.map(|x| 1.0 - x),
+        vol_ratio = state.alpha.vol_ratio,
+        spread_ratio = state.alpha.spread_ratio,
+        fast_move = state.alpha.fast_move,
+        oracle_disagree = state.alpha.oracle_disagree,
+        binance_stale = state.alpha.binance_stale,
         up_level = ?top_up.map(|o| o.level),
         up_price = ?top_up.map(|o| o.price),
         up_size = ?top_up.map(|o| o.size),
@@ -427,6 +440,7 @@ fn log_desired_orders(
     log_tx: &Option<Sender<LogEvent>>,
     slug: &str,
     ts_ms: i64,
+    state: &MarketState,
     desired: &[DesiredOrder],
 ) {
     let Some(tx) = log_tx else {
@@ -444,8 +458,26 @@ fn log_desired_orders(
             })
         })
         .collect();
+
+    let top_up = top_level_order(desired, &state.identity.token_up);
+    let top_down = top_level_order(desired, &state.identity.token_down);
+    let level0_total = match (top_up.map(|o| o.price), top_down.map(|o| o.price)) {
+        (Some(u), Some(d)) => Some(u + d),
+        _ => None,
+    };
+
     let payload = json!({
         "slug": slug,
+        "target_total": state.alpha.target_total,
+        "level0_total": level0_total,
+        "level0_edge": level0_total.map(|x| 1.0 - x),
+        "vol_ratio": state.alpha.vol_ratio,
+        "spread_ratio": state.alpha.spread_ratio,
+        "fast_move": state.alpha.fast_move,
+        "oracle_disagree": state.alpha.oracle_disagree,
+        "binance_stale": state.alpha.binance_stale,
+        "up_shares": state.inventory.up.shares,
+        "down_shares": state.inventory.down.shares,
         "count": desired.len(),
         "orders": orders,
     });

@@ -79,9 +79,9 @@ mod tests {
     #[test]
     fn target_total_clamps_to_bounds() {
         let trading = TradingConfig {
-            target_total_base: 0.985,
-            target_total_min: 0.97,
-            target_total_max: 0.99,
+            target_total_base: 0.992,
+            target_total_min: 0.98,
+            target_total_max: 0.995,
             adaptive_target_total_enabled: false,
             ..TradingConfig::default()
         };
@@ -104,10 +104,10 @@ mod tests {
     fn adaptive_target_total_can_go_below_normal_floor() {
         let trading = TradingConfig {
             adaptive_target_total_enabled: true,
-            target_total_min: 0.97,
-            target_total_max: 0.99,
-            target_total_min_toxic: 0.95,
-            target_total_max_toxic: 0.98,
+            target_total_min: 0.985,
+            target_total_max: 0.995,
+            target_total_min_toxic: 0.98,
+            target_total_max_toxic: 0.99,
             ..TradingConfig::default()
         };
         let alpha = AlphaConfig {

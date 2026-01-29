@@ -269,12 +269,15 @@ impl Default for TradingConfig {
         Self {
             dry_run: true,
             startup_cancel_all: true,
-            target_total_base: 0.985,
-            target_total_min: 0.97,
-            target_total_max: 0.99,
+            // Paired MM edge target: keep p_up + p_down in [0.98, 0.995]
+            // (i.e., ~0.5–2.0¢ theoretical edge), per user requirements.
+            target_total_base: 0.992,
+            target_total_min: 0.98,
+            target_total_max: 0.995,
             adaptive_target_total_enabled: true,
-            target_total_min_toxic: 0.955,
-            target_total_max_toxic: 0.985,
+            // In toxic regimes we only widen modestly (still within 0.98–0.995).
+            target_total_min_toxic: 0.98,
+            target_total_max_toxic: 0.99,
             cutoff_seconds: 60,
             max_usdc_exposure_per_market: 10.0,
             min_quote_price: 0.20,
@@ -283,7 +286,7 @@ impl Default for TradingConfig {
             adaptive_ladder_enabled: true,
             adaptive_ladder_vol_ratio_threshold: 2.0,
             ladder_levels_toxic: 1,
-            ladder_step_ticks_toxic: 2,
+            ladder_step_ticks_toxic: 1,
             size_decay: 0.6,
             base_size_shares_current: 5.0,
             base_size_shares_next: 3.0,
@@ -332,6 +335,15 @@ impl TradingConfig {
             )));
         }
 
+        if self.target_total_base + 1e-12 < self.target_total_min
+            || self.target_total_base > self.target_total_max + 1e-12
+        {
+            return Err(BotError::Config(format!(
+                "trading.target_total_base ({}) must be within [trading.target_total_min ({}), trading.target_total_max ({})]",
+                self.target_total_base, self.target_total_min, self.target_total_max
+            )));
+        }
+
         if !(0.0..=1.0).contains(&self.target_total_min_toxic) {
             return Err(BotError::Config(format!(
                 "trading.target_total_min_toxic must be in [0,1], got {}",
@@ -348,6 +360,20 @@ impl TradingConfig {
             return Err(BotError::Config(format!(
                 "trading.target_total_min_toxic ({}) > trading.target_total_max_toxic ({})",
                 self.target_total_min_toxic, self.target_total_max_toxic
+            )));
+        }
+
+        // Adaptive target_total is intended to widen (go lower) in toxicity.
+        if self.target_total_min_toxic > self.target_total_min + 1e-12 {
+            return Err(BotError::Config(format!(
+                "trading.target_total_min_toxic ({}) must be <= trading.target_total_min ({})",
+                self.target_total_min_toxic, self.target_total_min
+            )));
+        }
+        if self.target_total_max_toxic > self.target_total_max + 1e-12 {
+            return Err(BotError::Config(format!(
+                "trading.target_total_max_toxic ({}) must be <= trading.target_total_max ({})",
+                self.target_total_max_toxic, self.target_total_max
             )));
         }
 
