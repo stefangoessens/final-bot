@@ -88,7 +88,9 @@ impl StartupReconciler {
                     .send(AppEvent::MarketDiscovered(identity.clone()))
                     .await
                     .map_err(|_| {
-                        BotError::Other("startup reconciliation: state manager channel closed".to_string())
+                        BotError::Other(
+                            "startup reconciliation: state manager channel closed".to_string(),
+                        )
                     })?;
                 identities.push(identity);
             }
@@ -252,7 +254,10 @@ fn map_open_orders(
 fn map_positions(
     identities: &[MarketIdentity],
     positions: &[DataApiPosition],
-) -> (HashMap<String, InventorySeed>, HashMap<String, ReadinessFlags>) {
+) -> (
+    HashMap<String, InventorySeed>,
+    HashMap<String, ReadinessFlags>,
+) {
     let mut by_condition: HashMap<String, &MarketIdentity> = HashMap::new();
     for identity in identities {
         by_condition.insert(identity.condition_id.clone(), identity);
@@ -270,14 +275,14 @@ fn map_positions(
             continue;
         };
 
-        let entry = inventory_by_slug.entry(identity.slug.clone()).or_insert_with(|| {
-            InventorySeed {
+        let entry = inventory_by_slug
+            .entry(identity.slug.clone())
+            .or_insert_with(|| InventorySeed {
                 slug: identity.slug.clone(),
                 up: InventorySide::default(),
                 down: InventorySide::default(),
                 ts_ms: now_ms(),
-            }
-        });
+            });
 
         let notional = if pos.size.is_finite() && pos.avg_price.is_finite() {
             pos.size * pos.avg_price
@@ -346,12 +351,10 @@ pub fn resolve_data_api_user(cfg: &AppConfig) -> Option<String> {
                     .strip_prefix("0x")
                     .unwrap_or(private_key.trim());
                 if let Ok(signer) = pk.parse::<alloy_signer_local::PrivateKeySigner>() {
-                    if let Some(proxy) =
-                        polymarket_client_sdk::derive_proxy_wallet(
-                            signer.address(),
-                            polymarket_client_sdk::POLYGON,
-                        )
-                    {
+                    if let Some(proxy) = polymarket_client_sdk::derive_proxy_wallet(
+                        signer.address(),
+                        polymarket_client_sdk::POLYGON,
+                    ) {
                         return Some(proxy.to_string());
                     }
                     return Some(signer.address().to_string());
@@ -361,7 +364,10 @@ pub fn resolve_data_api_user(cfg: &AppConfig) -> Option<String> {
     }
     if let Some(private_key) = cfg.keys.private_key.as_deref() {
         if !private_key.trim().is_empty() {
-            let pk = private_key.trim().strip_prefix("0x").unwrap_or(private_key.trim());
+            let pk = private_key
+                .trim()
+                .strip_prefix("0x")
+                .unwrap_or(private_key.trim());
             if let Ok(signer) = pk.parse::<alloy_signer_local::PrivateKeySigner>() {
                 return Some(signer.address().to_string());
             }

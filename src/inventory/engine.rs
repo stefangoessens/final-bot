@@ -7,9 +7,9 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time;
 
 use crate::alpha::{toxicity, volatility};
+use crate::clients::data_api::DataApiClient;
 use crate::config::{AlphaConfig, MergeConfig, OracleConfig};
 use crate::inventory::onchain::OnchainRequest;
-use crate::clients::data_api::DataApiClient;
 use crate::state::market_state::MarketState;
 use crate::state::state_manager::QuoteTick;
 
@@ -29,8 +29,12 @@ pub enum InventoryAction {
         condition_id: String,
         qty_base_units: u64,
     },
-    Redeem { condition_id: String },
-    PauseMerges { reason: String },
+    Redeem {
+        condition_id: String,
+    },
+    PauseMerges {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -101,10 +105,8 @@ impl InventoryEngine {
                 continue;
             }
 
-            let full_sets_base_units = mergeable_base_units(
-                market.inventory.up.shares,
-                market.inventory.down.shares,
-            );
+            let full_sets_base_units =
+                mergeable_base_units(market.inventory.up.shares, market.inventory.down.shares);
             if full_sets_base_units < min_sets_base_units {
                 continue;
             }
@@ -165,9 +167,7 @@ impl InventoryEngine {
                 continue;
             }
             if matches!(
-                self.readiness
-                    .redeemable
-                    .get(&market.identity.condition_id),
+                self.readiness.redeemable.get(&market.identity.condition_id),
                 Some(false)
             ) {
                 tracing::info!(
@@ -212,8 +212,7 @@ impl InventoryEngine {
     }
 
     fn record_merge(&mut self, condition_id: &str, now_ms: i64) {
-        self.last_merge_ms
-            .insert(condition_id.to_string(), now_ms);
+        self.last_merge_ms.insert(condition_id.to_string(), now_ms);
         self.recent_ops.push_back(now_ms);
     }
 
@@ -236,8 +235,7 @@ impl InventoryEngine {
     }
 
     fn record_redeem(&mut self, condition_id: &str, now_ms: i64) {
-        self.last_redeem_ms
-            .insert(condition_id.to_string(), now_ms);
+        self.last_redeem_ms.insert(condition_id.to_string(), now_ms);
         self.recent_ops.push_back(now_ms);
     }
 
@@ -342,7 +340,11 @@ pub struct InventoryLoop {
 }
 
 impl InventoryLoop {
-    pub fn new(engine: InventoryEngine, executor: InventoryExecutor, merge_interval_s: u64) -> Self {
+    pub fn new(
+        engine: InventoryEngine,
+        executor: InventoryExecutor,
+        merge_interval_s: u64,
+    ) -> Self {
         Self {
             engine,
             executor,
@@ -353,12 +355,7 @@ impl InventoryLoop {
         }
     }
 
-    pub fn with_readiness(
-        mut self,
-        client: DataApiClient,
-        user: String,
-        interval_s: u64,
-    ) -> Self {
+    pub fn with_readiness(mut self, client: DataApiClient, user: String, interval_s: u64) -> Self {
         self.readiness_client = Some(client);
         self.readiness_user = Some(user);
         self.readiness_interval_s = interval_s.max(1);
@@ -368,7 +365,8 @@ impl InventoryLoop {
     pub async fn run(mut self, mut rx_quote: Receiver<QuoteTick>) {
         let interval_s = self.merge_interval_s.max(1);
         let mut tick = time::interval(Duration::from_secs(interval_s));
-        let mut readiness_tick = if self.readiness_client.is_some() && self.readiness_user.is_some() {
+        let mut readiness_tick = if self.readiness_client.is_some() && self.readiness_user.is_some()
+        {
             Some(time::interval(Duration::from_secs(
                 self.readiness_interval_s.max(1),
             )))
@@ -482,8 +480,10 @@ impl InventoryLoop {
                     entry.1 |= pos.redeemable;
                 }
                 for (condition_id, (mergeable, redeemable)) in by_condition {
-                    self.engine.set_mergeable_readiness(&condition_id, mergeable);
-                    self.engine.set_redeemable_readiness(&condition_id, redeemable);
+                    self.engine
+                        .set_mergeable_readiness(&condition_id, mergeable);
+                    self.engine
+                        .set_redeemable_readiness(&condition_id, redeemable);
                 }
             }
             Err(err) => {
@@ -534,9 +534,7 @@ fn log_inventory_actions(actions: &[InventoryAction]) {
                     "merge requested"
                 );
             }
-            InventoryAction::Redeem {
-                condition_id,
-            } => {
+            InventoryAction::Redeem { condition_id } => {
                 tracing::info!(target: "inventory_engine", condition_id = %condition_id, "redeem decision");
             }
             InventoryAction::PauseMerges { reason } => {
@@ -596,11 +594,8 @@ mod tests {
             wallet_mode: MergeWalletMode::Eoa,
             readiness_poll_interval_s: 30, // W7.15: keep tests aligned with config fields.
         };
-        let mut engine = InventoryEngine::new(
-            merge_cfg,
-            AlphaConfig::default(),
-            OracleConfig::default(),
-        );
+        let mut engine =
+            InventoryEngine::new(merge_cfg, AlphaConfig::default(), OracleConfig::default());
 
         let market_low = make_market("cond-low", 10.0, 30.0);
         let actions = engine.tick(0, &[market_low]);
@@ -629,11 +624,8 @@ mod tests {
             wallet_mode: MergeWalletMode::Eoa,
             readiness_poll_interval_s: 30,
         };
-        let mut engine = InventoryEngine::new(
-            merge_cfg,
-            AlphaConfig::default(),
-            OracleConfig::default(),
-        );
+        let mut engine =
+            InventoryEngine::new(merge_cfg, AlphaConfig::default(), OracleConfig::default());
 
         let market = make_market("cond", 50.0, 50.0);
         let actions = engine.tick(0, &[market.clone()]);
@@ -663,11 +655,8 @@ mod tests {
             wallet_mode: MergeWalletMode::Eoa,
             readiness_poll_interval_s: 30,
         };
-        let mut engine = InventoryEngine::new(
-            merge_cfg,
-            AlphaConfig::default(),
-            OracleConfig::default(),
-        );
+        let mut engine =
+            InventoryEngine::new(merge_cfg, AlphaConfig::default(), OracleConfig::default());
 
         let market_a = make_market("cond-a", 30.0, 30.0);
         let market_b = make_market("cond-b", 30.0, 30.0);
@@ -692,22 +681,23 @@ mod tests {
             wallet_mode: MergeWalletMode::Eoa,
             readiness_poll_interval_s: 30,
         };
-        let mut engine = InventoryEngine::new(
-            merge_cfg,
-            AlphaConfig::default(),
-            OracleConfig::default(),
-        );
+        let mut engine =
+            InventoryEngine::new(merge_cfg, AlphaConfig::default(), OracleConfig::default());
         engine.set_mergeable_readiness("cond", false);
 
         let market = make_market("cond", 60.0, 55.0);
         let actions = engine.tick(0, &[market]);
-        assert!(!actions.iter().any(|action| matches!(action, InventoryAction::Merge { .. })));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, InventoryAction::Merge { .. })));
 
         engine.set_redeemable_readiness("cond", false);
         let mut closed_market = make_market("cond", 10.0, 10.0);
         closed_market.identity.closed = true;
         let actions = engine.tick(10_000, &[closed_market]);
-        assert!(!actions.iter().any(|action| matches!(action, InventoryAction::Redeem { .. })));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, InventoryAction::Redeem { .. })));
     }
 
     #[test]
@@ -722,11 +712,8 @@ mod tests {
             wallet_mode: MergeWalletMode::Relayer,
             readiness_poll_interval_s: 30,
         };
-        let mut engine = InventoryEngine::new(
-            merge_cfg,
-            AlphaConfig::default(),
-            OracleConfig::default(),
-        );
+        let mut engine =
+            InventoryEngine::new(merge_cfg, AlphaConfig::default(), OracleConfig::default());
 
         let market = make_market("cond", 30.0, 30.0);
         let actions = engine.tick(0, &[market]);

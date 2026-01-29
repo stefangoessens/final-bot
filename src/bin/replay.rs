@@ -161,7 +161,9 @@ fn parse_bool(value: &str, default: bool) -> bool {
 fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  replay <path> [--ordering seq|ts|file] [--strict true|false]");
-    eprintln!("  stress <path> [--ordering seq|ts|file] [--strict true|false] [--speed N] [--sleep]");
+    eprintln!(
+        "  stress <path> [--ordering seq|ts|file] [--strict true|false] [--speed N] [--sleep]"
+    );
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  cargo run --bin replay -- replay ./logs/events.jsonl");

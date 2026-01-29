@@ -24,6 +24,7 @@ const BACKOFF_BASE_MS: u64 = 250;
 const BACKOFF_MAX_MS: u64 = 5_000;
 const UNKNOWN_USER_UPDATE_WARN_INTERVAL_MS: i64 = 30_000;
 const UNKNOWN_USER_UPDATE_CANCEL_INTERVAL_MS: i64 = 10_000;
+const FILL_CANCEL_INTERVAL_MS: i64 = 250;
 const ORDERS_PER_MIN_WINDOW_MS: i64 = 60_000;
 
 #[derive(Debug, Default)]
@@ -58,6 +59,27 @@ impl UnknownUserUpdateLimiter {
         }
         self.last_cancel_ms_by_order
             .insert(order_id.to_string(), now_ms);
+        true
+    }
+}
+
+#[derive(Debug, Default)]
+struct FillCancelLimiter {
+    last_cancel_ms_by_token: HashMap<(String, String), i64>,
+}
+
+impl FillCancelLimiter {
+    fn should_cancel(&mut self, slug: &str, token_id: &str, now_ms: i64) -> bool {
+        if slug.is_empty() || token_id.is_empty() {
+            return false;
+        }
+        let key = (slug.to_string(), token_id.to_string());
+        if let Some(last) = self.last_cancel_ms_by_token.get(&key) {
+            if now_ms.saturating_sub(*last) < FILL_CANCEL_INTERVAL_MS {
+                return false;
+            }
+        }
+        self.last_cancel_ms_by_token.insert(key, now_ms);
         true
     }
 }
@@ -286,6 +308,7 @@ pub struct OrderManager {
     owner: Option<String>,
     user_orders: Option<Receiver<UserOrderUpdate>>,
     unknown_update_limiter: UnknownUserUpdateLimiter,
+    fill_cancel_limiter: FillCancelLimiter,
     post_limiter: OrdersPerMinLimiter,
 }
 
@@ -311,6 +334,7 @@ impl OrderManager {
             owner: default_owner_from_env(),
             user_orders: Some(user_orders),
             unknown_update_limiter: UnknownUserUpdateLimiter::default(),
+            fill_cancel_limiter: FillCancelLimiter::default(),
             post_limiter,
         }
     }
@@ -373,7 +397,7 @@ impl OrderManager {
 
         cache.update_tick_cache(&cmd.desired, self.cfg.ladder_step_ticks);
 
-        let plan = diff_orders(
+        let mut plan = diff_orders(
             &cmd.desired,
             &cache.live,
             &cache.tick_size,
@@ -381,6 +405,8 @@ impl OrderManager {
             now_ms,
             &cache.last_update_ms,
         );
+
+        order_posts_by_level(&mut plan.posts);
 
         if plan.is_empty() {
             return;
@@ -492,7 +518,14 @@ impl OrderManager {
         update: UserOrderUpdate,
         tx_events: Option<&Sender<AppEvent>>,
     ) {
+        let now_ms = if update.ts_ms > 0 {
+            update.ts_ms
+        } else {
+            now_ms()
+        };
         let mut tracked_slug: Option<String> = None;
+        let mut applied_update: Option<(String, AppliedUserOrderUpdate, Vec<OrderId>, String)> =
+            None;
 
         for (slug, cache) in self.markets.iter_mut() {
             if tracked_slug.is_none() && cache.tracks_token(&update.token_id) {
@@ -500,22 +533,60 @@ impl OrderManager {
             }
 
             if let Some(applied) = apply_user_order_update(cache, &update, slug) {
+                let mut cancel_ids: Vec<OrderId> = Vec::new();
+                let mut fill_token = String::new();
                 if let Some(fill) = applied.fill.as_ref() {
-                    tracing::debug!(
-                        target: "order_manager",
-                        slug = %slug,
-                        order_id = %update.order_id,
-                        token_id = %fill.token_id,
-                        price = fill.price,
-                        shares = fill.shares,
-                        ts_ms = fill.ts_ms,
-                        action = "user_fill_delta",
-                        "fill delta derived from user order update"
-                    );
+                    fill_token = fill.token_id.clone();
+                    // When a fill occurs, immediately cancel any remaining orders on the same token
+                    // to prevent getting swept deeper on one side before the next strategy tick.
+                    cancel_ids = cache
+                        .live
+                        .values()
+                        .filter(|order| order.token_id == fill.token_id)
+                        .filter(|order| order.remaining.is_finite() && order.remaining > 0.0)
+                        .map(|order| order.order_id.clone())
+                        .collect();
                 }
-                emit_order_update(tx_events, applied.order_update);
-                return;
+
+                applied_update = Some((slug.clone(), applied, cancel_ids, fill_token));
+                break;
             }
+        }
+
+        if let Some((slug, applied, mut cancel_ids, fill_token)) = applied_update {
+            if let Some(fill) = applied.fill.as_ref() {
+                tracing::debug!(
+                    target: "order_manager",
+                    slug = %slug,
+                    order_id = %update.order_id,
+                    token_id = %fill.token_id,
+                    side = ?fill.side,
+                    price = fill.price,
+                    shares = fill.shares,
+                    ts_ms = fill.ts_ms,
+                    action = "user_fill_delta",
+                    "fill delta derived from user order update"
+                );
+            }
+
+            emit_order_update(tx_events, applied.order_update);
+
+            if !self.cfg.dry_run
+                && !cancel_ids.is_empty()
+                && !fill_token.is_empty()
+                && self
+                    .fill_cancel_limiter
+                    .should_cancel(&slug, &fill_token, now_ms)
+            {
+                cancel_ids.sort();
+                cancel_ids.dedup();
+                let rest = Arc::clone(&self.rest);
+                tokio::spawn(async move {
+                    cancel_on_fill(rest, slug, fill_token, cancel_ids).await;
+                });
+            }
+
+            return;
         }
 
         let Some(slug) = tracked_slug else {
@@ -527,12 +598,6 @@ impl OrderManager {
                 "ignoring user order update for untracked token"
             );
             return;
-        };
-
-        let now_ms = if update.ts_ms > 0 {
-            update.ts_ms
-        } else {
-            now_ms()
         };
 
         let is_potentially_live = matches!(
@@ -725,6 +790,53 @@ async fn execute_cancels(
     Ok(())
 }
 
+async fn cancel_on_fill(
+    rest: Arc<dyn OrderRestClient>,
+    slug: String,
+    token_id: String,
+    order_ids: Vec<OrderId>,
+) {
+    if order_ids.is_empty() {
+        return;
+    }
+
+    tracing::warn!(
+        target: "order_manager",
+        slug = %slug,
+        token_id = %token_id,
+        count = order_ids.len(),
+        action = "cancel_on_fill",
+        "triggering cancel sweep after fill"
+    );
+
+    let batches = batch::chunk(order_ids, batch::MAX_BATCH_ORDERS);
+    for ids in batches {
+        match rest.cancel_orders(ids.clone()).await {
+            Ok(result) => {
+                tracing::info!(
+                    target: "order_manager",
+                    slug = %slug,
+                    token_id = %token_id,
+                    canceled = result.canceled.len(),
+                    failed = result.failed.len(),
+                    action = "cancel_on_fill_result",
+                    "cancel-on-fill batch completed"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "order_manager",
+                    slug = %slug,
+                    token_id = %token_id,
+                    error = %err,
+                    action = "cancel_on_fill_error",
+                    "cancel-on-fill batch errored"
+                );
+            }
+        }
+    }
+}
+
 fn is_terminal_cancel_failure(reason: &str) -> bool {
     let reason = reason.to_lowercase();
     if reason.contains("not found") || reason.contains("does not exist") {
@@ -773,42 +885,76 @@ async fn execute_posts(
 
         log_post_result(log_tx, slug, &outcome, now_ms);
 
-        for (post, result) in post_batch.into_iter().zip(outcome.results.iter()) {
-            if result.error.is_none() && result.order_id.is_some() {
-                let order_id = result
-                    .order_id
-                    .as_ref()
-                    .expect("checked order_id.is_some");
-                let live = LiveOrder {
-                    order_id: order_id.clone(),
-                    token_id: post.token_id.clone(),
-                    level: post.level,
-                    price: post.price,
-                    size: post.size,
-                    remaining: post.size,
-                    status: OrderStatus::Open,
-                    last_update_ms: now_ms,
-                };
-                cache.insert_live(live.clone());
-                emit_order_update(
-                    tx_events,
-                    OrderUpdate::Upsert {
-                        slug: slug.to_string(),
-                        order: live,
-                    },
-                );
-                tracing::info!(
+        let token_count = post_batch
+            .iter()
+            .map(|post| post.token_id.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        let had_reject = outcome.results.iter().any(|result| result.error.is_some());
+
+        let mut results = outcome.results;
+        if token_count >= 2 && had_reject {
+            let reject_errors: Vec<&str> = results
+                .iter()
+                .filter_map(|result| result.error.as_deref())
+                .collect();
+            let all_rejects_post_only = !reject_errors.is_empty()
+                && reject_errors
+                    .iter()
+                    .all(|reason| is_expected_post_only_reject(reason));
+            let revert_error = if all_rejects_post_only {
+                "reverted due to post-only reject"
+            } else {
+                "reverted due to partial post"
+            };
+
+            let accepted_ids: Vec<OrderId> = results
+                .iter()
+                .filter(|result| result.error.is_none() && result.order_id.is_some())
+                .filter_map(|result| result.order_id.clone())
+                .collect();
+
+            if !accepted_ids.is_empty() {
+                tracing::warn!(
                     target: "order_manager",
                     slug = %slug,
-                    token_id = %post.token_id,
-                    level = post.level,
-                    price = post.price,
-                    size = post.size,
-                    order_id = %order_id,
-                    action = "post_sent",
-                    "order posted"
+                    accepted = accepted_ids.len(),
+                    action = "post_partial_revert",
+                    "partial post detected; reverting by canceling accepted orders"
                 );
-            } else {
+                let cancel_batches = batch::chunk(accepted_ids, batch::MAX_BATCH_ORDERS);
+                for ids in cancel_batches {
+                    match rest.cancel_orders(ids.clone()).await {
+                        Ok(result) => {
+                            tracing::info!(
+                                target: "order_manager",
+                                slug = %slug,
+                                canceled = result.canceled.len(),
+                                failed = result.failed.len(),
+                                action = "post_partial_revert_result",
+                                "revert cancel batch completed"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "order_manager",
+                                slug = %slug,
+                                error = %err,
+                                action = "post_partial_revert_error",
+                                "revert cancel batch errored"
+                            );
+                        }
+                    }
+                }
+            }
+
+            for result in results.iter_mut() {
+                if result.error.is_none() && result.order_id.is_some() {
+                    result.error = Some(revert_error.to_string());
+                }
+            }
+
+            for post in post_batch.into_iter() {
                 tracing::warn!(
                     target: "order_manager",
                     slug = %slug,
@@ -816,15 +962,62 @@ async fn execute_posts(
                     level = post.level,
                     price = post.price,
                     size = post.size,
-                    order_id = result.order_id.as_deref().unwrap_or(""),
-                    error = result.error.as_deref().unwrap_or("unknown"),
-                    action = "post_failed",
-                    "order post failed"
+                    error = revert_error,
+                    action = "post_reverted",
+                    "post reverted due to partial batch outcome"
                 );
+            }
+        } else {
+            for (post, result) in post_batch.into_iter().zip(results.iter()) {
+                if result.error.is_none() && result.order_id.is_some() {
+                    let order_id = result.order_id.as_ref().expect("checked order_id.is_some");
+                    let live = LiveOrder {
+                        order_id: order_id.clone(),
+                        token_id: post.token_id.clone(),
+                        level: post.level,
+                        price: post.price,
+                        size: post.size,
+                        remaining: post.size,
+                        status: OrderStatus::Open,
+                        last_update_ms: now_ms,
+                    };
+                    cache.insert_live(live.clone());
+                    emit_order_update(
+                        tx_events,
+                        OrderUpdate::Upsert {
+                            slug: slug.to_string(),
+                            order: live,
+                        },
+                    );
+                    tracing::info!(
+                        target: "order_manager",
+                        slug = %slug,
+                        token_id = %post.token_id,
+                        level = post.level,
+                        price = post.price,
+                        size = post.size,
+                        order_id = %order_id,
+                        action = "post_sent",
+                        "order posted"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "order_manager",
+                        slug = %slug,
+                        token_id = %post.token_id,
+                        level = post.level,
+                        price = post.price,
+                        size = post.size,
+                        order_id = result.order_id.as_deref().unwrap_or(""),
+                        error = result.error.as_deref().unwrap_or("unknown"),
+                        action = "post_failed",
+                        "order post failed"
+                    );
+                }
             }
         }
 
-        all_results.extend(outcome.results.into_iter());
+        all_results.extend(results.into_iter());
     }
 
     Ok(PostOutcome {
@@ -926,7 +1119,9 @@ fn apply_user_order_update(
         let fill = if delta > 0.0 && price.is_finite() && price > 0.0 {
             Some(FillEvent {
                 token_id: live.token_id.clone(),
-                side: crate::state::state_manager::OrderSide::Buy,
+                side: update
+                    .side
+                    .unwrap_or(crate::state::state_manager::OrderSide::Buy),
                 price,
                 shares: delta,
                 ts_ms: update.ts_ms,
@@ -1073,6 +1268,16 @@ fn default_owner_from_env() -> Option<String> {
     std::env::var("PMMB_KEYS__CLOB_API_KEY")
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+fn order_posts_by_level(posts: &mut [DesiredOrder]) {
+    // Ensures level-0 orders are posted first (helps avoid persistent one-sided quoting when
+    // balance/allowance constraints cause partial batch acceptance).
+    posts.sort_by(|a, b| {
+        a.level
+            .cmp(&b.level)
+            .then_with(|| a.token_id.cmp(&b.token_id))
+    });
 }
 
 fn diff_orders(
@@ -2107,7 +2312,10 @@ mod tests {
     fn orders_per_min_limiter_resets_window() {
         let mut limiter = OrdersPerMinLimiter::new(3);
         assert!(limiter.try_acquire(1_000, 2));
-        assert!(!limiter.try_acquire(1_100, 2), "should exceed limit within window");
+        assert!(
+            !limiter.try_acquire(1_100, 2),
+            "should exceed limit within window"
+        );
         assert!(limiter.try_acquire(1_000 + ORDERS_PER_MIN_WINDOW_MS, 2));
     }
 
@@ -2125,7 +2333,10 @@ mod tests {
         let mut manager = OrderManager::with_client(cfg, Arc::new(mock.clone()), rx_user_orders);
 
         let slug_a = future_slug();
-        let slug_b = format!("btc-updown-15m-{}", now_ms() / 1_000 + BTC_15M_INTERVAL_S * 2);
+        let slug_b = format!(
+            "btc-updown-15m-{}",
+            now_ms() / 1_000 + BTC_15M_INTERVAL_S * 2
+        );
 
         let desired = vec![DesiredOrder {
             token_id: "token".to_string(),
@@ -2583,7 +2794,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_post_accept_reject_keeps_cache() {
+    async fn partial_post_accept_reject_reverts_batch() {
         let mock = MockRestClient::new();
         mock.push_post_outcome(vec![
             PostResult {
@@ -2608,9 +2819,15 @@ mod tests {
             .expect("post ok");
         assert_eq!(outcome.results.len(), 2);
 
-        assert!(cache.key_for_order_id("order-accept").is_some());
-        assert_eq!(cache.live.len(), 1);
+        // New behavior: when posting both tokens in a batch, we revert (cancel accepted) if any
+        // order is rejected, to avoid persistent one-sided exposure.
+        assert!(cache.key_for_order_id("order-accept").is_none());
+        assert!(cache.live.is_empty());
+        assert!(outcome.results[0].error.is_some());
         assert_cache_consistent(&cache);
+
+        let calls = mock.calls.lock().unwrap().clone();
+        assert_eq!(calls, vec!["sign", "post", "cancel"]);
     }
 
     #[tokio::test]

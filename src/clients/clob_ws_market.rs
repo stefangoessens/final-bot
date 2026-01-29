@@ -450,12 +450,7 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn log_raw_frame(
-    log_tx: &Option<Sender<LogEvent>>,
-    event: &str,
-    ts_ms: i64,
-    text: &str,
-) {
+fn log_raw_frame(log_tx: &Option<Sender<LogEvent>>, event: &str, ts_ms: i64, text: &str) {
     let Some(tx) = log_tx else {
         return;
     };

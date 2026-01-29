@@ -6,8 +6,8 @@ use crate::clients::clob_public::ClobPublicClient;
 use crate::clients::clob_ws_market::MarketWsCommand;
 use crate::clients::gamma::GammaClient;
 use crate::error::BotResult;
-use crate::state::state_manager::{AppEvent, TickSizeSeed};
 use crate::state::market_state::MarketIdentity;
+use crate::state::state_manager::{AppEvent, TickSizeSeed};
 use crate::time::{interval_start_s, now_s, BTC_15M_INTERVAL_S};
 
 #[derive(Debug, Clone)]
@@ -176,9 +176,14 @@ impl MarketDiscoveryLoop {
                 (slugs.cur_slug.clone(), slugs.cur_start_s, true, true),
                 (slugs.next_slug.clone(), slugs.next_start_s, true, true),
             ] {
-                let identity =
-                    fetch_or_cached_identity(&self.gamma, &slug, interval_start, &mut identity_cache, fetch)
-                        .await?;
+                let identity = fetch_or_cached_identity(
+                    &self.gamma,
+                    &slug,
+                    interval_start,
+                    &mut identity_cache,
+                    fetch,
+                )
+                .await?;
                 if let Some(identity) = identity {
                     let fingerprint = IdentityFingerprint::from_identity(&identity);
                     let changed = last_sent

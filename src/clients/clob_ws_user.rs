@@ -132,7 +132,8 @@ impl UserWsLoop {
         log_tx: Option<Sender<LogEvent>>,
     ) -> BotResult<()> {
         let user_order_tx = self.user_order_tx.clone();
-        self.run_with_order_updates(tx_events, user_order_tx, log_tx).await
+        self.run_with_order_updates(tx_events, user_order_tx, log_tx)
+            .await
     }
 
     pub async fn run_with_order_updates(
@@ -151,8 +152,9 @@ impl UserWsLoop {
                     backoff.reset();
 
                     let order_tx = tx_order_updates.clone();
-                    if let Err(err) =
-                        self.run_session(ws_stream, &tx_events, order_tx, log_tx.clone()).await
+                    if let Err(err) = self
+                        .run_session(ws_stream, &tx_events, order_tx, log_tx.clone())
+                        .await
                     {
                         tracing::warn!(
                             target: "clob_ws_user",
@@ -546,14 +548,15 @@ impl FillTracker {
             return None;
         }
 
-        let entry = self.by_order_id.entry(order_id.to_string()).or_insert_with(|| {
-            FillTrackerEntry {
+        let entry = self
+            .by_order_id
+            .entry(order_id.to_string())
+            .or_insert_with(|| FillTrackerEntry {
                 token_id: token_id.to_string(),
                 side: update.side,
                 price: update.price,
                 matched: 0.0,
-            }
-        });
+            });
 
         if entry.token_id != token_id {
             entry.token_id = token_id.to_string();
@@ -565,9 +568,7 @@ impl FillTracker {
             entry.price = update.price;
         }
 
-        let matched = update
-            .size_matched
-            .filter(|v| v.is_finite() && *v >= 0.0)?;
+        let matched = update.size_matched.filter(|v| v.is_finite() && *v >= 0.0)?;
         let prev = entry.matched;
         if matched <= prev + 1e-12 {
             entry.matched = matched.max(prev);
@@ -629,10 +630,7 @@ fn parse_order_event(text: &str) -> BotResult<Option<UserOrderUpdate>> {
         Some(id) => id,
         None => return Ok(None),
     };
-    let token_id = value
-        .get("asset_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let token_id = value.get("asset_id").and_then(|v| v.as_str()).unwrap_or("");
     let side = value.get("side").and_then(|v| v.as_str()).and_then(|raw| {
         let raw = raw.trim();
         if raw.eq_ignore_ascii_case("BUY") {
@@ -726,12 +724,7 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn log_raw_frame(
-    log_tx: &Option<Sender<LogEvent>>,
-    event: &str,
-    ts_ms: i64,
-    text: &str,
-) {
+fn log_raw_frame(log_tx: &Option<Sender<LogEvent>>, event: &str, ts_ms: i64, text: &str) {
     let Some(tx) = log_tx else {
         return;
     };
@@ -954,9 +947,9 @@ mod tests {
     use tokio::time::{timeout, Duration};
 
     #[test]
-	    fn parse_trade_message_attributes_only_our_maker_orders() {
-	        let maker = "0x63db2184575e93ab59dcd167b2fa6013369561cf".to_string();
-	        let raw = r#"{
+    fn parse_trade_message_attributes_only_our_maker_orders() {
+        let maker = "0x63db2184575e93ab59dcd167b2fa6013369561cf".to_string();
+        let raw = r#"{
 	            "event_type": "trade",
 	            "side": "BUY",
 	            "maker_orders": [
@@ -975,15 +968,15 @@ mod tests {
             ],
             "timestamp": "1672290701"
         }"#;
-	
-	        let fills = parse_trade_fills(raw, &[maker]).unwrap();
-	        assert_eq!(fills.len(), 1);
-	        assert_eq!(fills[0].token_id, "token");
-	        assert_eq!(fills[0].side, OrderSide::Sell);
-	        assert!((fills[0].price - 0.41).abs() < 1e-12);
-	        assert!((fills[0].shares - 0.5).abs() < 1e-12);
-	        assert_eq!(fills[0].ts_ms, 1_672_290_701_000);
-	    }
+
+        let fills = parse_trade_fills(raw, &[maker]).unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].token_id, "token");
+        assert_eq!(fills[0].side, OrderSide::Sell);
+        assert!((fills[0].price - 0.41).abs() < 1e-12);
+        assert!((fills[0].shares - 0.5).abs() < 1e-12);
+        assert_eq!(fills[0].ts_ms, 1_672_290_701_000);
+    }
 
     #[test]
     fn parse_order_message_placement() {

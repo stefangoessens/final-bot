@@ -305,9 +305,7 @@ impl EventLogger {
         while let Some(line) = self.buffer.pop_front() {
             writer.write_all(&line)?;
             writer.write_all(b"\n")?;
-            self.written_bytes = self
-                .written_bytes
-                .saturating_add((line.len() + 1) as u64);
+            self.written_bytes = self.written_bytes.saturating_add((line.len() + 1) as u64);
             self.buffer_bytes = self
                 .buffer_bytes
                 .saturating_sub(line.len().saturating_add(1));
@@ -344,11 +342,7 @@ impl EventLogger {
         if total_bytes <= max_total_bytes {
             return Ok(());
         }
-        rotated.sort_by(|a, b| {
-            a.ts_ms
-                .cmp(&b.ts_ms)
-                .then_with(|| a.path.cmp(&b.path))
-        });
+        rotated.sort_by(|a, b| a.ts_ms.cmp(&b.ts_ms).then_with(|| a.path.cmp(&b.path)));
         for entry in rotated {
             if total_bytes <= max_total_bytes {
                 break;
@@ -474,11 +468,7 @@ fn collect_log_sizes(log_path: &Path) -> io::Result<(u64, Vec<RotatedLogEntry>)>
         }
         let ts_ms = parse_rotated_ts(&name, stem, ext).unwrap_or(0);
         total_bytes = total_bytes.saturating_add(size);
-        rotated.push(RotatedLogEntry {
-            path,
-            size,
-            ts_ms,
-        });
+        rotated.push(RotatedLogEntry { path, size, ts_ms });
     }
 
     Ok((total_bytes, rotated))

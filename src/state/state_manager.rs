@@ -81,7 +81,10 @@ pub struct GeoblockStatus {
 
 #[derive(Debug, Clone)]
 pub enum OrderUpdate {
-    Upsert { slug: String, order: LiveOrder },
+    Upsert {
+        slug: String,
+        order: LiveOrder,
+    },
     Remove {
         slug: String,
         token_id: String,
@@ -119,7 +122,9 @@ pub struct InventorySeed {
 #[allow(dead_code)] // event variants will be used by feed + strategy tasks
 pub enum AppEvent {
     MarketDiscovered(MarketIdentity),
-    SetTrackedMarkets { slugs: Vec<String> },
+    SetTrackedMarkets {
+        slugs: Vec<String>,
+    },
     MarketWsUpdate(MarketWsUpdate),
     TickSizeSeed(TickSizeSeed),
     UserWsUpdate(UserWsUpdate),
@@ -134,12 +139,17 @@ pub enum AppEvent {
         qty_base_units: u64,
         ts_ms: i64,
     },
-    OnchainRedeem { condition_id: String, ts_ms: i64 },
-    TimerTick { now_ms: i64 },
+    OnchainRedeem {
+        condition_id: String,
+        ts_ms: i64,
+    },
+    TimerTick {
+        now_ms: i64,
+    },
 }
 
 pub struct StateManager {
-    markets: HashMap<String, MarketState>, // key: slug
+    markets: HashMap<String, MarketState>,         // key: slug
     last_fill_quote_tick_ms: HashMap<String, i64>, // key: slug
     last_user_ws_msg_ms: Option<i64>,
     last_geoblock: Option<GeoblockStatus>,
@@ -413,10 +423,8 @@ impl StateManager {
                     } else if !user_ws_fresh {
                         block_reason = Some("user_ws_stale".to_string());
                     } else if !tradable {
-                        block_reason = Some(format!(
-                            "market_not_tradable: {}",
-                            state.identity.slug
-                        ));
+                        block_reason =
+                            Some(format!("market_not_tradable: {}", state.identity.slug));
                     } else if exposure_over_cap {
                         block_reason = Some("exposure_cap".to_string());
                     }
@@ -469,7 +477,8 @@ impl StateManager {
                 } else {
                     None
                 };
-                self.health.set_quoting_status(enabled_markets, block_reason);
+                self.health
+                    .set_quoting_status(enabled_markets, block_reason);
             }
         }
     }
@@ -539,10 +548,14 @@ impl StateManager {
                 None => continue,
             };
             match fill.side {
-                OrderSide::Buy => state
+                OrderSide::Buy => {
+                    state
+                        .inventory
+                        .apply_buy_fill(side, fill.price, fill.shares, fill.ts_ms)
+                }
+                OrderSide::Sell => state
                     .inventory
-                    .apply_buy_fill(side, fill.price, fill.shares, fill.ts_ms),
-                OrderSide::Sell => state.inventory.apply_sell_fill(side, fill.shares, fill.ts_ms),
+                    .apply_sell_fill(side, fill.shares, fill.ts_ms),
             }
             self.metrics.inc_fills();
             return;
@@ -738,8 +751,8 @@ impl StateManager {
 }
 
 fn market_exposure_usdc(state: &MarketState) -> (f64, f64, f64) {
-    let inventory_usdc = (state.inventory.up.notional_usdc + state.inventory.down.notional_usdc)
-        .max(0.0);
+    let inventory_usdc =
+        (state.inventory.up.notional_usdc + state.inventory.down.notional_usdc).max(0.0);
     let mut open_order_usdc = 0.0;
     for order in state.orders.live.values() {
         if !order.price.is_finite() || !order.remaining.is_finite() {
@@ -800,7 +813,12 @@ mod tests {
         }
     }
 
-    fn make_identity_named(slug: &str, condition_id: &str, token_up: &str, token_down: &str) -> MarketIdentity {
+    fn make_identity_named(
+        slug: &str,
+        condition_id: &str,
+        token_up: &str,
+        token_down: &str,
+    ) -> MarketIdentity {
         MarketIdentity {
             slug: slug.to_string(),
             condition_id: condition_id.to_string(),
@@ -811,10 +829,10 @@ mod tests {
     }
 
     #[test]
-	    fn applying_fill_updates_cost_basis() {
-	        let ops = OpsState::new(&AppConfig::default());
-	        let mut sm = StateManager::new(
-	            AlphaConfig::default(),
+    fn applying_fill_updates_cost_basis() {
+        let ops = OpsState::new(&AppConfig::default());
+        let mut sm = StateManager::new(
+            AlphaConfig::default(),
             OracleConfig::default(),
             TradingConfig::default(),
             ops.health,
@@ -836,53 +854,53 @@ mod tests {
         let state = sm.market_state("btc-updown-15m-0").unwrap();
         assert_eq!(state.inventory.up.shares, 10.0);
         assert_eq!(state.inventory.up.notional_usdc, 4.9);
-	        let avg = state.inventory.up.avg_cost().unwrap();
-	        assert!((avg - 0.49).abs() < 1e-12, "avg_cost={avg}");
-	        assert_eq!(state.inventory.unpaired_shares(), 10.0);
-	    }
+        let avg = state.inventory.up.avg_cost().unwrap();
+        assert!((avg - 0.49).abs() < 1e-12, "avg_cost={avg}");
+        assert_eq!(state.inventory.unpaired_shares(), 10.0);
+    }
 
-	    #[test]
-	    fn applying_sell_fill_reduces_cost_basis_pro_rata() {
-	        let ops = OpsState::new(&AppConfig::default());
-	        let mut sm = StateManager::new(
-	            AlphaConfig::default(),
-	            OracleConfig::default(),
-	            TradingConfig::default(),
-	            ops.health,
-	            ops.metrics,
-	        );
-	        sm.apply_event(AppEvent::MarketDiscovered(make_identity()), 0);
-	
-	        sm.apply_event(
-	            AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
-	                token_id: "up".to_string(),
-	                side: OrderSide::Buy,
-	                price: 0.4,
-	                shares: 10.0,
-	                ts_ms: 1_000,
-	            })),
-	            1_000,
-	        );
-	        sm.apply_event(
-	            AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
-	                token_id: "up".to_string(),
-	                side: OrderSide::Sell,
-	                price: 0.6,
-	                shares: 4.0,
-	                ts_ms: 2_000,
-	            })),
-	            2_000,
-	        );
-	
-	        let state = sm.market_state("btc-updown-15m-0").unwrap();
-	        assert_eq!(state.inventory.up.shares, 6.0);
-	        assert!((state.inventory.up.notional_usdc - 2.4).abs() < 1e-12);
-	        let avg = state.inventory.up.avg_cost().unwrap();
-	        assert!((avg - 0.4).abs() < 1e-12, "avg_cost={avg}");
-	        assert_eq!(state.inventory.last_trade_ms, 2_000);
-	    }
-	
-	    #[tokio::test]
+    #[test]
+    fn applying_sell_fill_reduces_cost_basis_pro_rata() {
+        let ops = OpsState::new(&AppConfig::default());
+        let mut sm = StateManager::new(
+            AlphaConfig::default(),
+            OracleConfig::default(),
+            TradingConfig::default(),
+            ops.health,
+            ops.metrics,
+        );
+        sm.apply_event(AppEvent::MarketDiscovered(make_identity()), 0);
+
+        sm.apply_event(
+            AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
+                token_id: "up".to_string(),
+                side: OrderSide::Buy,
+                price: 0.4,
+                shares: 10.0,
+                ts_ms: 1_000,
+            })),
+            1_000,
+        );
+        sm.apply_event(
+            AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
+                token_id: "up".to_string(),
+                side: OrderSide::Sell,
+                price: 0.6,
+                shares: 4.0,
+                ts_ms: 2_000,
+            })),
+            2_000,
+        );
+
+        let state = sm.market_state("btc-updown-15m-0").unwrap();
+        assert_eq!(state.inventory.up.shares, 6.0);
+        assert!((state.inventory.up.notional_usdc - 2.4).abs() < 1e-12);
+        let avg = state.inventory.up.avg_cost().unwrap();
+        assert!((avg - 0.4).abs() < 1e-12, "avg_cost={avg}");
+        assert_eq!(state.inventory.last_trade_ms, 2_000);
+    }
+
+    #[tokio::test]
     async fn fill_emits_quote_tick_only_for_affected_market() {
         let ops = OpsState::new(&AppConfig::default());
         let sm = StateManager::new(
@@ -1280,7 +1298,10 @@ mod tests {
 
         let report = sm.health.report(10_000);
         assert_eq!(report.quoting_enabled_markets, 0);
-        assert_eq!(report.quoting_block_reason, Some("user_ws_stale".to_string()));
+        assert_eq!(
+            report.quoting_block_reason,
+            Some("user_ws_stale".to_string())
+        );
     }
 
     #[test]
@@ -1386,8 +1407,14 @@ mod tests {
 
         let state = sm.market_state("btc-updown-15m-0").unwrap();
         let (inventory_usdc, open_order_usdc, total_usdc) = market_exposure_usdc(state);
-        assert!((inventory_usdc - 2.0).abs() < 1e-12, "inventory={inventory_usdc}");
-        assert!((open_order_usdc - 2.0).abs() < 1e-12, "open={open_order_usdc}");
+        assert!(
+            (inventory_usdc - 2.0).abs() < 1e-12,
+            "inventory={inventory_usdc}"
+        );
+        assert!(
+            (open_order_usdc - 2.0).abs() < 1e-12,
+            "open={open_order_usdc}"
+        );
         assert!((total_usdc - 4.0).abs() < 1e-12, "total={total_usdc}");
     }
 
@@ -1449,7 +1476,10 @@ mod tests {
         let state = sm.market_state("btc-updown-15m-0").unwrap();
         assert!(!state.quoting_enabled);
         let report = sm.health.report(9_100);
-        assert_eq!(report.quoting_block_reason, Some("exposure_cap".to_string()));
+        assert_eq!(
+            report.quoting_block_reason,
+            Some("exposure_cap".to_string())
+        );
     }
 
     #[test]
@@ -1465,27 +1495,36 @@ mod tests {
             ops.metrics,
         );
 
-        sm.apply_event(AppEvent::GeoblockStatus(GeoblockStatus {
-            blocked: Some(true),
-            ip: Some("1.2.3.4".to_string()),
-            country: Some("US".to_string()),
-            region: Some("CA".to_string()),
-            ts_ms: 1_000,
-            error: None,
-        }), 1_000);
+        sm.apply_event(
+            AppEvent::GeoblockStatus(GeoblockStatus {
+                blocked: Some(true),
+                ip: Some("1.2.3.4".to_string()),
+                country: Some("US".to_string()),
+                region: Some("CA".to_string()),
+                ts_ms: 1_000,
+                error: None,
+            }),
+            1_000,
+        );
 
         let report = sm.health.report(1_000);
         assert_eq!(report.status, "halted");
-        assert!(report.halted_reason.unwrap_or_default().starts_with("geoblock_"));
+        assert!(report
+            .halted_reason
+            .unwrap_or_default()
+            .starts_with("geoblock_"));
 
-        sm.apply_event(AppEvent::GeoblockStatus(GeoblockStatus {
-            blocked: Some(false),
-            ip: Some("1.2.3.4".to_string()),
-            country: Some("IE".to_string()),
-            region: Some("L".to_string()),
-            ts_ms: 2_000,
-            error: None,
-        }), 2_000);
+        sm.apply_event(
+            AppEvent::GeoblockStatus(GeoblockStatus {
+                blocked: Some(false),
+                ip: Some("1.2.3.4".to_string()),
+                country: Some("IE".to_string()),
+                region: Some("L".to_string()),
+                ts_ms: 2_000,
+                error: None,
+            }),
+            2_000,
+        );
 
         let report = sm.health.report(2_000);
         assert!(report.halted_reason.is_none());

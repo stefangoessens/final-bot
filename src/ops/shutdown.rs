@@ -33,8 +33,7 @@ impl ShutdownTrigger {
 
 pub async fn listen_for_shutdown(trigger: ShutdownTrigger) {
     #[cfg(unix)]
-    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    {
+    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
         Ok(signal) => signal,
         Err(err) => {
             tracing::warn!(target: "shutdown", error = %err, "failed to register SIGTERM handler");

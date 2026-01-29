@@ -43,9 +43,7 @@ pub fn update_alpha(
             .identity
             .interval_start_ts
             .saturating_mul(1_000);
-        if market_state.start_btc_price.is_none()
-            && chainlink.ts_ms >= start_ms
-            && chainlink_fresh
+        if market_state.start_btc_price.is_none() && chainlink.ts_ms >= start_ms && chainlink_fresh
         {
             market_state.start_btc_price = Some(chainlink.price);
             market_state.start_price_ts_ms = Some(chainlink.ts_ms);
@@ -107,13 +105,14 @@ pub fn update_alpha(
     let q_down = (1.0 - q_up).clamp(0.0, 1.0);
 
     let cap_up = if up_stale { 0.0 } else { q_up * target_total };
-    let cap_down = if down_stale { 0.0 } else { q_down * target_total };
+    let cap_down = if down_stale {
+        0.0
+    } else {
+        q_down * target_total
+    };
 
-    let size_scalar = compute_size_scalar(
-        &regime_eval,
-        target_total,
-        trading_cfg.target_total_base,
-    );
+    let size_scalar =
+        compute_size_scalar(&regime_eval, target_total, trading_cfg.target_total_base);
 
     market_state.alpha.cap_up = cap_up;
     market_state.alpha.cap_down = cap_down;
@@ -146,7 +145,11 @@ fn compute_q_up(market_state: &MarketState, now_ms: i64, drift_per_s: f64, var_p
     probability::compute_q_up(s0, st, tau_s, drift_per_s, var_per_s)
 }
 
-fn is_fresh(price: Option<crate::state::rtds_price::RTDSPrice>, stale_ms: i64, now_ms: i64) -> bool {
+fn is_fresh(
+    price: Option<crate::state::rtds_price::RTDSPrice>,
+    stale_ms: i64,
+    now_ms: i64,
+) -> bool {
     match price {
         Some(p) => now_ms.saturating_sub(p.ts_ms) <= stale_ms,
         None => false,

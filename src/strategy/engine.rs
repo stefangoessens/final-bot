@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 
 use serde_json::json;
-use tokio::sync::{mpsc::{Receiver, Sender}, watch};
+use tokio::sync::{
+    mpsc::{Receiver, Sender},
+    watch,
+};
 
 use crate::config::{CompletionConfig, InventoryConfig, RewardsConfig, TradingConfig};
 use crate::persistence::LogEvent;
@@ -10,7 +13,9 @@ use crate::state::state_manager::QuoteTick;
 use crate::strategy::fee;
 use crate::strategy::quote_engine::build_desired_orders;
 use crate::strategy::reward_engine::{apply_reward_hints, RewardApplySummary, RewardsSnapshot};
-use crate::strategy::risk::{adjust_for_inventory, apply_skew_repair_pricing, should_taker_complete};
+use crate::strategy::risk::{
+    adjust_for_inventory, apply_skew_repair_pricing, should_taker_complete,
+};
 use crate::strategy::DesiredOrder;
 use polymarket_client_sdk::clob::types::Side;
 
@@ -125,9 +130,13 @@ impl StrategyEngine {
                 f64::INFINITY
             };
 
-            if let Some(taker_action) =
-                should_taker_complete(&state, &self.inventory, &self.completion, &self.trading, now_ms)
-            {
+            if let Some(taker_action) = should_taker_complete(
+                &state,
+                &self.inventory,
+                &self.completion,
+                &self.trading,
+                now_ms,
+            ) {
                 let completion_cost = if matches!(taker_action.side, Side::Sell) {
                     0.0
                 } else {
@@ -145,54 +154,56 @@ impl StrategyEngine {
                         "taker completion suppressed by market USDC budget"
                     );
                 } else {
-                tracing::info!(
-                    target: "strategy_engine",
-                    slug = %slug,
-                    token_id = %taker_action.token_id,
-                    side = ?taker_action.side,
-                    p_max = taker_action.p_max,
-                    shares = taker_action.shares,
-                    order_type = ?taker_action.order_type,
-                    "taker completion triggered"
-                );
+                    tracing::info!(
+                        target: "strategy_engine",
+                        slug = %slug,
+                        token_id = %taker_action.token_id,
+                        side = ?taker_action.side,
+                        p_max = taker_action.p_max,
+                        shares = taker_action.shares,
+                        order_type = ?taker_action.order_type,
+                        "taker completion triggered"
+                    );
 
-                if tx_exec
-                    .send(ExecCommand {
-                        slug: slug.clone(),
-                        desired: Vec::new(),
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
+                    if tx_exec
+                        .send(ExecCommand {
+                            slug: slug.clone(),
+                            desired: Vec::new(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
 
-                if tx_completion
-                    .send(CompletionCommand {
-                        slug: slug.clone(),
-                        condition_id: state.identity.condition_id.clone(),
-                        token_id: taker_action.token_id.clone(),
-                        cancel_order_ids: state
-                            .orders
-                            .live
-                            .values()
-                            .filter(|order| order.remaining.is_finite() && order.remaining > 0.0)
-                            .map(|order| order.order_id.clone())
-                            .collect(),
-                        side: taker_action.side,
-                        shares: taker_action.shares,
-                        p_max: taker_action.p_max,
-                        order_type: taker_action.order_type,
-                        now_ms,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
+                    if tx_completion
+                        .send(CompletionCommand {
+                            slug: slug.clone(),
+                            condition_id: state.identity.condition_id.clone(),
+                            token_id: taker_action.token_id.clone(),
+                            cancel_order_ids: state
+                                .orders
+                                .live
+                                .values()
+                                .filter(|order| {
+                                    order.remaining.is_finite() && order.remaining > 0.0
+                                })
+                                .map(|order| order.order_id.clone())
+                                .collect(),
+                            side: taker_action.side,
+                            shares: taker_action.shares,
+                            p_max: taker_action.p_max,
+                            order_type: taker_action.order_type,
+                            now_ms,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
 
-                log_completion_command(&log_tx, &slug, now_ms, &taker_action);
-                continue;
+                    log_completion_command(&log_tx, &slug, now_ms, &taker_action);
+                    continue;
                 }
             }
 
@@ -217,10 +228,7 @@ impl StrategyEngine {
                 continue;
             }
 
-            let reward_snapshot = self
-                .rewards_rx
-                .as_ref()
-                .map(|rx| rx.borrow().clone());
+            let reward_snapshot = self.rewards_rx.as_ref().map(|rx| rx.borrow().clone());
             let reward_summary = apply_reward_hints(
                 &mut desired,
                 &state,
@@ -247,14 +255,7 @@ impl StrategyEngine {
                 );
             }
 
-            if tx_exec
-                .send(ExecCommand {
-                    slug,
-                    desired,
-                })
-                .await
-                .is_err()
-            {
+            if tx_exec.send(ExecCommand { slug, desired }).await.is_err() {
                 break;
             }
         }
@@ -316,7 +317,11 @@ fn enforce_market_budget(
     pruned
 }
 
-fn enforce_final_safety(desired: &mut Vec<DesiredOrder>, state: &MarketState, cfg: &TradingConfig) -> bool {
+fn enforce_final_safety(
+    desired: &mut Vec<DesiredOrder>,
+    state: &MarketState,
+    cfg: &TradingConfig,
+) -> bool {
     if desired.is_empty() {
         return false;
     }
@@ -340,8 +345,12 @@ fn enforce_final_safety(desired: &mut Vec<DesiredOrder>, state: &MarketState, cf
     let down_shares = state.inventory.down.shares;
     let unpaired = (up_shares - down_shares).abs();
     if unpaired <= UNPAIRED_EPS {
-        let has_up = desired.iter().any(|o| o.token_id == state.identity.token_up);
-        let has_down = desired.iter().any(|o| o.token_id == state.identity.token_down);
+        let has_up = desired
+            .iter()
+            .any(|o| o.token_id == state.identity.token_up);
+        let has_down = desired
+            .iter()
+            .any(|o| o.token_id == state.identity.token_down);
         if has_up ^ has_down {
             desired.clear();
         }
@@ -721,7 +730,10 @@ mod tests {
 
         let pruned = enforce_final_safety(&mut desired, &state, &cfg);
         assert!(pruned, "expected safety prune to trigger");
-        assert!(desired.is_empty(), "expected one-sided desired to be cleared");
+        assert!(
+            desired.is_empty(),
+            "expected one-sided desired to be cleared"
+        );
     }
 
     #[test]
@@ -754,7 +766,9 @@ mod tests {
         let pruned = enforce_final_safety(&mut desired, &state, &cfg);
         assert!(pruned, "expected safety prune to trigger");
         assert!(
-            desired.iter().all(|o| o.token_id == state.identity.token_down),
+            desired
+                .iter()
+                .all(|o| o.token_id == state.identity.token_down),
             "expected only missing-side orders to remain"
         );
     }
@@ -822,7 +836,10 @@ mod tests {
 
         let safety_pruned = enforce_final_safety(&mut desired, &state, &cfg);
         assert!(safety_pruned, "expected final safety prune to trigger");
-        assert!(desired.is_empty(), "expected one-sided desired to be cleared");
+        assert!(
+            desired.is_empty(),
+            "expected one-sided desired to be cleared"
+        );
     }
 
     #[test]
@@ -848,13 +865,18 @@ mod tests {
         state.alpha.cap_down = 0.19;
         state.alpha.size_scalar = 1.0;
 
-        let mut desired = crate::strategy::quote_engine::build_desired_orders(&state, &trading, now_ms);
+        let mut desired =
+            crate::strategy::quote_engine::build_desired_orders(&state, &trading, now_ms);
         assert!(
-            desired.iter().any(|o| o.token_id == state.identity.token_up),
+            desired
+                .iter()
+                .any(|o| o.token_id == state.identity.token_up),
             "expected quote_engine to produce excess-side orders before pairing enforcement"
         );
         assert!(
-            !desired.iter().any(|o| o.token_id == state.identity.token_down),
+            !desired
+                .iter()
+                .any(|o| o.token_id == state.identity.token_down),
             "expected quote_engine to produce no missing-side orders when cap below floor"
         );
 

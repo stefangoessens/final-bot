@@ -35,12 +35,18 @@ impl Metrics {
     pub fn new() -> Self {
         let registry = Registry::new();
 
-        let ws_market_connected =
-            register(&registry, IntGauge::new("ws_market_connected", "CLOB market ws up").unwrap());
-        let ws_user_connected =
-            register(&registry, IntGauge::new("ws_user_connected", "CLOB user ws up").unwrap());
-        let rtds_connected =
-            register(&registry, IntGauge::new("rtds_connected", "RTDS ws up").unwrap());
+        let ws_market_connected = register(
+            &registry,
+            IntGauge::new("ws_market_connected", "CLOB market ws up").unwrap(),
+        );
+        let ws_user_connected = register(
+            &registry,
+            IntGauge::new("ws_user_connected", "CLOB user ws up").unwrap(),
+        );
+        let rtds_connected = register(
+            &registry,
+            IntGauge::new("rtds_connected", "RTDS ws up").unwrap(),
+        );
 
         let ws_message_lag_ms = register(
             &registry,
@@ -60,10 +66,14 @@ impl Metrics {
             .unwrap(),
         );
 
-        let order_rejects_total =
-            register(&registry, IntCounter::new("order_rejects_total", "Order rejects").unwrap());
-        let fills_total =
-            register(&registry, IntCounter::new("fills_total", "Fills total").unwrap());
+        let order_rejects_total = register(
+            &registry,
+            IntCounter::new("order_rejects_total", "Order rejects").unwrap(),
+        );
+        let fills_total = register(
+            &registry,
+            IntCounter::new("fills_total", "Fills total").unwrap(),
+        );
 
         let unpaired_shares = register(
             &registry,
@@ -108,8 +118,10 @@ impl Metrics {
             &registry,
             Gauge::new("pnl_realized_usdc", "Realized pnl in USDC").unwrap(),
         );
-        let fee_paid_usdc =
-            register(&registry, Counter::new("fee_paid_usdc", "Fees paid in USDC").unwrap());
+        let fee_paid_usdc = register(
+            &registry,
+            Counter::new("fee_paid_usdc", "Fees paid in USDC").unwrap(),
+        );
         let rebate_estimated_usdc = register(
             &registry,
             Counter::new("rebate_estimated_usdc", "Estimated rebates in USDC").unwrap(),

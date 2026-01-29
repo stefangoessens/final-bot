@@ -16,7 +16,8 @@ use crate::strategy::engine::CompletionCommand;
 const COMPLETION_RATE_LIMIT_MS: i64 = 1_000;
 
 trait CompletionRestClient: Send + Sync {
-    fn cancel_orders(&self, order_ids: Vec<OrderId>) -> BoxFuture<'static, BotResult<CancelResult>>;
+    fn cancel_orders(&self, order_ids: Vec<OrderId>)
+        -> BoxFuture<'static, BotResult<CancelResult>>;
     fn build_completion_order(
         &self,
         token_id: String,
@@ -33,7 +34,10 @@ trait CompletionRestClient: Send + Sync {
 }
 
 impl CompletionRestClient for ClobRestClient {
-    fn cancel_orders(&self, order_ids: Vec<OrderId>) -> BoxFuture<'static, BotResult<CancelResult>> {
+    fn cancel_orders(
+        &self,
+        order_ids: Vec<OrderId>,
+    ) -> BoxFuture<'static, BotResult<CancelResult>> {
         let client = self.clone();
         Box::pin(async move { client.cancel_orders(order_ids).await })
     }
@@ -345,10 +349,7 @@ mod tests {
             "expected suppression within window"
         );
         assert!(limiter.allows("slug-b", base + 100));
-        assert!(limiter.allows(
-            "slug-a",
-            base + COMPLETION_RATE_LIMIT_MS as i64
-        ));
+        assert!(limiter.allows("slug-a", base + COMPLETION_RATE_LIMIT_MS as i64));
     }
 
     #[derive(Clone)]
@@ -425,10 +426,7 @@ mod tests {
         ) -> BoxFuture<'static, BotResult<PostOrdersResult>> {
             let calls = self.calls.clone();
             Box::pin(async move {
-                calls
-                    .lock()
-                    .expect("lock calls")
-                    .push("post_orders_result");
+                calls.lock().expect("lock calls").push("post_orders_result");
                 Ok(PostOrdersResult::default())
             })
         }
@@ -466,13 +464,14 @@ mod tests {
 
         assert_eq!(
             rest.calls(),
-            vec!["cancel_orders", "build_completion_order", "post_orders_result"]
+            vec![
+                "cancel_orders",
+                "build_completion_order",
+                "post_orders_result"
+            ]
         );
         assert_eq!(
-            &*rest
-                .seen_cancel_ids
-                .lock()
-                .expect("lock seen_cancel_ids"),
+            &*rest.seen_cancel_ids.lock().expect("lock seen_cancel_ids"),
             &vec!["o1".to_string(), "o2".to_string()]
         );
     }
@@ -510,7 +509,11 @@ mod tests {
 
         assert_eq!(
             rest.calls(),
-            vec!["cancel_orders", "build_completion_order", "post_orders_result"]
+            vec![
+                "cancel_orders",
+                "build_completion_order",
+                "post_orders_result"
+            ]
         );
     }
 

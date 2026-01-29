@@ -93,19 +93,9 @@ fn is_fast_move(
     var_per_s: f64,
 ) -> bool {
     let return_bps = if !binance_stale {
-        fast_move_return_bps(
-            alpha,
-            rtds_primary,
-            oracle_cfg.fast_move_window_ms,
-            true,
-        )
+        fast_move_return_bps(alpha, rtds_primary, oracle_cfg.fast_move_window_ms, true)
     } else {
-        fast_move_return_bps(
-            alpha,
-            rtds_sanity,
-            oracle_cfg.fast_move_window_ms,
-            false,
-        )
+        fast_move_return_bps(alpha, rtds_sanity, oracle_cfg.fast_move_window_ms, false)
     };
 
     let return_fast = return_bps

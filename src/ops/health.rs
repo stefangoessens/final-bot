@@ -261,7 +261,11 @@ async fn handle(req: Request<Body>, health: HealthState) -> Result<Response<Body
             );
             Ok(resp)
         }
-        _ => Ok(response_with_status(StatusCode::NOT_FOUND, "not found", None)),
+        _ => Ok(response_with_status(
+            StatusCode::NOT_FOUND,
+            "not found",
+            None,
+        )),
     }
 }
 
@@ -286,7 +290,11 @@ fn feed_report(last_update_ms: i64, stale_after_ms: i64, now_ms: i64) -> FeedRep
     }
 }
 
-fn response_with_status(status: StatusCode, body: &str, content_type: Option<&str>) -> Response<Body> {
+fn response_with_status(
+    status: StatusCode,
+    body: &str,
+    content_type: Option<&str>,
+) -> Response<Body> {
     let mut resp = Response::builder()
         .status(status)
         .body(Body::from(body.to_string()))

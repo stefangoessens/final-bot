@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use polymarket_client_sdk::auth::Signer as _;
 use polymarket_client_sdk::ctf::types::{MergePositionsRequest, RedeemPositionsRequest};
 use polymarket_client_sdk::ctf::Client as CtfClient;
-use polymarket_client_sdk::types::{B256, ChainId, U256};
+use polymarket_client_sdk::types::{ChainId, B256, U256};
 use polymarket_client_sdk::{contract_config, POLYGON};
 
 use crate::config::MergeWalletMode;
@@ -65,8 +65,9 @@ pub fn spawn_onchain_worker(
         }
 
         let chain_id: ChainId = POLYGON;
-        let contract_cfg = contract_config(chain_id, false)
-            .ok_or_else(|| BotError::Other(format!("missing contract config for chain {chain_id}")));
+        let contract_cfg = contract_config(chain_id, false).ok_or_else(|| {
+            BotError::Other(format!("missing contract config for chain {chain_id}"))
+        });
         let (collateral, conditional_tokens) = match contract_cfg {
             Ok(c) => (c.collateral, c.conditional_tokens),
             Err(err) => {
@@ -99,13 +100,11 @@ pub fn spawn_onchain_worker(
                     None
                 }
             },
-            MergeWalletMode::Relayer => {
-                None
-            }
+            MergeWalletMode::Relayer => None,
         };
-        let ctf_read = ctf
-            .as_ref()
-            .map(|client| IConditionalTokensRead::new(conditional_tokens, client.provider().clone()));
+        let ctf_read = ctf.as_ref().map(|client| {
+            IConditionalTokensRead::new(conditional_tokens, client.provider().clone())
+        });
         let mut readiness_cache = ReadinessCache::default();
         let mut relayer_drop_logged = false;
 
@@ -188,13 +187,8 @@ pub fn spawn_onchain_worker(
                     if qty_base_units == 0 {
                         continue;
                     }
-                    match condition_prepared(
-                        ctf_read,
-                        &mut readiness_cache,
-                        &condition_id,
-                        ts_ms,
-                    )
-                    .await
+                    match condition_prepared(ctf_read, &mut readiness_cache, &condition_id, ts_ms)
+                        .await
                     {
                         Ok(true) => {}
                         Ok(false) => {
@@ -310,13 +304,8 @@ pub fn spawn_onchain_worker(
                             "condition_id": condition_id,
                         }),
                     );
-                    match condition_resolved(
-                        ctf_read,
-                        &mut readiness_cache,
-                        &condition_id,
-                        ts_ms,
-                    )
-                    .await
+                    match condition_resolved(ctf_read, &mut readiness_cache, &condition_id, ts_ms)
+                        .await
                     {
                         Ok(true) => {}
                         Ok(false) => {
@@ -422,11 +411,7 @@ async fn build_ctf_client(
     cfg: &OnchainWorkerConfig,
     chain_id: ChainId,
 ) -> BotResult<CtfClient<alloy::providers::DynProvider>> {
-    let private_key = cfg
-        .private_key
-        .as_deref()
-        .unwrap_or_default()
-        .trim();
+    let private_key = cfg.private_key.as_deref().unwrap_or_default().trim();
     if private_key.is_empty() {
         return Err(BotError::Config(
             "missing required key for onchain: PMMB_KEYS__PRIVATE_KEY".to_string(),

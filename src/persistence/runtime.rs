@@ -74,7 +74,11 @@ pub fn spawn_event_logger(config: EventLogConfig) -> mpsc::Sender<LogEvent> {
 }
 
 fn handle_event(logger: &mut EventLogger, event: LogEvent) {
-    let LogEvent { ts_ms, event, payload } = event;
+    let LogEvent {
+        ts_ms,
+        event,
+        payload,
+    } = event;
     if let Err(err) = logger.log_value_with_ts(event, payload, ts_ms) {
         tracing::warn!(
             target: "event_log",

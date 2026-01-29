@@ -26,12 +26,7 @@ impl ClobPublicClient {
             .iter()
             .map(|token_id| BooksRequestItem { token_id })
             .collect();
-        let resp = self
-            .http
-            .post(url)
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.http.post(url).json(&body).send().await?;
 
         if !resp.status().is_success() {
             return Err(BotError::Other(format!(
@@ -108,6 +103,9 @@ mod tests {
             .map(|token_id| BooksRequestItem { token_id })
             .collect();
         let value = serde_json::to_value(&body).expect("serialize books");
-        assert_eq!(value, serde_json::json!([{"token_id":"1"},{"token_id":"2"}]));
+        assert_eq!(
+            value,
+            serde_json::json!([{"token_id":"1"},{"token_id":"2"}])
+        );
     }
 }

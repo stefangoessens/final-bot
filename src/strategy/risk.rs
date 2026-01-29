@@ -961,6 +961,14 @@ mod tests {
     }
 
     #[test]
+    fn completion_limit_price_ceiling_rounds_down_on_coarse_ticks() {
+        // A raw ceiling of 0.99 would round up to 1.0 at tick=0.05; ensure we use a tick-aligned
+        // ceiling instead (0.95) to avoid ever emitting 1.0 as a completion limit price.
+        let cap = completion_limit_price_ceiling(0.05);
+        assert!((cap - 0.95).abs() < 1e-12, "expected cap=0.95, got {cap}");
+    }
+
+    #[test]
     fn should_taker_complete_rounds_pmax_to_tick() {
         let mut state = make_state(30_000);
         state.inventory.up.shares = 1.0;
@@ -991,6 +999,64 @@ mod tests {
         assert_eq!(action.side, Side::Buy);
         assert!(action.p_max <= raw + 1e-12);
         assert!(((action.p_max / 0.01).round() - (action.p_max / 0.01)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn should_taker_complete_buy_never_emits_one_as_p_max() {
+        let mut state = make_state(30_000);
+        state.inventory.up.shares = 1.0;
+        state.inventory.up.notional_usdc = 0.10; // low avg cost => target can exceed 1.0 under loss allowance
+        state.inventory.down.shares = 0.0;
+        state.down_book.best_ask = Some(0.25);
+        state.down_book.tick_size = 0.01;
+
+        let mut inventory_cfg = InventoryConfig::default();
+        inventory_cfg.taker_window_s = 30;
+
+        let mut completion_cfg = CompletionConfig::default();
+        completion_cfg.enabled = true;
+        completion_cfg.order_type = CompletionOrderType::Fok;
+        completion_cfg.min_profit_per_share = 0.0;
+        completion_cfg.max_loss_usdc = 10.0;
+
+        let trading_cfg = TradingConfig::default();
+        let action =
+            should_taker_complete(&state, &inventory_cfg, &completion_cfg, &trading_cfg, 0)
+                .expect("expected taker completion");
+        assert!(
+            action.p_max < 1.0 - 1e-12,
+            "expected p_max < 1.0, got {}",
+            action.p_max
+        );
+    }
+
+    #[test]
+    fn should_taker_complete_sell_refuses_prices_above_tick_aligned_ceiling() {
+        let mut state = make_state(30_000);
+        // Unpaired: excess=UP, missing=DOWN (missing ask under floor triggers sell path).
+        state.inventory.up.shares = 1.0;
+        state.inventory.up.notional_usdc = 0.96; // high avg cost forces a high sell floor
+        state.inventory.down.shares = 0.0;
+        state.down_book.best_ask = Some(0.10);
+        state.up_book.best_bid = Some(1.0);
+        state.up_book.tick_size = 0.05;
+
+        let mut inventory_cfg = InventoryConfig::default();
+        inventory_cfg.taker_window_s = 30;
+
+        let mut completion_cfg = CompletionConfig::default();
+        completion_cfg.enabled = true;
+        completion_cfg.order_type = CompletionOrderType::Fok;
+        completion_cfg.min_profit_per_share = 0.0;
+        completion_cfg.max_loss_usdc = 0.0;
+
+        let trading_cfg = TradingConfig::default(); // min_quote_price=0.20
+        let action =
+            should_taker_complete(&state, &inventory_cfg, &completion_cfg, &trading_cfg, 0);
+        assert!(
+            action.is_none(),
+            "expected sell completion to be blocked when required p_min exceeds ceiling"
+        );
     }
 
     #[test]

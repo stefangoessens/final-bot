@@ -41,10 +41,7 @@ mod tests {
 
     impl RedeemClient for MockRedeemClient {
         fn redeem(&self, request: &RedeemRequest) -> BotResult<()> {
-            self.calls
-                .lock()
-                .expect("lock calls")
-                .push(request.clone());
+            self.calls.lock().expect("lock calls").push(request.clone());
             Ok(())
         }
     }

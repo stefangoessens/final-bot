@@ -207,9 +207,7 @@ fn read_events(path: &Path, strict: bool) -> io::Result<Vec<IndexedEvent>> {
         }
         match serde_json::from_str::<EventRecord>(&line) {
             Ok(event) => events.push(IndexedEvent { line_no, event }),
-            Err(err) if strict => {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, err))
-            }
+            Err(err) if strict => return Err(io::Error::new(io::ErrorKind::InvalidData, err)),
             Err(_) => continue,
         }
     }
@@ -220,9 +218,9 @@ fn order_events(events: &mut [IndexedEvent], ordering: ReplayOrdering) {
     match ordering {
         ReplayOrdering::InFileOrder => {}
         ReplayOrdering::BySeq => events.sort_by_key(|entry| (entry.event.seq, entry.line_no)),
-        ReplayOrdering::ByTimestamp => events.sort_by_key(|entry| {
-            (entry.event.ts_ms, entry.event.seq, entry.line_no)
-        }),
+        ReplayOrdering::ByTimestamp => {
+            events.sort_by_key(|entry| (entry.event.ts_ms, entry.event.seq, entry.line_no))
+        }
     }
 }
 

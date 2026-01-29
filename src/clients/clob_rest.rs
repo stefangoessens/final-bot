@@ -180,7 +180,12 @@ impl ClobRestClient {
         let creds = match cfg.keys.api_creds_source {
             ApiCredsSource::Explicit => {
                 let api_key = cfg.keys.clob_api_key.as_deref().unwrap_or_default().trim();
-                let api_secret = cfg.keys.clob_api_secret.as_deref().unwrap_or_default().trim();
+                let api_secret = cfg
+                    .keys
+                    .clob_api_secret
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim();
                 let api_passphrase = cfg
                     .keys
                     .clob_api_passphrase
@@ -206,7 +211,11 @@ impl ClobRestClient {
 
                 let api_key_uuid = Uuid::from_str(api_key)
                     .map_err(|e| BotError::Config(format!("invalid CLOB API key uuid: {e}")))?;
-                Credentials::new(api_key_uuid, api_secret.to_string(), api_passphrase.to_string())
+                Credentials::new(
+                    api_key_uuid,
+                    api_secret.to_string(),
+                    api_passphrase.to_string(),
+                )
             }
             ApiCredsSource::Derive => {
                 tracing::info!(
@@ -232,7 +241,12 @@ impl ClobRestClient {
             .credentials(creds)
             .signature_type(signature_type);
 
-        let mut funder = cfg.keys.funder_address.as_deref().map(str::trim).unwrap_or("");
+        let mut funder = cfg
+            .keys
+            .funder_address
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("");
         let mut derived = None;
         if cfg.keys.wallet_mode == WalletMode::ProxySafe && funder.is_empty() {
             derived = derive_proxy_wallet(signer.address(), POLYGON);
@@ -600,9 +614,9 @@ fn post_orders_result_from_responses(
         }
 
         let error = if !resp.success {
-            Some(
-                normalized_error.unwrap_or_else(|| format!("unknown error (success=false status={:?})", resp.status)),
-            )
+            Some(normalized_error.unwrap_or_else(|| {
+                format!("unknown error (success=false status={:?})", resp.status)
+            }))
         } else if let Some(err) = normalized_error {
             Some(err)
         } else if !has_order_id {
@@ -1118,7 +1132,14 @@ mod tests {
         };
 
         let signed = rest
-            .build_completion_order("123", Side::Buy, 10.0, 0.35, CompletionOrderType::Fak, now_ms())
+            .build_completion_order(
+                "123",
+                Side::Buy,
+                10.0,
+                0.35,
+                CompletionOrderType::Fak,
+                now_ms(),
+            )
             .await
             .expect("build completion order");
 
@@ -1131,7 +1152,14 @@ mod tests {
         assert_eq!(signed.order.makerAmount, U256::from(3_500_000u64));
 
         let signed_sell = rest
-            .build_completion_order("123", Side::Sell, 10.0, 0.35, CompletionOrderType::Fak, now_ms())
+            .build_completion_order(
+                "123",
+                Side::Sell,
+                10.0,
+                0.35,
+                CompletionOrderType::Fak,
+                now_ms(),
+            )
             .await
             .expect("build completion sell order");
 

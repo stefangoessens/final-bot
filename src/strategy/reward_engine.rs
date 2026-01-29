@@ -30,7 +30,10 @@ pub struct RewardEngine {
 }
 
 impl RewardEngine {
-    pub fn new(cfg: RewardsConfig, rest: ClobRestClient) -> (Self, watch::Receiver<RewardsSnapshot>) {
+    pub fn new(
+        cfg: RewardsConfig,
+        rest: ClobRestClient,
+    ) -> (Self, watch::Receiver<RewardsSnapshot>) {
         Self::with_client(cfg, Arc::new(rest))
     }
 
@@ -310,7 +313,11 @@ fn floor_to_tick(price: f64, tick: f64) -> f64 {
     (price / tick).floor() * tick
 }
 
-fn log_scoring(log_tx: &Option<mpsc::Sender<LogEvent>>, ts_ms: i64, scoring: &HashMap<String, bool>) {
+fn log_scoring(
+    log_tx: &Option<mpsc::Sender<LogEvent>>,
+    ts_ms: i64,
+    scoring: &HashMap<String, bool>,
+) {
     let Some(tx) = log_tx else {
         return;
     };
@@ -525,7 +532,9 @@ mod tests {
         rewards_cfg.scoring_check_interval_s = 1;
 
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let mock_rest = Arc::new(MockRewardsRest { calls: calls.clone() });
+        let mock_rest = Arc::new(MockRewardsRest {
+            calls: calls.clone(),
+        });
         let (reward_engine, _rx) = RewardEngine::with_client(rewards_cfg, mock_rest);
 
         let (tx_events, rx_events) = mpsc::channel(64);
@@ -589,7 +598,10 @@ mod tests {
             },
         ];
         tx_exec
-            .send(ExecCommand { slug: slug.clone(), desired })
+            .send(ExecCommand {
+                slug: slug.clone(),
+                desired,
+            })
             .await
             .expect("exec command sent");
 
