@@ -574,11 +574,43 @@ impl OrderManager {
                     fill_token = fill.token_id.clone();
                     // When a fill occurs, immediately cancel any remaining orders on the same token
                     // to prevent getting swept deeper on one side before the next strategy tick.
+                    let other_token_live = cache.live.values().any(|order| {
+                        order.token_id != fill.token_id
+                            && order.remaining.is_finite()
+                            && order.remaining > 0.0
+                    });
+                    let repair_only = !other_token_live;
+
+                    let tick = cache.tick_size.get(&fill.token_id).copied().unwrap_or(0.0);
+                    let near_ticks = self.cfg.selective_cancel_on_fill_near_ticks;
+                    let near_dist = if tick > 0.0 {
+                        near_ticks as f64 * tick
+                    } else {
+                        0.0
+                    };
+                    let max_level = self.cfg.selective_cancel_on_fill_repair_max_level;
+
                     cancel_ids = cache
                         .live
                         .values()
                         .filter(|order| order.token_id == fill.token_id)
                         .filter(|order| order.remaining.is_finite() && order.remaining > 0.0)
+                        .filter(|order| {
+                            if !self.cfg.selective_cancel_on_fill_enabled {
+                                return true;
+                            }
+                            if !repair_only {
+                                return true;
+                            }
+                            if order.level <= max_level {
+                                return true;
+                            }
+                            if near_dist > 0.0 {
+                                (order.price - fill.price).abs() <= near_dist + 1e-12
+                            } else {
+                                false
+                            }
+                        })
                         .map(|order| order.order_id.clone())
                         .collect();
                 }
@@ -1734,6 +1766,57 @@ mod tests {
         next_post: Arc<Mutex<Vec<Vec<PostResult>>>>,
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingRestClient {
+        canceled: Arc<Mutex<Vec<Vec<OrderId>>>>,
+    }
+
+    impl RecordingRestClient {
+        fn canceled_flat(&self) -> Vec<OrderId> {
+            self.canceled
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|batch| batch.iter().cloned())
+                .collect()
+        }
+    }
+
+    impl OrderRestClient for RecordingRestClient {
+        fn build_signed_orders(
+            &self,
+            _desired: Vec<DesiredOrder>,
+            _now_ms: i64,
+        ) -> BoxFuture<'static, BotResult<Vec<OrderRequest>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn post_orders_partial(
+            &self,
+            _orders: Vec<OrderRequest>,
+        ) -> BoxFuture<'static, BotResult<PostOutcome>> {
+            Box::pin(async {
+                Ok(PostOutcome {
+                    results: Vec::new(),
+                })
+            })
+        }
+
+        fn cancel_orders(
+            &self,
+            order_ids: Vec<OrderId>,
+        ) -> BoxFuture<'static, BotResult<CancelResult>> {
+            let canceled = self.canceled.clone();
+            Box::pin(async move {
+                canceled.lock().unwrap().push(order_ids.clone());
+                Ok(CancelResult {
+                    canceled: order_ids,
+                    failed: HashMap::new(),
+                })
+            })
+        }
+    }
+
     #[derive(Clone)]
     struct ComplianceRestClient {
         expected: Arc<HashMap<String, (f64, f64)>>,
@@ -1987,7 +2070,7 @@ mod tests {
         let mut completion_cfg = CompletionConfig::default();
         completion_cfg.enabled = false;
 
-        let preview = build_desired_orders(&state, &cfg, now_ms);
+        let preview = build_desired_orders(&state, &cfg, now_ms, None);
         assert!(
             !preview.is_empty(),
             "quote engine produced no orders for test state"
@@ -2650,6 +2733,59 @@ mod tests {
         })
         .await
         .expect("expected cancel attempt for unknown tracked order");
+    }
+
+    #[tokio::test]
+    async fn cancel_on_fill_is_selective_in_repair_only_mode() {
+        use crate::state::state_manager::OrderSide;
+
+        let mut cfg = TradingConfig::default();
+        cfg.dry_run = false;
+        cfg.selective_cancel_on_fill_enabled = true;
+        cfg.selective_cancel_on_fill_near_ticks = 2;
+        cfg.selective_cancel_on_fill_repair_max_level = 0;
+
+        let rest = RecordingRestClient::default();
+        let (_tx_user_orders, rx_user_orders) = mpsc::channel(1);
+        let mut manager = OrderManager::with_client(cfg, Arc::new(rest.clone()), rx_user_orders);
+
+        let slug = future_slug();
+        let cache = manager.markets.entry(slug).or_default();
+        cache.tick_size.insert("token".to_string(), 0.01);
+        cache.insert_live(make_live("order-0", "token", 0, 0.50, 10.0));
+        cache.insert_live(make_live("order-1", "token", 1, 0.48, 10.0));
+        cache.insert_live(make_live("order-2", "token", 2, 0.44, 10.0));
+
+        // Trigger a fill delta on order-0.
+        manager.handle_user_order_update(
+            UserOrderUpdate {
+                order_id: "order-0".to_string(),
+                token_id: "token".to_string(),
+                side: Some(OrderSide::Buy),
+                price: Some(0.50),
+                original_size: Some(10.0),
+                size_matched: Some(1.0),
+                ts_ms: 1_000,
+                update_type: UserOrderUpdateType::Update,
+            },
+            None,
+        );
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !rest.canceled_flat().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected cancel_on_fill to run");
+
+        let canceled = rest.canceled_flat();
+        assert!(canceled.contains(&"order-0".to_string()));
+        assert!(canceled.contains(&"order-1".to_string()));
+        assert!(!canceled.contains(&"order-2".to_string()));
     }
 
     #[tokio::test]

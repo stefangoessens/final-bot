@@ -262,6 +262,35 @@ pub struct TradingConfig {
     /// Hard cap on the number of orders posted per minute (across markets).
     /// 0 disables the limiter.
     pub max_orders_per_min: u32,
+
+    // --- Adverse-selection / pairing controls ---
+    /// Pause maker quoting for a short period after detecting negative fill markout.
+    pub markout_cooldown_enabled: bool,
+    pub markout_horizon_short_ms: i64,
+    pub markout_horizon_long_ms: i64,
+    pub markout_bad_threshold_bps: f64,
+    pub markout_cooldown_ms: i64,
+    pub markout_ewma_alpha: f64,
+    pub markout_min_fills_before_activation: u64,
+
+    /// Scale down maker aggressiveness when inventory pairing is deteriorating.
+    pub pair_protection_enabled: bool,
+    pub pair_protection_ratio_threshold: f64,
+    pub pair_protection_min_total_shares: f64,
+    pub pair_protection_unpaired_duration_s: i64,
+    pub pair_protection_max_ladder_levels: usize,
+    pub pair_protection_size_scale_min: f64,
+    pub pair_protection_repair_extra_improve_ticks: u64,
+
+    /// Limit how fast level-0 price can move upward (anti-pickoff).
+    pub chase_limiter_enabled: bool,
+    pub chase_level0_max_up_ticks_per_s: f64,
+    pub chase_level0_max_up_ticks_per_s_repair: f64,
+
+    /// Avoid canceling all depth on a repair-only token after a good repair fill.
+    pub selective_cancel_on_fill_enabled: bool,
+    pub selective_cancel_on_fill_near_ticks: u64,
+    pub selective_cancel_on_fill_repair_max_level: usize,
 }
 
 impl Default for TradingConfig {
@@ -298,6 +327,30 @@ impl Default for TradingConfig {
             resize_min_pct: 0.10,
             min_update_interval_ms: 250,
             max_orders_per_min: 300,
+
+            markout_cooldown_enabled: true,
+            markout_horizon_short_ms: 1_000,
+            markout_horizon_long_ms: 5_000,
+            markout_bad_threshold_bps: 10.0,
+            markout_cooldown_ms: 3_000,
+            markout_ewma_alpha: 0.2,
+            markout_min_fills_before_activation: 5,
+
+            pair_protection_enabled: true,
+            pair_protection_ratio_threshold: 0.85,
+            pair_protection_min_total_shares: 1.0,
+            pair_protection_unpaired_duration_s: 20,
+            pair_protection_max_ladder_levels: 1,
+            pair_protection_size_scale_min: 0.5,
+            pair_protection_repair_extra_improve_ticks: 1,
+
+            chase_limiter_enabled: true,
+            chase_level0_max_up_ticks_per_s: 5.0,
+            chase_level0_max_up_ticks_per_s_repair: 5.0,
+
+            selective_cancel_on_fill_enabled: true,
+            selective_cancel_on_fill_near_ticks: 2,
+            selective_cancel_on_fill_repair_max_level: 0,
         }
     }
 }
@@ -416,6 +469,93 @@ impl TradingConfig {
                 self.min_order_size_shares
             )));
         }
+
+        if self.markout_horizon_short_ms <= 0 {
+            return Err(BotError::Config(format!(
+                "trading.markout_horizon_short_ms must be >0, got {}",
+                self.markout_horizon_short_ms
+            )));
+        }
+        if self.markout_horizon_long_ms <= self.markout_horizon_short_ms {
+            return Err(BotError::Config(format!(
+                "trading.markout_horizon_long_ms ({}) must be > trading.markout_horizon_short_ms ({})",
+                self.markout_horizon_long_ms, self.markout_horizon_short_ms
+            )));
+        }
+        if !self.markout_bad_threshold_bps.is_finite() || self.markout_bad_threshold_bps <= 0.0 {
+            return Err(BotError::Config(format!(
+                "trading.markout_bad_threshold_bps must be finite and >0, got {}",
+                self.markout_bad_threshold_bps
+            )));
+        }
+        if self.markout_cooldown_ms <= 0 {
+            return Err(BotError::Config(format!(
+                "trading.markout_cooldown_ms must be >0, got {}",
+                self.markout_cooldown_ms
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.markout_ewma_alpha) {
+            return Err(BotError::Config(format!(
+                "trading.markout_ewma_alpha must be in [0,1], got {}",
+                self.markout_ewma_alpha
+            )));
+        }
+
+        if !self.pair_protection_ratio_threshold.is_finite()
+            || self.pair_protection_ratio_threshold <= 0.0
+            || self.pair_protection_ratio_threshold > 1.0
+        {
+            return Err(BotError::Config(format!(
+                "trading.pair_protection_ratio_threshold must be in (0,1], got {}",
+                self.pair_protection_ratio_threshold
+            )));
+        }
+        if !self.pair_protection_min_total_shares.is_finite()
+            || self.pair_protection_min_total_shares < 0.0
+        {
+            return Err(BotError::Config(format!(
+                "trading.pair_protection_min_total_shares must be finite and >=0, got {}",
+                self.pair_protection_min_total_shares
+            )));
+        }
+        if self.pair_protection_unpaired_duration_s < 0 {
+            return Err(BotError::Config(format!(
+                "trading.pair_protection_unpaired_duration_s must be >=0, got {}",
+                self.pair_protection_unpaired_duration_s
+            )));
+        }
+        if self.pair_protection_max_ladder_levels == 0 {
+            return Err(BotError::Config(
+                "trading.pair_protection_max_ladder_levels must be >=1".to_string(),
+            ));
+        }
+        if !self.pair_protection_size_scale_min.is_finite()
+            || self.pair_protection_size_scale_min <= 0.0
+            || self.pair_protection_size_scale_min > 1.0
+        {
+            return Err(BotError::Config(format!(
+                "trading.pair_protection_size_scale_min must be in (0,1], got {}",
+                self.pair_protection_size_scale_min
+            )));
+        }
+
+        if !self.chase_level0_max_up_ticks_per_s.is_finite()
+            || self.chase_level0_max_up_ticks_per_s < 0.0
+        {
+            return Err(BotError::Config(format!(
+                "trading.chase_level0_max_up_ticks_per_s must be finite and >=0, got {}",
+                self.chase_level0_max_up_ticks_per_s
+            )));
+        }
+        if !self.chase_level0_max_up_ticks_per_s_repair.is_finite()
+            || self.chase_level0_max_up_ticks_per_s_repair < 0.0
+        {
+            return Err(BotError::Config(format!(
+                "trading.chase_level0_max_up_ticks_per_s_repair must be finite and >=0, got {}",
+                self.chase_level0_max_up_ticks_per_s_repair
+            )));
+        }
+
         Ok(())
     }
 }

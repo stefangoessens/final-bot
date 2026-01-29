@@ -154,11 +154,226 @@ pub struct StateManager {
     last_market_quote_tick_ms: HashMap<String, i64>, // key: slug
     last_user_ws_msg_ms: Option<i64>,
     last_geoblock: Option<GeoblockStatus>,
+    markout: HashMap<String, FillMarkoutTracker>, // key: slug
     alpha_cfg: AlphaConfig,
     oracle_cfg: OracleConfig,
     trading_cfg: TradingConfig,
     health: HealthState,
     metrics: Metrics,
+}
+
+#[derive(Debug, Clone)]
+struct MarkoutPendingFill {
+    token_side: TokenSide,
+    fill_side: OrderSide,
+    fill_ts_ms: i64,
+    btc_fill_price: f64,
+    done_short: bool,
+    done_long: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+struct FillMarkoutTracker {
+    pending: Vec<MarkoutPendingFill>,
+    ewma_bps: f64,
+    fills_seen: u64,
+}
+
+impl FillMarkoutTracker {
+    fn record_fill(
+        &mut self,
+        token_side: TokenSide,
+        fill_side: OrderSide,
+        fill_ts_ms: i64,
+        btc_fill_price: f64,
+    ) {
+        if fill_ts_ms <= 0 || !btc_fill_price.is_finite() || btc_fill_price <= 0.0 {
+            return;
+        }
+
+        self.pending.push(MarkoutPendingFill {
+            token_side,
+            fill_side,
+            fill_ts_ms,
+            btc_fill_price,
+            done_short: false,
+            done_long: false,
+        });
+    }
+
+    fn evaluate(
+        &mut self,
+        alpha: &mut crate::state::market_state::AlphaState,
+        now_ms: i64,
+        btc_now: f64,
+        cfg: &TradingConfig,
+    ) {
+        if !cfg.markout_cooldown_enabled {
+            return;
+        }
+        if now_ms <= 0 || !btc_now.is_finite() || btc_now <= 0.0 {
+            return;
+        }
+
+        let short_ms = cfg.markout_horizon_short_ms.max(1);
+        let long_ms = cfg.markout_horizon_long_ms.max(short_ms + 1);
+        let threshold_bps = cfg.markout_bad_threshold_bps.max(0.0);
+        let cooldown_ms = cfg.markout_cooldown_ms.max(1);
+
+        let a = cfg.markout_ewma_alpha.clamp(0.0, 1.0);
+        let fills_seen = &mut self.fills_seen;
+        let ewma_bps = &mut self.ewma_bps;
+        let mut apply_ewma = |m: f64| {
+            if !m.is_finite() {
+                return;
+            }
+            *fills_seen = fills_seen.saturating_add(1);
+            if *fills_seen == 1 || a >= 1.0 - 1e-12 {
+                *ewma_bps = m;
+            } else if a > 0.0 {
+                *ewma_bps = a * m + (1.0 - a) * *ewma_bps;
+            }
+            alpha.markout_ewma_bps = *ewma_bps;
+        };
+
+        let mut any_bad = false;
+        let mut any_bad_hard = false;
+        for pending in self.pending.iter_mut() {
+            if !pending.done_short && now_ms.saturating_sub(pending.fill_ts_ms) >= short_ms {
+                let m = markout_bps(
+                    pending.btc_fill_price,
+                    btc_now,
+                    pending.token_side,
+                    pending.fill_side,
+                );
+                alpha.last_markout_bps_short = Some(m);
+                apply_ewma(m);
+                pending.done_short = true;
+                if m < -threshold_bps {
+                    any_bad = true;
+                }
+                if threshold_bps > 0.0 && m < -2.0 * threshold_bps {
+                    any_bad_hard = true;
+                }
+            }
+
+            if !pending.done_long && now_ms.saturating_sub(pending.fill_ts_ms) >= long_ms {
+                let m = markout_bps(
+                    pending.btc_fill_price,
+                    btc_now,
+                    pending.token_side,
+                    pending.fill_side,
+                );
+                alpha.last_markout_bps_long = Some(m);
+                apply_ewma(m);
+                pending.done_long = true;
+                if m < -threshold_bps {
+                    any_bad = true;
+                }
+                if threshold_bps > 0.0 && m < -2.0 * threshold_bps {
+                    any_bad_hard = true;
+                }
+            }
+        }
+
+        // Prune fills once all horizons are evaluated.
+        self.pending.retain(|p| !(p.done_short && p.done_long));
+
+        if any_bad_hard || (any_bad && (self.fills_seen >= cfg.markout_min_fills_before_activation))
+        {
+            alpha.maker_cooldown_until_ms = alpha
+                .maker_cooldown_until_ms
+                .max(now_ms.saturating_add(cooldown_ms));
+        }
+    }
+}
+
+fn markout_bps(btc_fill: f64, btc_now: f64, token_side: TokenSide, fill_side: OrderSide) -> f64 {
+    if !btc_fill.is_finite() || btc_fill <= 0.0 || !btc_now.is_finite() || btc_now <= 0.0 {
+        return 0.0;
+    }
+    let r_bps = 10_000.0 * (btc_now / btc_fill - 1.0);
+    let token_dir = match token_side {
+        TokenSide::Up => 1.0,
+        TokenSide::Down => -1.0,
+    };
+    let side_dir = match fill_side {
+        OrderSide::Buy => 1.0,
+        OrderSide::Sell => -1.0,
+    };
+    token_dir * side_dir * r_bps
+}
+
+fn update_markout_for_market(
+    markout: &mut HashMap<String, FillMarkoutTracker>,
+    state: &mut MarketState,
+    now_ms: i64,
+    cfg: &TradingConfig,
+) {
+    if !cfg.markout_cooldown_enabled {
+        return;
+    }
+    // If Binance is stale, the reference price can be untrustworthy; skip markout evaluation.
+    if state.alpha.binance_stale {
+        return;
+    }
+
+    let Some(btc) = state.rtds_primary.as_ref() else {
+        return;
+    };
+    if !btc.price.is_finite() || btc.price <= 0.0 {
+        return;
+    }
+
+    markout
+        .entry(state.identity.slug.clone())
+        .or_default()
+        .evaluate(&mut state.alpha, now_ms, btc.price, cfg);
+}
+
+fn update_pair_protection_for_market(state: &mut MarketState, now_ms: i64, cfg: &TradingConfig) {
+    let up = state.inventory.up.shares.max(0.0);
+    let down = state.inventory.down.shares.max(0.0);
+    let max = up.max(down);
+    let min = up.min(down);
+    state.alpha.pair_ratio = if max > 0.0 { min / max } else { 1.0 };
+
+    let unpaired = (up - down).abs();
+    let is_unpaired = unpaired > 1e-9;
+    let duration_s = if is_unpaired {
+        let since = state.alpha.unpaired_since_ms.unwrap_or(now_ms);
+        (now_ms.saturating_sub(since) as f64 / 1_000.0).max(0.0)
+    } else {
+        0.0
+    };
+    state.alpha.unpaired_duration_s = duration_s;
+
+    if !is_unpaired || !cfg.pair_protection_enabled {
+        state.alpha.pair_protection_level = 0.0;
+        return;
+    }
+
+    let total_shares = up + down;
+    if total_shares + 1e-12 < cfg.pair_protection_min_total_shares.max(0.0) {
+        state.alpha.pair_protection_level = 0.0;
+        return;
+    }
+
+    let ratio_threshold = cfg.pair_protection_ratio_threshold;
+    let level_ratio = if state.alpha.pair_ratio + 1e-12 < ratio_threshold {
+        ((ratio_threshold - state.alpha.pair_ratio) / ratio_threshold).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let dur_threshold_s = cfg.pair_protection_unpaired_duration_s.max(0) as f64;
+    let level_dur = if dur_threshold_s > 0.0 && duration_s + 1e-12 >= dur_threshold_s {
+        ((duration_s - dur_threshold_s) / dur_threshold_s).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    state.alpha.pair_protection_level = level_ratio.max(level_dur);
 }
 
 impl StateManager {
@@ -178,6 +393,7 @@ impl StateManager {
             last_market_quote_tick_ms: HashMap::new(),
             last_user_ws_msg_ms: None,
             last_geoblock: None,
+            markout: HashMap::new(),
             alpha_cfg,
             oracle_cfg,
             trading_cfg,
@@ -409,6 +625,7 @@ impl StateManager {
                     .retain(|slug, _| keep.contains(slug));
                 self.last_market_quote_tick_ms
                     .retain(|slug, _| keep.contains(slug));
+                self.markout.retain(|slug, _| keep.contains(slug));
             }
             AppEvent::MarketWsUpdate(update) => {
                 self.health.mark_market_ws(update.ts_ms);
@@ -463,83 +680,91 @@ impl StateManager {
                 let mut total_markets = 0usize;
                 let mut first_block_reason: Option<String> = None;
 
-                for state in self.markets.values_mut() {
-                    total_markets += 1;
+                {
+                    let alpha_cfg = &self.alpha_cfg;
+                    let oracle_cfg = &self.oracle_cfg;
+                    let trading_cfg = &self.trading_cfg;
+                    let metrics = &self.metrics;
+                    let health = &self.health;
+                    let markout = &mut self.markout;
 
-                    let out = crate::alpha::update_alpha(
-                        state,
-                        now_ms,
-                        &self.alpha_cfg,
-                        &self.oracle_cfg,
-                        &self.trading_cfg,
-                    );
+                    for state in self.markets.values_mut() {
+                        total_markets += 1;
 
-                    let (inventory_usdc, open_order_usdc, exposure_usdc) =
-                        market_exposure_usdc(state);
-                    let exposure_cap = self.trading_cfg.max_usdc_exposure_per_market;
-                    let exposure_over_cap = exposure_usdc > exposure_cap;
-                    self.metrics
-                        .set_market_exposure_usdc(&state.identity.slug, exposure_usdc);
-                    self.metrics
-                        .set_market_exposure_cap_usdc(&state.identity.slug, exposure_cap);
-                    self.metrics
-                        .set_market_exposure_over_cap(&state.identity.slug, exposure_over_cap);
+                        let out = crate::alpha::update_alpha(
+                            state,
+                            now_ms,
+                            alpha_cfg,
+                            oracle_cfg,
+                            trading_cfg,
+                        );
 
-                    let tradable = state.identity.active
-                        && state.identity.accepting_orders
-                        && !state.identity.closed;
+                        update_pair_protection_for_market(state, now_ms, trading_cfg);
+                        update_markout_for_market(markout, state, now_ms, trading_cfg);
 
-                    let halted = self.health.is_halted();
-                    let mut block_reason = None;
-                    if halted {
-                        block_reason = self
-                            .health
-                            .halt_reason()
-                            .or_else(|| Some("halted".to_string()));
-                    } else if !user_ws_fresh {
-                        block_reason = Some("user_ws_stale".to_string());
-                    } else if !tradable {
-                        block_reason =
-                            Some(format!("market_not_tradable: {}", state.identity.slug));
-                    } else if exposure_over_cap {
-                        block_reason = Some("exposure_cap".to_string());
-                    }
+                        let (inventory_usdc, open_order_usdc, exposure_usdc) =
+                            market_exposure_usdc(state);
+                        let exposure_cap = trading_cfg.max_usdc_exposure_per_market;
+                        let exposure_over_cap = exposure_usdc > exposure_cap;
+                        metrics.set_market_exposure_usdc(&state.identity.slug, exposure_usdc);
+                        metrics.set_market_exposure_cap_usdc(&state.identity.slug, exposure_cap);
+                        metrics
+                            .set_market_exposure_over_cap(&state.identity.slug, exposure_over_cap);
 
-                    let alpha_ok = now_ms < state.cutoff_ts_ms && out.size_scalar > 0.0;
-                    let quoting_enabled = alpha_ok && block_reason.is_none();
-                    state.quoting_enabled = quoting_enabled;
+                        let tradable = state.identity.active
+                            && state.identity.accepting_orders
+                            && !state.identity.closed;
 
-                    if quoting_enabled {
-                        enabled_markets += 1;
-                    } else if first_block_reason.is_none() {
-                        first_block_reason = block_reason;
-                    }
+                        let halted = health.is_halted();
+                        let mut block_reason = None;
+                        if halted {
+                            block_reason =
+                                health.halt_reason().or_else(|| Some("halted".to_string()));
+                        } else if !user_ws_fresh {
+                            block_reason = Some("user_ws_stale".to_string());
+                        } else if !tradable {
+                            block_reason =
+                                Some(format!("market_not_tradable: {}", state.identity.slug));
+                        } else if exposure_over_cap {
+                            block_reason = Some("exposure_cap".to_string());
+                        }
 
-                    if exposure_over_cap {
-                        tracing::warn!(
-                            target: "risk",
+                        let alpha_ok = now_ms < state.cutoff_ts_ms && out.size_scalar > 0.0;
+                        let quoting_enabled = alpha_ok && block_reason.is_none();
+                        state.quoting_enabled = quoting_enabled;
+
+                        if quoting_enabled {
+                            enabled_markets += 1;
+                        } else if first_block_reason.is_none() {
+                            first_block_reason = block_reason;
+                        }
+
+                        if exposure_over_cap {
+                            tracing::warn!(
+                                target: "risk",
+                                slug = %state.identity.slug,
+                                exposure_usdc,
+                                exposure_cap,
+                                inventory_usdc,
+                                open_order_usdc,
+                                "market exposure over cap; quoting disabled"
+                            );
+                        }
+
+                        tracing::debug!(
+                            target: "alpha",
                             slug = %state.identity.slug,
-                            exposure_usdc,
-                            exposure_cap,
-                            inventory_usdc,
-                            open_order_usdc,
-                            "market exposure over cap; quoting disabled"
+                            regime = ?out.regime,
+                            oracle_disagree = out.oracle_disagree,
+                            q_up = out.q_up,
+                            cap_up = out.cap_up,
+                            cap_down = out.cap_down,
+                            target_total = out.target_total,
+                            size_scalar = out.size_scalar,
+                            quoting_enabled,
+                            "alpha update"
                         );
                     }
-
-                    tracing::debug!(
-                        target: "alpha",
-                        slug = %state.identity.slug,
-                        regime = ?out.regime,
-                        oracle_disagree = out.oracle_disagree,
-                        q_up = out.q_up,
-                        cap_up = out.cap_up,
-                        cap_down = out.cap_down,
-                        target_total = out.target_total,
-                        size_scalar = out.size_scalar,
-                        quoting_enabled,
-                        "alpha update"
-                    );
                 }
 
                 let block_reason = if enabled_markets == 0 {
@@ -623,6 +848,7 @@ impl StateManager {
                 Some(s) => s,
                 None => continue,
             };
+            let was_unpaired = state.inventory.unpaired_shares() > 1e-9;
             match fill.side {
                 OrderSide::Buy => {
                     state
@@ -633,6 +859,30 @@ impl StateManager {
                     .inventory
                     .apply_sell_fill(side, fill.shares, fill.ts_ms),
             }
+
+            // Track unpaired start time for pair-protection heuristics.
+            let now_unpaired = state.inventory.unpaired_shares() > 1e-9;
+            if now_unpaired && !was_unpaired {
+                state.alpha.unpaired_since_ms = Some(fill.ts_ms);
+            }
+            if !now_unpaired {
+                state.alpha.unpaired_since_ms = None;
+                state.alpha.unpaired_duration_s = 0.0;
+                state.alpha.pair_protection_level = 0.0;
+            }
+
+            // Record the BTC price at fill time for markout computation.
+            if self.trading_cfg.markout_cooldown_enabled {
+                if let Some(btc) = state.rtds_primary.as_ref() {
+                    if btc.price.is_finite() && btc.price > 0.0 {
+                        self.markout
+                            .entry(state.identity.slug.clone())
+                            .or_default()
+                            .record_fill(side, fill.side, fill.ts_ms, btc.price);
+                    }
+                }
+            }
+
             self.metrics.inc_fills();
             return;
         }
@@ -961,6 +1211,100 @@ mod tests {
         let avg = state.inventory.up.avg_cost().unwrap();
         assert!((avg - 0.49).abs() < 1e-12, "avg_cost={avg}");
         assert_eq!(state.inventory.unpaired_shares(), 10.0);
+    }
+
+    #[test]
+    fn markout_cooldown_triggers_on_large_negative_markout() {
+        let ops = OpsState::new(&AppConfig::default());
+        let mut sm = StateManager::new(
+            AlphaConfig::default(),
+            OracleConfig::default(),
+            TradingConfig::default(),
+            ops.health,
+            ops.metrics,
+        );
+        sm.apply_event(AppEvent::MarketDiscovered(make_identity()), 0);
+
+        // Seed BTC price.
+        sm.apply_event(
+            AppEvent::RTDSUpdate(RTDSUpdate {
+                source: RTDSSource::BinanceBtcUsdt,
+                price: 10_000.0,
+                ts_ms: 0,
+            }),
+            0,
+        );
+
+        // Fill UP (BUY) with BTC at 10_000.
+        sm.apply_event(
+            AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
+                token_id: "up".to_string(),
+                side: OrderSide::Buy,
+                price: 0.49,
+                shares: 1.0,
+                ts_ms: 1,
+            })),
+            1,
+        );
+
+        // 1s later BTC is down ~21 bps => hard negative markout triggers cooldown.
+        sm.apply_event(
+            AppEvent::RTDSUpdate(RTDSUpdate {
+                source: RTDSSource::BinanceBtcUsdt,
+                price: 9_979.0,
+                ts_ms: 1_001,
+            }),
+            1_001,
+        );
+        sm.apply_event(AppEvent::TimerTick { now_ms: 1_001 }, 1_001);
+
+        let state = sm.market_state("btc-updown-15m-0").unwrap();
+        assert!(
+            state.alpha.maker_cooldown_until_ms >= 4_001,
+            "cooldown_until_ms={}",
+            state.alpha.maker_cooldown_until_ms
+        );
+        assert!(
+            state.alpha.last_markout_bps_short.is_some(),
+            "expected short-horizon markout to be computed"
+        );
+    }
+
+    #[test]
+    fn pair_protection_level_increases_when_unpaired_persists() {
+        let ops = OpsState::new(&AppConfig::default());
+        let mut sm = StateManager::new(
+            AlphaConfig::default(),
+            OracleConfig::default(),
+            TradingConfig::default(),
+            ops.health,
+            ops.metrics,
+        );
+        sm.apply_event(AppEvent::MarketDiscovered(make_identity()), 0);
+
+        sm.apply_event(
+            AppEvent::UserWsUpdate(UserWsUpdate::Fill(FillEvent {
+                token_id: "up".to_string(),
+                side: OrderSide::Buy,
+                price: 0.49,
+                shares: 10.0,
+                ts_ms: 1_000,
+            })),
+            1_000,
+        );
+
+        sm.apply_event(AppEvent::TimerTick { now_ms: 1_000 }, 1_000);
+        sm.apply_event(AppEvent::TimerTick { now_ms: 25_000 }, 25_000);
+
+        let state = sm.market_state("btc-updown-15m-0").unwrap();
+        assert_eq!(state.alpha.unpaired_since_ms, Some(1_000));
+        assert!(state.alpha.unpaired_duration_s >= 24.0);
+        assert!(
+            state.alpha.pair_protection_level > 0.0,
+            "pair_protection_level={}",
+            state.alpha.pair_protection_level
+        );
+        assert!(state.alpha.pair_ratio < 0.85);
     }
 
     #[test]

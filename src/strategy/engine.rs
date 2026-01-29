@@ -12,7 +12,7 @@ use crate::persistence::LogEvent;
 use crate::state::market_state::MarketState;
 use crate::state::state_manager::QuoteTick;
 use crate::strategy::fee;
-use crate::strategy::quote_engine::build_desired_orders;
+use crate::strategy::quote_engine::{build_desired_orders, Level0ChaseLimiter};
 use crate::strategy::reward_engine::{apply_reward_hints, RewardApplySummary, RewardsSnapshot};
 use crate::strategy::risk::{
     adjust_for_inventory, apply_skew_repair_pricing, should_taker_complete,
@@ -48,6 +48,7 @@ pub struct StrategyEngine {
     completion: CompletionConfig,
     rewards: RewardsConfig,
     rewards_rx: Option<watch::Receiver<RewardsSnapshot>>,
+    chase: Level0ChaseLimiter,
 }
 
 impl StrategyEngine {
@@ -64,6 +65,7 @@ impl StrategyEngine {
             completion,
             rewards,
             rewards_rx,
+            chase: Level0ChaseLimiter::default(),
         }
     }
 
@@ -78,7 +80,7 @@ impl StrategyEngine {
     }
 
     pub async fn run_with_logger(
-        self,
+        mut self,
         mut rx_quote: Receiver<QuoteTick>,
         tx_exec: Sender<ExecCommand>,
         tx_completion: Sender<CompletionCommand>,
@@ -120,7 +122,12 @@ impl StrategyEngine {
                 continue;
             }
 
-            let mut desired = build_desired_orders(&state, &self.trading, now_ms);
+            let chase = if self.trading.chase_limiter_enabled {
+                Some(&mut self.chase)
+            } else {
+                None
+            };
+            let mut desired = build_desired_orders(&state, &self.trading, now_ms, chase);
             adjust_for_inventory(&mut desired, &state, &self.inventory, now_ms);
             apply_skew_repair_pricing(
                 &mut desired,
@@ -908,7 +915,7 @@ mod tests {
         state.alpha.size_scalar = 1.0;
 
         let mut desired =
-            crate::strategy::quote_engine::build_desired_orders(&state, &trading, now_ms);
+            crate::strategy::quote_engine::build_desired_orders(&state, &trading, now_ms, None);
         assert!(
             desired
                 .iter()

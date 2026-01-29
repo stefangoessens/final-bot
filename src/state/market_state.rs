@@ -46,6 +46,17 @@ pub struct AlphaState {
     pub fast_move: bool,
     pub oracle_disagree: bool,
 
+    // Fill-quality / pairing telemetry (set by StateManager).
+    pub maker_cooldown_until_ms: i64,
+    pub markout_ewma_bps: f64,
+    pub last_markout_bps_short: Option<f64>,
+    pub last_markout_bps_long: Option<f64>,
+
+    pub unpaired_since_ms: Option<i64>,
+    pub unpaired_duration_s: f64,
+    pub pair_ratio: f64,
+    pub pair_protection_level: f64,
+
     pub cap_up: f64,
     pub cap_down: f64,
     pub target_total: f64,

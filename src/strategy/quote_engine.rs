@@ -1,16 +1,86 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
 use crate::config::TradingConfig;
 use crate::state::book::TokenBookTop;
 use crate::state::market_state::MarketState;
 use crate::strategy::{DesiredOrder, TimeInForce};
 
+#[derive(Debug, Default, Clone)]
+pub struct Level0ChaseLimiter {
+    last_by_token: HashMap<(String, String), ChaseState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChaseState {
+    last_p0: f64,
+    last_ts_ms: i64,
+}
+
+impl Level0ChaseLimiter {
+    fn clamp_upward(
+        &mut self,
+        slug: &str,
+        token_id: &str,
+        p0: f64,
+        tick: f64,
+        now_ms: i64,
+        max_up_ticks_per_s: f64,
+    ) -> f64 {
+        if slug.is_empty() || token_id.is_empty() {
+            return p0;
+        }
+        if !p0.is_finite() || p0 <= 0.0 || tick <= 0.0 || now_ms <= 0 {
+            return p0;
+        }
+
+        let key = (slug.to_string(), token_id.to_string());
+        let entry = self.last_by_token.entry(key).or_insert(ChaseState {
+            last_p0: p0,
+            last_ts_ms: now_ms,
+        });
+
+        if now_ms <= entry.last_ts_ms {
+            entry.last_p0 = p0;
+            entry.last_ts_ms = now_ms;
+            return p0;
+        }
+
+        if p0 <= entry.last_p0 + 1e-12 {
+            entry.last_p0 = p0;
+            entry.last_ts_ms = now_ms;
+            return p0;
+        }
+
+        if !max_up_ticks_per_s.is_finite() || max_up_ticks_per_s <= 0.0 {
+            // No upward chasing allowed.
+            entry.last_ts_ms = now_ms;
+            return entry.last_p0;
+        }
+
+        let dt_s = (now_ms.saturating_sub(entry.last_ts_ms) as f64 / 1_000.0).max(0.0);
+        let allowed_ticks = (max_up_ticks_per_s * dt_s).floor();
+        let allowed = (allowed_ticks.max(0.0)) * tick;
+        let clamped = p0.min(entry.last_p0 + allowed);
+
+        entry.last_p0 = clamped;
+        entry.last_ts_ms = now_ms;
+        clamped
+    }
+}
+
 pub fn build_desired_orders(
     state: &MarketState,
     cfg: &TradingConfig,
     now_ms: i64,
+    chase: Option<&mut Level0ChaseLimiter>,
 ) -> Vec<DesiredOrder> {
     if !state.quoting_enabled || now_ms >= state.cutoff_ts_ms {
+        return Vec::new();
+    }
+
+    if cfg.markout_cooldown_enabled && now_ms < state.alpha.maker_cooldown_until_ms {
         return Vec::new();
     }
 
@@ -50,8 +120,71 @@ pub fn build_desired_orders(
         cap_down = 0.5 * target_total;
     }
 
-    let mut up_p0 = top_price(&state.up_book, cap_up, cfg);
-    let mut down_p0 = top_price(&state.down_book, cap_down, cfg);
+    let unpaired = state.inventory.unpaired_shares();
+    let repair_missing_token = if unpaired > 1e-9 {
+        if state.inventory.up.shares > state.inventory.down.shares {
+            Some(state.identity.token_down.as_str())
+        } else {
+            Some(state.identity.token_up.as_str())
+        }
+    } else {
+        None
+    };
+    let pair_level = if cfg.pair_protection_enabled {
+        state.alpha.pair_protection_level.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let base_improve = cfg.base_improve_ticks.min(cfg.max_improve_ticks);
+    let up_improve = if repair_missing_token.is_some_and(|t| t == state.identity.token_up.as_str())
+        && pair_level > 0.0
+    {
+        base_improve
+            .saturating_add(cfg.pair_protection_repair_extra_improve_ticks)
+            .min(cfg.max_improve_ticks)
+    } else {
+        base_improve
+    };
+    let down_improve = if repair_missing_token
+        .is_some_and(|t| t == state.identity.token_down.as_str())
+        && pair_level > 0.0
+    {
+        base_improve
+            .saturating_add(cfg.pair_protection_repair_extra_improve_ticks)
+            .min(cfg.max_improve_ticks)
+    } else {
+        base_improve
+    };
+
+    let mut up_p0 = top_price(&state.up_book, cap_up, cfg, up_improve);
+    let mut down_p0 = top_price(&state.down_book, cap_down, cfg, down_improve);
+
+    if cfg.chase_limiter_enabled {
+        if let Some(limiter) = chase {
+            let max_up = if unpaired > 1e-9 {
+                cfg.chase_level0_max_up_ticks_per_s_repair
+            } else {
+                cfg.chase_level0_max_up_ticks_per_s
+            };
+            up_p0 = limiter.clamp_upward(
+                &state.identity.slug,
+                &state.identity.token_up,
+                up_p0,
+                tick_up,
+                now_ms,
+                max_up,
+            );
+            down_p0 = limiter.clamp_upward(
+                &state.identity.slug,
+                &state.identity.token_down,
+                down_p0,
+                tick_down,
+                now_ms,
+                max_up,
+            );
+        }
+    }
 
     (up_p0, down_p0) = enforce_combined_cap(
         up_p0,
@@ -70,9 +203,14 @@ pub fn build_desired_orders(
         cfg.base_size_shares_current
     };
     let size_scalar = state.alpha.size_scalar.clamp(0.0, 1.0);
-    let base_size = (base_size * size_scalar).max(cfg.min_order_size_shares);
+    let mut base_size = (base_size * size_scalar).max(cfg.min_order_size_shares);
+    if pair_level > 0.0 {
+        let min_scale = cfg.pair_protection_size_scale_min.clamp(0.0, 1.0);
+        let scale = (1.0 - pair_level) + pair_level * min_scale;
+        base_size = (base_size * scale).max(cfg.min_order_size_shares);
+    }
 
-    let (ladder_levels, ladder_step_ticks) = if cfg.adaptive_ladder_enabled {
+    let (mut ladder_levels, ladder_step_ticks) = if cfg.adaptive_ladder_enabled {
         let toxic = state.alpha.vol_ratio >= cfg.adaptive_ladder_vol_ratio_threshold
             || state.alpha.binance_stale;
         if toxic {
@@ -86,6 +224,10 @@ pub fn build_desired_orders(
     } else {
         (cfg.ladder_levels, cfg.ladder_step_ticks)
     };
+
+    if pair_level > 0.0 {
+        ladder_levels = ladder_levels.min(cfg.pair_protection_max_ladder_levels.max(1));
+    }
 
     let mut desired = Vec::with_capacity(ladder_levels.saturating_mul(2));
 
@@ -176,13 +318,13 @@ fn build_ladder(
     }
 }
 
-fn top_price(book: &TokenBookTop, cap: f64, cfg: &TradingConfig) -> f64 {
+fn top_price(book: &TokenBookTop, cap: f64, cfg: &TradingConfig, improve_ticks: u64) -> f64 {
     let tick = book.tick_size;
     if tick <= 0.0 {
         return 0.0;
     }
 
-    let improve_ticks = cfg.base_improve_ticks.min(cfg.max_improve_ticks);
+    let improve_ticks = improve_ticks.min(cfg.max_improve_ticks);
     let improve = improve_ticks as f64 * tick;
     let mut comp = if let Some(bid) = book.best_bid {
         bid + improve
@@ -315,7 +457,7 @@ mod tests {
         let mut cfg = TradingConfig::default();
         cfg.base_improve_ticks = 0;
 
-        let desired = build_desired_orders(&state, &cfg, 1000);
+        let desired = build_desired_orders(&state, &cfg, 1000, None);
         let mut up0 = None;
         let mut down0 = None;
         for order in desired {
@@ -348,7 +490,7 @@ mod tests {
         state.alpha.size_scalar = 1.0;
 
         let cfg = TradingConfig::default();
-        let desired = build_desired_orders(&state, &cfg, 1000);
+        let desired = build_desired_orders(&state, &cfg, 1000, None);
         assert!(desired.is_empty(), "expected no orders before tick known");
     }
 
@@ -369,7 +511,7 @@ mod tests {
         let mut cfg = TradingConfig::default();
         cfg.base_improve_ticks = 0;
 
-        let desired = build_desired_orders(&state, &cfg, 1000);
+        let desired = build_desired_orders(&state, &cfg, 1000, None);
         for order in desired {
             let tick = if order.token_id == "up" {
                 state.up_book.tick_size
@@ -402,7 +544,7 @@ mod tests {
         cfg.min_ticks_from_ask = 1;
         cfg.base_improve_ticks = 1;
 
-        let desired = build_desired_orders(&state, &cfg, 1000);
+        let desired = build_desired_orders(&state, &cfg, 1000, None);
         for order in desired {
             let (ask, tick) = if order.token_id == "up" {
                 (state.up_book.best_ask.unwrap(), state.up_book.tick_size)
@@ -433,7 +575,7 @@ mod tests {
         state.alpha.cap_down = 0.99;
         state.alpha.size_scalar = 1.0;
 
-        let desired = build_desired_orders(&state, &cfg, 1000);
+        let desired = build_desired_orders(&state, &cfg, 1000, None);
         assert!(
             desired.is_empty(),
             "expected quoting to pause when Up is under floor"
@@ -449,7 +591,7 @@ mod tests {
         state.alpha.cap_down = 0.99;
         state.alpha.size_scalar = 1.0;
 
-        let desired = build_desired_orders(&state, &cfg, 1000);
+        let desired = build_desired_orders(&state, &cfg, 1000, None);
         assert!(
             desired.is_empty(),
             "expected quoting to pause when Down is under floor"
@@ -471,7 +613,7 @@ mod tests {
         state.alpha.cap_down = 0.99;
         state.alpha.size_scalar = 1.0;
 
-        let desired = build_desired_orders(&state, &cfg, 1000);
+        let desired = build_desired_orders(&state, &cfg, 1000, None);
         assert!(!desired.is_empty(), "expected some desired orders");
         for order in desired {
             assert!(
@@ -512,10 +654,29 @@ mod tests {
         state.alpha.cap_down = 0.99;
         state.alpha.size_scalar = 1.0;
 
-        let desired = build_desired_orders(&state, &cfg, 1000);
+        let desired = build_desired_orders(&state, &cfg, 1000, None);
         assert!(
             desired.is_empty(),
             "expected quoting to pause when balanced but only one side would quote"
         );
+    }
+
+    #[test]
+    fn level0_chase_limiter_clamps_upward_moves() {
+        let mut limiter = Level0ChaseLimiter::default();
+        let slug = "m";
+        let token = "t";
+        let tick = 0.01;
+
+        let first = limiter.clamp_upward(slug, token, 0.50, tick, 1_000, 5.0);
+        assert!((first - 0.50).abs() < 1e-12);
+
+        // 1s later at 5 ticks/s => allow 5 ticks = 0.05.
+        let clamped = limiter.clamp_upward(slug, token, 0.60, tick, 2_000, 5.0);
+        assert!((clamped - 0.55).abs() < 1e-12, "clamped={clamped}");
+
+        // Downward moves should not be clamped.
+        let down = limiter.clamp_upward(slug, token, 0.53, tick, 3_000, 5.0);
+        assert!((down - 0.53).abs() < 1e-12, "down={down}");
     }
 }
