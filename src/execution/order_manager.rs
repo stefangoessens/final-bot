@@ -452,6 +452,41 @@ impl OrderManager {
                 .contains_key(&(post.token_id.clone(), post.level))
         });
 
+        // Defense-in-depth: never post a maker order below the quote floor, even if a
+        // strategy bug/regression produces one.
+        let min_quote_price = self.cfg.min_quote_price.max(0.0);
+        posts.retain(|post| {
+            if !post.post_only {
+                return true;
+            }
+            if !post.price.is_finite() {
+                tracing::error!(
+                    target: "safety",
+                    slug = %cmd.slug,
+                    token_id = %post.token_id,
+                    level = post.level,
+                    price = post.price,
+                    action = "drop_non_finite_post",
+                    "dropping non-finite post-only order"
+                );
+                return false;
+            }
+            if post.price + 1e-12 < min_quote_price {
+                tracing::error!(
+                    target: "safety",
+                    slug = %cmd.slug,
+                    token_id = %post.token_id,
+                    level = post.level,
+                    price = post.price,
+                    min_quote_price,
+                    action = "drop_below_floor_post",
+                    "dropping post-only order below min_quote_price"
+                );
+                return false;
+            }
+            true
+        });
+
         if posts.is_empty() {
             return;
         }

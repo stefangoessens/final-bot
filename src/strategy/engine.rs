@@ -2,6 +2,7 @@
 
 use serde_json::json;
 use tokio::sync::{
+    mpsc::error::TryRecvError,
     mpsc::{Receiver, Sender},
     watch,
 };
@@ -83,7 +84,16 @@ impl StrategyEngine {
         tx_completion: Sender<CompletionCommand>,
         log_tx: Option<Sender<LogEvent>>,
     ) {
-        while let Some(tick) = rx_quote.recv().await {
+        while let Some(mut tick) = rx_quote.recv().await {
+            // Drain backlog and only process the most recent tick.
+            loop {
+                match rx_quote.try_recv() {
+                    Ok(next) => tick = next,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
+
             let QuoteTick {
                 slug,
                 now_ms,

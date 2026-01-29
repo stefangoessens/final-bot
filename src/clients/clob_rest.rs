@@ -28,6 +28,7 @@ pub type OrderId = String;
 pub type OrderRequest = SignedOrder;
 
 const DEFAULT_FEE_RATE_TTL_MS: i64 = 60_000;
+const MAX_POST_ORDERS_BATCH: usize = 15;
 
 #[derive(Debug, Clone, Default)]
 pub struct CancelResult {
@@ -512,6 +513,14 @@ impl ClobRestClient {
         })?;
         if orders.is_empty() {
             return Ok(PostOrdersResult::default());
+        }
+
+        if orders.len() > MAX_POST_ORDERS_BATCH {
+            return Err(BotError::Other(format!(
+                "refusing to post batch >{} orders (got {})",
+                MAX_POST_ORDERS_BATCH,
+                orders.len()
+            )));
         }
 
         let token_ids: Vec<Option<String>> =

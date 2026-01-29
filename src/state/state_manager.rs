@@ -149,8 +149,9 @@ pub enum AppEvent {
 }
 
 pub struct StateManager {
-    markets: HashMap<String, MarketState>,         // key: slug
-    last_fill_quote_tick_ms: HashMap<String, i64>, // key: slug
+    markets: HashMap<String, MarketState>,           // key: slug
+    last_fill_quote_tick_ms: HashMap<String, i64>,   // key: slug
+    last_market_quote_tick_ms: HashMap<String, i64>, // key: slug
     last_user_ws_msg_ms: Option<i64>,
     last_geoblock: Option<GeoblockStatus>,
     alpha_cfg: AlphaConfig,
@@ -162,6 +163,7 @@ pub struct StateManager {
 
 impl StateManager {
     const FILL_QUOTE_TICK_MIN_GAP_MS: i64 = 25;
+    const MARKET_QUOTE_TICK_MIN_GAP_MS: i64 = 25;
 
     pub fn new(
         alpha_cfg: AlphaConfig,
@@ -173,6 +175,7 @@ impl StateManager {
         Self {
             markets: HashMap::new(),
             last_fill_quote_tick_ms: HashMap::new(),
+            last_market_quote_tick_ms: HashMap::new(),
             last_user_ws_msg_ms: None,
             last_geoblock: None,
             alpha_cfg,
@@ -190,6 +193,21 @@ impl StateManager {
 
     pub async fn run(mut self, mut rx: Receiver<AppEvent>, tx_quote: Sender<QuoteTick>) {
         while let Some(event) = rx.recv().await {
+            let market_update_slug = match &event {
+                AppEvent::MarketWsUpdate(u) => self.market_slug_for_token_id(&u.token_id),
+                _ => None,
+            };
+
+            let market_update_before = market_update_slug
+                .as_deref()
+                .and_then(|slug| self.markets.get(slug))
+                .map(book_snapshot);
+            let market_update_under_floor_before = market_update_slug
+                .as_deref()
+                .and_then(|slug| self.markets.get(slug))
+                .map(|state| market_under_floor(state, self.trading_cfg.min_quote_price))
+                .unwrap_or(false);
+
             let fill_token_id = match &event {
                 AppEvent::UserWsUpdate(UserWsUpdate::Fill(fill)) => Some(fill.token_id.clone()),
                 _ => None,
@@ -240,10 +258,66 @@ impl StateManager {
                         }
                     }
                 }
+            } else if let Some(slug) = market_update_slug {
+                if let Some(state) = self.markets.get(&slug) {
+                    let after = book_snapshot(state);
+                    let under_floor_after =
+                        market_under_floor(state, self.trading_cfg.min_quote_price);
+                    let changed = market_update_before
+                        .map(|before| before != after)
+                        .unwrap_or(true)
+                        || market_update_under_floor_before != under_floor_after;
+
+                    if changed {
+                        self.maybe_emit_market_quote_tick(slug, now_ms, &tx_quote);
+                    }
+                }
             } else if let Some(token_id) = fill_token_id {
                 if let Some(slug) = self.market_slug_for_token_id(&token_id) {
                     self.maybe_emit_fill_quote_tick(slug, now_ms, &tx_quote);
                 }
+            }
+        }
+    }
+
+    fn maybe_emit_market_quote_tick(
+        &mut self,
+        slug: String,
+        now_ms: i64,
+        tx_quote: &Sender<QuoteTick>,
+    ) {
+        if let Some(last_ms) = self.last_market_quote_tick_ms.get(&slug).copied() {
+            if now_ms.saturating_sub(last_ms) < Self::MARKET_QUOTE_TICK_MIN_GAP_MS {
+                return;
+            }
+        }
+
+        let Some(state) = self.markets.get(&slug) else {
+            return;
+        };
+
+        let tick = QuoteTick {
+            slug: slug.clone(),
+            now_ms,
+            state: state.clone(),
+        };
+
+        match tx_quote.try_send(tick) {
+            Ok(()) => {
+                self.last_market_quote_tick_ms.insert(slug, now_ms);
+            }
+            Err(TrySendError::Full(_)) => {
+                tracing::debug!(
+                    target: "state_manager",
+                    slug = %slug,
+                    "quote tick channel full; dropping market-triggered tick"
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                tracing::warn!(
+                    target: "state_manager",
+                    "quote tick channel closed; dropping market-triggered tick"
+                );
             }
         }
     }
@@ -332,6 +406,8 @@ impl StateManager {
                 let keep: std::collections::HashSet<String> = slugs.into_iter().collect();
                 self.markets.retain(|slug, _| keep.contains(slug));
                 self.last_fill_quote_tick_ms
+                    .retain(|slug, _| keep.contains(slug));
+                self.last_market_quote_tick_ms
                     .retain(|slug, _| keep.contains(slug));
             }
             AppEvent::MarketWsUpdate(update) => {
@@ -767,6 +843,34 @@ fn market_exposure_usdc(state: &MarketState) -> (f64, f64, f64) {
     (inventory_usdc, open_order_usdc, total)
 }
 
+type BookSnapshot = (Option<f64>, Option<f64>, f64, Option<f64>, Option<f64>, f64);
+
+fn book_snapshot(state: &MarketState) -> BookSnapshot {
+    (
+        state.up_book.best_bid,
+        state.up_book.best_ask,
+        state.up_book.tick_size,
+        state.down_book.best_bid,
+        state.down_book.best_ask,
+        state.down_book.tick_size,
+    )
+}
+
+fn market_under_floor(state: &MarketState, min_quote_price: f64) -> bool {
+    let floor = min_quote_price.max(0.0);
+    observed_market_price(&state.up_book).is_some_and(|p| p < floor)
+        || observed_market_price(&state.down_book).is_some_and(|p| p < floor)
+}
+
+fn observed_market_price(book: &crate::state::book::TokenBookTop) -> Option<f64> {
+    match (book.best_bid, book.best_ask) {
+        (Some(bid), Some(ask)) => Some(bid.min(ask)),
+        (Some(bid), None) => Some(bid),
+        (None, Some(ask)) => Some(ask),
+        (None, None) => None,
+    }
+}
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -954,6 +1058,69 @@ mod tests {
         assert_eq!(tick.state.inventory.up.shares, 3.0);
 
         // Ensure no quote tick for the other market was emitted by this fill.
+        let no_second_tick = timeout(Duration::from_millis(50), rx_quote.recv()).await;
+        assert!(
+            no_second_tick.is_err(),
+            "unexpected extra quote tick: {no_second_tick:?}"
+        );
+
+        drop(tx_events);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn market_ws_update_emits_quote_tick_only_for_affected_market() {
+        let ops = OpsState::new(&AppConfig::default());
+        let sm = StateManager::new(
+            AlphaConfig::default(),
+            OracleConfig::default(),
+            TradingConfig::default(),
+            ops.health,
+            ops.metrics,
+        );
+
+        let (tx_events, rx_events) = mpsc::channel(8);
+        let (tx_quote, mut rx_quote) = mpsc::channel(8);
+        let handle = tokio::spawn(sm.run(rx_events, tx_quote));
+
+        let t0 = now_ms();
+        tx_events
+            .send(AppEvent::MarketDiscovered(make_identity_named(
+                "btc-updown-15m-0",
+                "cond-0",
+                "up-0",
+                "down-0",
+            )))
+            .await
+            .expect("send market discovered");
+        tx_events
+            .send(AppEvent::MarketDiscovered(make_identity_named(
+                "btc-updown-15m-1",
+                "cond-1",
+                "up-1",
+                "down-1",
+            )))
+            .await
+            .expect("send market discovered");
+
+        tx_events
+            .send(AppEvent::MarketWsUpdate(MarketWsUpdate {
+                token_id: "up-1".to_string(),
+                best_bid: Some(0.49),
+                best_ask: Some(0.51),
+                tick_size: Some(0.01),
+                ts_ms: t0 + 10,
+            }))
+            .await
+            .expect("send market update");
+
+        let tick = timeout(Duration::from_millis(200), rx_quote.recv())
+            .await
+            .expect("quote tick timeout")
+            .expect("quote tick");
+        assert_eq!(tick.slug, "btc-updown-15m-1");
+
+        // Ensure no quote tick for the other market was emitted by this update.
         let no_second_tick = timeout(Duration::from_millis(50), rx_quote.recv()).await;
         assert!(
             no_second_tick.is_err(),
