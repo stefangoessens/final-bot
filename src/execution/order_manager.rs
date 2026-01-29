@@ -312,6 +312,47 @@ pub struct OrderManager {
     post_limiter: OrdersPerMinLimiter,
 }
 
+#[derive(Debug)]
+enum OmInternal {
+    CancelBatch {
+        slug: String,
+        now_ms: i64,
+        cancels: Vec<CancelAction>,
+        result: CancelResult,
+    },
+    CancelFinished {
+        slug: String,
+        now_ms: i64,
+        fatal: Option<BotError>,
+    },
+    PostBatch {
+        slug: String,
+        now_ms: i64,
+        posts: Vec<DesiredOrder>,
+        outcome: PostOutcome,
+    },
+    PostFinished {
+        slug: String,
+        now_ms: i64,
+        fatal: Option<BotError>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InFlightStage {
+    Canceling,
+    Posting,
+}
+
+#[derive(Debug, Default)]
+struct InFlight {
+    busy: bool,
+    stage: Option<InFlightStage>,
+    current_cmd: Option<ExecCommand>,
+    pending_latest: Option<ExecCommand>,
+    post_failures: usize,
+}
+
 impl OrderManager {
     pub fn new(
         cfg: TradingConfig,
@@ -360,10 +401,18 @@ impl OrderManager {
         log_tx: Option<Sender<LogEvent>>,
     ) {
         let mut user_orders = self.user_orders.take();
+        let (tx_internal, mut rx_internal) = tokio::sync::mpsc::channel::<OmInternal>(1024);
+        let mut inflight_by_slug: HashMap<String, InFlight> = HashMap::new();
         loop {
             tokio::select! {
                 Some(cmd) = rx_exec.recv() => {
-                    self.handle_command_with_logger(cmd, Some(&tx_events), log_tx.as_ref()).await;
+                    self.on_exec_nonblocking(
+                        cmd,
+                        &tx_events,
+                        log_tx.as_ref(),
+                        &tx_internal,
+                        &mut inflight_by_slug,
+                    );
                 }
                 update = async {
                     match &mut user_orders {
@@ -378,11 +427,502 @@ impl OrderManager {
                         }
                     }
                 }
+                Some(msg) = rx_internal.recv() => {
+                    self.on_internal_msg(
+                        msg,
+                        &tx_events,
+                        log_tx.as_ref(),
+                        &tx_internal,
+                        &mut inflight_by_slug,
+                    );
+                }
                 else => break,
             }
         }
     }
 
+    fn on_exec_nonblocking(
+        &mut self,
+        cmd: ExecCommand,
+        tx_events: &Sender<AppEvent>,
+        log_tx: Option<&Sender<LogEvent>>,
+        tx_internal: &Sender<OmInternal>,
+        inflight_by_slug: &mut HashMap<String, InFlight>,
+    ) {
+        let slug = cmd.slug.clone();
+        {
+            let slot = inflight_by_slug.entry(slug.clone()).or_default();
+            if slot.busy {
+                slot.pending_latest = Some(cmd);
+                return;
+            }
+            slot.busy = true;
+            slot.stage = None;
+            slot.post_failures = 0;
+            slot.current_cmd = Some(cmd);
+        }
+
+        let Some(cmd) = inflight_by_slug
+            .get(&slug)
+            .and_then(|slot| slot.current_cmd.clone())
+        else {
+            return;
+        };
+
+        self.start_for_cmd(cmd, tx_events, log_tx, tx_internal, inflight_by_slug);
+    }
+
+    fn on_internal_msg(
+        &mut self,
+        msg: OmInternal,
+        tx_events: &Sender<AppEvent>,
+        log_tx: Option<&Sender<LogEvent>>,
+        tx_internal: &Sender<OmInternal>,
+        inflight_by_slug: &mut HashMap<String, InFlight>,
+    ) {
+        match msg {
+            OmInternal::CancelBatch {
+                slug,
+                now_ms,
+                cancels,
+                result,
+            } => {
+                self.apply_cancel_batch(&slug, now_ms, cancels, result, Some(tx_events));
+            }
+            OmInternal::CancelFinished {
+                slug,
+                now_ms,
+                fatal,
+            } => {
+                if let Some(slot) = inflight_by_slug.get_mut(&slug) {
+                    slot.stage = None;
+                }
+
+                if let Some(err) = fatal {
+                    if let Some(cache) = self.markets.get_mut(&slug) {
+                        apply_backoff(cache, &slug, now_ms, err);
+                    }
+                    self.finish_and_maybe_start_next(
+                        &slug,
+                        false,
+                        tx_events,
+                        log_tx,
+                        tx_internal,
+                        inflight_by_slug,
+                    );
+                    return;
+                }
+
+                // Cancels are done; continue with either the latest pending command (if any),
+                // otherwise the command that triggered the cancel stage.
+                self.finish_and_maybe_start_next(
+                    &slug,
+                    true,
+                    tx_events,
+                    log_tx,
+                    tx_internal,
+                    inflight_by_slug,
+                );
+            }
+            OmInternal::PostBatch {
+                slug,
+                now_ms,
+                posts,
+                outcome,
+            } => {
+                if let Some(slot) = inflight_by_slug.get_mut(&slug) {
+                    slot.post_failures = slot.post_failures.saturating_add(outcome.failure_count());
+                }
+                self.apply_post_batch(&slug, now_ms, posts, outcome, Some(tx_events));
+            }
+            OmInternal::PostFinished {
+                slug,
+                now_ms,
+                fatal,
+            } => {
+                if let Some(slot) = inflight_by_slug.get_mut(&slug) {
+                    slot.stage = None;
+
+                    if let Some(err) = fatal {
+                        if let Some(cache) = self.markets.get_mut(&slug) {
+                            apply_backoff(cache, &slug, now_ms, err);
+                        }
+                    } else if slot.post_failures > 0 {
+                        if let Some(cache) = self.markets.get_mut(&slug) {
+                            apply_backoff(
+                                cache,
+                                &slug,
+                                now_ms,
+                                BotError::Other(format!(
+                                    "partial post failures: {}",
+                                    slot.post_failures
+                                )),
+                            );
+                        }
+                    } else if let Some(cache) = self.markets.get_mut(&slug) {
+                        reset_backoff(cache);
+                    }
+                }
+
+                self.finish_and_maybe_start_next(
+                    &slug,
+                    false,
+                    tx_events,
+                    log_tx,
+                    tx_internal,
+                    inflight_by_slug,
+                );
+            }
+        }
+    }
+
+    fn finish_and_maybe_start_next(
+        &mut self,
+        slug: &str,
+        continue_current_when_idle: bool,
+        tx_events: &Sender<AppEvent>,
+        log_tx: Option<&Sender<LogEvent>>,
+        tx_internal: &Sender<OmInternal>,
+        inflight_by_slug: &mut HashMap<String, InFlight>,
+    ) {
+        let next = {
+            let slot = inflight_by_slug.entry(slug.to_string()).or_default();
+            slot.busy = false;
+            slot.post_failures = 0;
+            let pending = slot.pending_latest.take();
+
+            if let Some(p) = pending {
+                slot.current_cmd = None;
+                Some(p)
+            } else if continue_current_when_idle {
+                slot.current_cmd.take()
+            } else {
+                slot.current_cmd = None;
+                None
+            }
+        };
+
+        if let Some(cmd) = next {
+            self.on_exec_nonblocking(cmd, tx_events, log_tx, tx_internal, inflight_by_slug);
+        }
+    }
+
+    fn start_for_cmd(
+        &mut self,
+        cmd: ExecCommand,
+        tx_events: &Sender<AppEvent>,
+        log_tx: Option<&Sender<LogEvent>>,
+        tx_internal: &Sender<OmInternal>,
+        inflight_by_slug: &mut HashMap<String, InFlight>,
+    ) {
+        let now_ms = now_ms();
+        let slug = cmd.slug.clone();
+
+        if self.owner.as_deref().unwrap_or_default().is_empty() {
+            tracing::warn!(
+                target: "order_manager",
+                slug = %slug,
+                "owner api key missing; order placement may fail"
+            );
+        }
+
+        let mut spawn_cancels: Option<Vec<CancelAction>> = None;
+        let mut spawn_posts: Option<Vec<DesiredOrder>> = None;
+        let mut should_finish = false;
+
+        {
+            let cache = self.markets.entry(slug.clone()).or_default();
+            let post_backoff_active = cache.backoff_until_ms > now_ms;
+            let backoff_until_ms = cache.backoff_until_ms;
+            let cutoff_ts_ms = cutoff_ts_from_slug(&slug, self.cfg.cutoff_seconds);
+            let cutoff_active = cutoff_ts_ms.map(|cutoff| now_ms >= cutoff).unwrap_or(true);
+
+            cache.update_tick_cache(&cmd.desired, self.cfg.ladder_step_ticks);
+
+            let mut plan = diff_orders(
+                &cmd.desired,
+                &cache.live,
+                &cache.tick_size,
+                &self.cfg,
+                now_ms,
+                &cache.last_update_ms,
+            );
+            order_posts_by_level(&mut plan.posts);
+
+            if plan.is_empty() {
+                should_finish = true;
+            } else {
+                log_plan(&slug, &plan, &cache.live);
+
+                if self.cfg.dry_run {
+                    cache.apply_dry_run(&plan, now_ms);
+                    emit_dry_run_updates(Some(tx_events), &slug, &plan, now_ms);
+                    should_finish = true;
+                } else if !plan.cancels.is_empty() {
+                    spawn_cancels = Some(plan.cancels);
+                } else {
+                    // No cancels: we can go straight to posting.
+                    let mut posts = plan.posts;
+
+                    // Defense-in-depth: never post a maker order below the quote floor, even if a
+                    // strategy bug/regression produces one.
+                    let min_quote_price = self.cfg.min_quote_price.max(0.0);
+                    posts.retain(|post| {
+                        if !post.post_only {
+                            return true;
+                        }
+                        if !post.price.is_finite() {
+                            tracing::error!(
+                                target: "safety",
+                                slug = %slug,
+                                token_id = %post.token_id,
+                                level = post.level,
+                                price = post.price,
+                                action = "drop_non_finite_post",
+                                "dropping non-finite post-only order"
+                            );
+                            return false;
+                        }
+                        if post.price + 1e-12 < min_quote_price {
+                            tracing::error!(
+                                target: "safety",
+                                slug = %slug,
+                                token_id = %post.token_id,
+                                level = post.level,
+                                price = post.price,
+                                min_quote_price,
+                                action = "drop_below_floor_post",
+                                "dropping post-only order below min_quote_price"
+                            );
+                            return false;
+                        }
+                        true
+                    });
+
+                    if posts.is_empty() {
+                        should_finish = true;
+                    } else if post_backoff_active || cutoff_active {
+                        tracing::warn!(
+                            target: "order_manager",
+                            slug = %slug,
+                            post_count = posts.len(),
+                            backoff_active = post_backoff_active,
+                            backoff_until_ms,
+                            cutoff_active = cutoff_active,
+                            cutoff_ts_ms = cutoff_ts_ms.unwrap_or_default(),
+                            "post suppressed due to backoff/cutoff"
+                        );
+                        should_finish = true;
+                    } else {
+                        let post_count = posts.len().min(u32::MAX as usize) as u32;
+                        if !self.post_limiter.try_acquire(now_ms, post_count) {
+                            tracing::warn!(
+                                target: "order_manager",
+                                slug = %slug,
+                                post_count,
+                                max_orders_per_min = self.cfg.max_orders_per_min,
+                                action = "post_rate_limited",
+                                "post suppressed by max_orders_per_min"
+                            );
+                            should_finish = true;
+                        } else {
+                            spawn_posts = Some(posts);
+                        }
+                    }
+                }
+            }
+        }
+
+        if should_finish {
+            self.finish_and_maybe_start_next(
+                &slug,
+                false,
+                tx_events,
+                log_tx,
+                tx_internal,
+                inflight_by_slug,
+            );
+            return;
+        }
+
+        if let Some(cancels) = spawn_cancels {
+            if let Some(slot) = inflight_by_slug.get_mut(&slug) {
+                slot.stage = Some(InFlightStage::Canceling);
+                slot.post_failures = 0;
+            }
+            let rest = Arc::clone(&self.rest);
+            let tx = tx_internal.clone();
+            let log = log_tx.cloned();
+            tokio::spawn(async move {
+                run_cancel_stage(rest, slug, now_ms, cancels, log, tx).await;
+            });
+            return;
+        }
+
+        if let Some(posts) = spawn_posts {
+            if let Some(slot) = inflight_by_slug.get_mut(&slug) {
+                slot.stage = Some(InFlightStage::Posting);
+                slot.post_failures = 0;
+            }
+            let rest = Arc::clone(&self.rest);
+            let tx = tx_internal.clone();
+            let log = log_tx.cloned();
+            tokio::spawn(async move {
+                run_post_stage(rest, slug, now_ms, posts, log, tx).await;
+            });
+            return;
+        }
+
+        self.finish_and_maybe_start_next(
+            &slug,
+            false,
+            tx_events,
+            log_tx,
+            tx_internal,
+            inflight_by_slug,
+        );
+    }
+
+    fn apply_cancel_batch(
+        &mut self,
+        slug: &str,
+        now_ms: i64,
+        cancels: Vec<CancelAction>,
+        result: CancelResult,
+        tx_events: Option<&Sender<AppEvent>>,
+    ) {
+        let Some(cache) = self.markets.get_mut(slug) else {
+            return;
+        };
+
+        let mut canceled_ids: HashSet<String> = result.canceled.into_iter().collect();
+        let mut failed_ids: HashSet<String> = HashSet::new();
+
+        for (id, reason) in result.failed {
+            if is_terminal_cancel_failure(&reason) {
+                tracing::warn!(
+                    target: "order_manager",
+                    slug = %slug,
+                    order_id = %id,
+                    reason = %reason,
+                    action = "cancel_terminal_failure",
+                    "cancel reported order is not live; removing from cache"
+                );
+                canceled_ids.insert(id);
+            } else {
+                failed_ids.insert(id);
+            }
+        }
+
+        if !failed_ids.is_empty() {
+            tracing::warn!(
+                target: "order_manager",
+                slug = %slug,
+                failed = failed_ids.len(),
+                "some cancel requests failed"
+            );
+        }
+
+        for cancel in cancels {
+            if canceled_ids.contains(&cancel.order_id) {
+                let key = (cancel.token_id.clone(), cancel.level);
+                cache.remove_live_by_key(&key);
+                tracing::info!(
+                    target: "order_manager",
+                    slug = %slug,
+                    token_id = %cancel.token_id,
+                    level = cancel.level,
+                    order_id = %cancel.order_id,
+                    action = "cancel_sent",
+                    "cancel acknowledged"
+                );
+                emit_order_update(
+                    tx_events,
+                    OrderUpdate::Remove {
+                        slug: slug.to_string(),
+                        token_id: cancel.token_id,
+                        level: cancel.level,
+                        order_id: cancel.order_id,
+                        ts_ms: now_ms,
+                    },
+                );
+            }
+        }
+    }
+
+    fn apply_post_batch(
+        &mut self,
+        slug: &str,
+        now_ms: i64,
+        posts: Vec<DesiredOrder>,
+        outcome: PostOutcome,
+        tx_events: Option<&Sender<AppEvent>>,
+    ) {
+        let Some(cache) = self.markets.get_mut(slug) else {
+            return;
+        };
+
+        if outcome.results.len() != posts.len() {
+            tracing::warn!(
+                target: "order_manager",
+                slug = %slug,
+                expected = posts.len(),
+                got = outcome.results.len(),
+                "post batch result length mismatch"
+            );
+            return;
+        }
+
+        for (post, result) in posts.into_iter().zip(outcome.results.into_iter()) {
+            if result.error.is_none() && result.order_id.is_some() {
+                let order_id = result.order_id.as_ref().expect("checked order_id.is_some");
+                let live = LiveOrder {
+                    order_id: order_id.clone(),
+                    token_id: post.token_id.clone(),
+                    level: post.level,
+                    price: post.price,
+                    size: post.size,
+                    remaining: post.size,
+                    status: OrderStatus::Open,
+                    last_update_ms: now_ms,
+                };
+                cache.insert_live(live.clone());
+                emit_order_update(
+                    tx_events,
+                    OrderUpdate::Upsert {
+                        slug: slug.to_string(),
+                        order: live,
+                    },
+                );
+                tracing::info!(
+                    target: "order_manager",
+                    slug = %slug,
+                    token_id = %post.token_id,
+                    level = post.level,
+                    price = post.price,
+                    size = post.size,
+                    order_id = %order_id,
+                    action = "post_sent",
+                    "order posted"
+                );
+            } else {
+                tracing::warn!(
+                    target: "order_manager",
+                    slug = %slug,
+                    token_id = %post.token_id,
+                    level = post.level,
+                    price = post.price,
+                    size = post.size,
+                    order_id = result.order_id.as_deref().unwrap_or(""),
+                    error = result.error.as_deref().unwrap_or("unknown"),
+                    action = "post_failed",
+                    "order post failed"
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
     async fn handle_command_with_logger(
         &mut self,
         cmd: ExecCommand,
@@ -774,6 +1314,229 @@ struct AppliedUserOrderUpdate {
     fill: Option<FillEvent>,
 }
 
+async fn run_cancel_stage(
+    rest: Arc<dyn OrderRestClient>,
+    slug: String,
+    now_ms: i64,
+    cancels: Vec<CancelAction>,
+    log_tx: Option<Sender<LogEvent>>,
+    tx_internal: Sender<OmInternal>,
+) {
+    let cancel_batches = batch::chunk(cancels, batch::MAX_BATCH_ORDERS);
+    for cancel_batch in cancel_batches {
+        let ids: Vec<OrderId> = cancel_batch
+            .iter()
+            .map(|cancel| cancel.order_id.clone())
+            .collect();
+        log_cancel_batch(log_tx.as_ref(), &slug, &ids, now_ms);
+
+        match rest.cancel_orders(ids).await {
+            Ok(result) => {
+                if tx_internal
+                    .send(OmInternal::CancelBatch {
+                        slug: slug.clone(),
+                        now_ms,
+                        cancels: cancel_batch,
+                        result,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(err) => {
+                let _ = tx_internal
+                    .send(OmInternal::CancelFinished {
+                        slug: slug.clone(),
+                        now_ms,
+                        fatal: Some(err),
+                    })
+                    .await;
+                return;
+            }
+        }
+    }
+
+    let _ = tx_internal
+        .send(OmInternal::CancelFinished {
+            slug,
+            now_ms,
+            fatal: None,
+        })
+        .await;
+}
+
+async fn run_post_stage(
+    rest: Arc<dyn OrderRestClient>,
+    slug: String,
+    now_ms: i64,
+    posts: Vec<DesiredOrder>,
+    log_tx: Option<Sender<LogEvent>>,
+    tx_internal: Sender<OmInternal>,
+) {
+    let post_batches = batch::chunk(posts, batch::MAX_BATCH_ORDERS);
+
+    for post_batch in post_batches {
+        log_post_batch(log_tx.as_ref(), &slug, &post_batch, now_ms);
+
+        let signed = match rest.build_signed_orders(post_batch.clone(), now_ms).await {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = tx_internal
+                    .send(OmInternal::PostFinished {
+                        slug: slug.clone(),
+                        now_ms,
+                        fatal: Some(err),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        let raw_outcome = match rest.post_orders_partial(signed).await {
+            Ok(out) => out,
+            Err(err) => {
+                let _ = tx_internal
+                    .send(OmInternal::PostFinished {
+                        slug: slug.clone(),
+                        now_ms,
+                        fatal: Some(err),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        if raw_outcome.results.len() != post_batch.len() {
+            let _ = tx_internal
+                .send(OmInternal::PostFinished {
+                    slug: slug.clone(),
+                    now_ms,
+                    fatal: Some(BotError::Other(format!(
+                        "post_orders returned {} results for {} orders",
+                        raw_outcome.results.len(),
+                        post_batch.len()
+                    ))),
+                })
+                .await;
+            return;
+        }
+
+        log_post_result(log_tx.as_ref(), &slug, &raw_outcome, now_ms);
+
+        let token_count = post_batch
+            .iter()
+            .map(|post| post.token_id.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        let had_reject = raw_outcome
+            .results
+            .iter()
+            .any(|result| result.error.is_some());
+
+        let mut results = raw_outcome.results;
+        if token_count >= 2 && had_reject {
+            let reject_errors: Vec<&str> = results
+                .iter()
+                .filter_map(|result| result.error.as_deref())
+                .collect();
+            let all_rejects_post_only = !reject_errors.is_empty()
+                && reject_errors
+                    .iter()
+                    .all(|reason| is_expected_post_only_reject(reason));
+            let revert_error = if all_rejects_post_only {
+                "reverted due to post-only reject"
+            } else {
+                "reverted due to partial post"
+            };
+
+            let accepted_ids: Vec<OrderId> = results
+                .iter()
+                .filter(|result| result.error.is_none() && result.order_id.is_some())
+                .filter_map(|result| result.order_id.clone())
+                .collect();
+
+            if !accepted_ids.is_empty() {
+                tracing::warn!(
+                    target: "order_manager",
+                    slug = %slug,
+                    accepted = accepted_ids.len(),
+                    action = "post_partial_revert",
+                    "partial post detected; reverting by canceling accepted orders"
+                );
+                let cancel_batches = batch::chunk(accepted_ids, batch::MAX_BATCH_ORDERS);
+                for ids in cancel_batches {
+                    match rest.cancel_orders(ids.clone()).await {
+                        Ok(result) => {
+                            tracing::info!(
+                                target: "order_manager",
+                                slug = %slug,
+                                canceled = result.canceled.len(),
+                                failed = result.failed.len(),
+                                action = "post_partial_revert_result",
+                                "revert cancel batch completed"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "order_manager",
+                                slug = %slug,
+                                error = %err,
+                                action = "post_partial_revert_error",
+                                "revert cancel batch errored"
+                            );
+                        }
+                    }
+                }
+            }
+
+            for result in results.iter_mut() {
+                if result.error.is_none() && result.order_id.is_some() {
+                    result.error = Some(revert_error.to_string());
+                }
+            }
+
+            for post in post_batch.iter() {
+                tracing::warn!(
+                    target: "order_manager",
+                    slug = %slug,
+                    token_id = %post.token_id,
+                    level = post.level,
+                    price = post.price,
+                    size = post.size,
+                    error = revert_error,
+                    action = "post_reverted",
+                    "post reverted due to partial batch outcome"
+                );
+            }
+        }
+
+        let outcome = PostOutcome { results };
+        if tx_internal
+            .send(OmInternal::PostBatch {
+                slug: slug.clone(),
+                now_ms,
+                posts: post_batch,
+                outcome,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    let _ = tx_internal
+        .send(OmInternal::PostFinished {
+            slug,
+            now_ms,
+            fatal: None,
+        })
+        .await;
+}
+
+#[cfg(test)]
 async fn execute_cancels(
     rest: &dyn OrderRestClient,
     slug: &str,
@@ -925,6 +1688,7 @@ fn is_terminal_cancel_failure(reason: &str) -> bool {
         && (reason.contains("fill") || reason.contains("cancel") || reason.contains("close"))
 }
 
+#[cfg(test)]
 async fn execute_posts(
     rest: &dyn OrderRestClient,
     slug: &str,
@@ -1562,6 +2326,7 @@ fn log_cancel_batch(
     });
 }
 
+#[cfg(test)]
 fn log_cancel_result(
     log_tx: Option<&Sender<LogEvent>>,
     slug: &str,
@@ -1744,7 +2509,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, Notify};
     use tokio::time::{timeout, Duration};
 
     use crate::config::{CompletionConfig, InventoryConfig, RewardsConfig};
@@ -1809,6 +2574,64 @@ mod tests {
             let canceled = self.canceled.clone();
             Box::pin(async move {
                 canceled.lock().unwrap().push(order_ids.clone());
+                Ok(CancelResult {
+                    canceled: order_ids,
+                    failed: HashMap::new(),
+                })
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct BlockingRestClient {
+        last_desired_len: Arc<Mutex<usize>>,
+        post_started: Arc<Notify>,
+        allow_post: Arc<Notify>,
+        cancel_called: Arc<Notify>,
+    }
+
+    impl OrderRestClient for BlockingRestClient {
+        fn build_signed_orders(
+            &self,
+            desired: Vec<DesiredOrder>,
+            _now_ms: i64,
+        ) -> BoxFuture<'static, BotResult<Vec<OrderRequest>>> {
+            let last = self.last_desired_len.clone();
+            Box::pin(async move {
+                *last.lock().unwrap() = desired.len();
+                Ok(Vec::new())
+            })
+        }
+
+        fn post_orders_partial(
+            &self,
+            _orders: Vec<OrderRequest>,
+        ) -> BoxFuture<'static, BotResult<PostOutcome>> {
+            let last = self.last_desired_len.clone();
+            let post_started = self.post_started.clone();
+            let allow_post = self.allow_post.clone();
+            Box::pin(async move {
+                post_started.notify_one();
+                allow_post.notified().await;
+                let n = *last.lock().unwrap();
+                Ok(PostOutcome {
+                    results: (0..n)
+                        .map(|i| PostResult {
+                            order_id: Some(format!("order-{i}")),
+                            error: None,
+                        })
+                        .collect(),
+                })
+            })
+        }
+
+        fn cancel_orders(
+            &self,
+            order_ids: Vec<OrderId>,
+        ) -> BoxFuture<'static, BotResult<CancelResult>> {
+            let notify = self.cancel_called.clone();
+            Box::pin(async move {
+                notify.notify_one();
                 Ok(CancelResult {
                     canceled: order_ids,
                     failed: HashMap::new(),
@@ -3050,5 +3873,55 @@ mod tests {
         assert!(apply_user_order_update(&mut cache, &update, &future_slug()).is_some());
         assert!(cache.live.is_empty());
         assert!(!cache.order_id_index.contains_key("order-1"));
+    }
+
+    #[tokio::test]
+    async fn run_processes_user_updates_while_post_in_flight() {
+        let mut cfg = TradingConfig::default();
+        cfg.dry_run = false;
+
+        let rest = BlockingRestClient::default();
+        let (tx_user_orders, rx_user_orders) = mpsc::channel(16);
+        let manager = OrderManager::with_client(cfg, Arc::new(rest.clone()), rx_user_orders);
+
+        let (tx_exec, rx_exec) = mpsc::channel(16);
+        let (tx_events, _rx_events) = mpsc::channel(128);
+        let handle = tokio::spawn(manager.run(rx_exec, tx_events, None));
+
+        let slug = future_slug();
+        tx_exec
+            .send(ExecCommand {
+                slug: slug.clone(),
+                desired: vec![make_desired("token-a", 0, 0.50, 1.0)],
+            })
+            .await
+            .expect("send exec");
+
+        timeout(Duration::from_millis(200), rest.post_started.notified())
+            .await
+            .expect("post should start");
+
+        // While the post REST call is blocked, ensure we still process user updates.
+        tx_user_orders
+            .send(UserOrderUpdate {
+                order_id: "unknown-order".to_string(),
+                token_id: "token-a".to_string(),
+                side: None,
+                price: Some(0.50),
+                original_size: Some(1.0),
+                size_matched: Some(0.0),
+                ts_ms: now_ms(),
+                update_type: UserOrderUpdateType::Update,
+            })
+            .await
+            .expect("send user update");
+
+        timeout(Duration::from_millis(200), rest.cancel_called.notified())
+            .await
+            .expect("expected cancel to be invoked while post is blocked");
+
+        rest.allow_post.notify_one();
+
+        handle.abort();
     }
 }
